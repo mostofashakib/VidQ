@@ -2,7 +2,7 @@
 
 A high-performance, agentic video extraction and search platform. VidQ uses LLM-guided vision to navigate complex video hosting sites and captures high-quality content via browser native MediaRecorder.
 
-## 🚀 Features
+## Features
 
 - **Agentic Navigation**: Uses Vision LLMs (OpenAI/Anthropic) to bypass overlays, age-gates, and interact with custom video players.
 - **Unified Extraction**: Integrated MediaRecorder pipeline for capturing 720p+ video with synchronized audio.
@@ -10,13 +10,13 @@ A high-performance, agentic video extraction and search platform. VidQ uses LLM-
 - **Glassmorphism UI**: Simple, sleek, and modern web interface built with Next.js.
 - **Resilient Pipeline**: Smart recovery loops for blocked interactions and CORS-bypass for cross-domain captures.
 
-## 🛠️ Architecture
+## Architecture
 
 - **Backend**: FastAPI with Playwright (Chromium) and asynchronous workers.
 - **Frontend**: Next.js 15 (App Router) with custom CSS.
 - **AI**: Fallback-protected LLM manager supporting OpenAI, Anthropic, and Ollama.
 
-## 📦 Getting Started
+## Getting Started
 
 ### Prerequisites
 
@@ -41,9 +41,9 @@ A high-performance, agentic video extraction and search platform. VidQ uses LLM-
    ./run.sh
    ```
 
-## 📜 License
+## License
 
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
 
 ---
-Created by Adib Shakib
+Created by Mostofa Shakib
