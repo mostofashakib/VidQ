@@ -1,0 +1,11 @@
+fastapi[standard]
+sqlalchemy
+requests
+beautifulsoup4
+openai
+anthropic
+python-dotenv
+playwright
+httpx
+imageio
+imageio-ffmpeg
