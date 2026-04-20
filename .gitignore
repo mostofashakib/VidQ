@@ -10,3 +10,4 @@ backend/app/__pycache__
 frontend/.next
 frontend/out
 .DS_Store
+.vscode/
