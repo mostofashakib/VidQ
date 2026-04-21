@@ -1,14 +1,15 @@
 # VidQ
 
-A high-performance, agentic video extraction and search platform. VidQ uses LLM-guided vision to navigate complex video hosting sites and captures high-quality content via browser native MediaRecorder.
+An agentic video downloader that enables you to download multiple videos from anywhere on the web, in parallel. VidQ uses LLM-driven vision to autonomously navigate any video hosting site — bypassing overlays, interacting with custom players, and capturing high-quality content directly from the browser.
 
 ## Features
 
-- **Agentic Navigation**: Uses Vision LLMs (OpenAI/Anthropic) to bypass overlays, age-gates, and interact with custom video players.
-- **Unified Extraction**: Integrated MediaRecorder pipeline for capturing 720p+ video with synchronized audio.
-- **Local Storage**: Automatically manages extracted content in a local `temp_storage` for immediate preview.
-- **Glassmorphism UI**: Simple, sleek, and modern web interface built with Next.js.
-- **Resilient Pipeline**: Smart recovery loops for blocked interactions and CORS-bypass for cross-domain captures.
+- **Parallel Downloads**: Queue multiple videos from different sources and download them simultaneously.
+- **Agentic Navigation**: Vision LLMs (OpenAI/Anthropic) autonomously find and interact with video players on any site — no site-specific configuration needed.
+- **Universal Compatibility**: Works with virtually any video hosting platform by capturing content directly from the browser via MediaRecorder.
+- **Smart Recovery**: Automatically detects and dismisses ad overlays, age-gates, and cookie banners that block playback.
+- **Quality Selection**: Attempts to set the highest available quality (720p+) before recording.
+- **Modern UI**: Clean, responsive web interface for managing your download queue.
 
 ## Architecture
 
@@ -28,15 +29,14 @@ A high-performance, agentic video extraction and search platform. VidQ uses LLM-
 
 1. **Clone the repository**:
    ```bash
-   git clone https://github.com/adibshakib/vidQ.git
-   cd vidQ
+   git clone https://github.com/mostofashakib/VidQ.git
+   cd VidQ
    ```
 
 2. **Setup Environments**:
-   - Create `.env` in `backend/` with your `OPENAI_API_KEY` and `ANTHROPIC_API_KEY`.
+   - Create `.env` in `backend/` with your `OPENAI_API_KEY` and/or `ANTHROPIC_API_KEY`.
 
 3. **Run the Application**:
-   Use the provided orchestration script:
    ```bash
    ./run.sh
    ```

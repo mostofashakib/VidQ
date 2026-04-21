@@ -16,23 +16,32 @@ def _parse_json(text: str) -> dict:
     return json.loads(text[start:end])
 
 
-def _get_media_type(image_b64: str) -> str:
-    """Detect media type from base64 string prefix."""
-    # Clean up input
-    img_data = image_b64.strip()
-    if "," in img_data:
-        img_data = img_data.split(",")[1]
+def _strip_data_uri(image_b64: str) -> str:
+    """Strip the data:image/...;base64, prefix if present, returning raw base64."""
+    img = image_b64.strip()
+    if "," in img:
+        img = img.split(",", 1)[1]
+    return img
 
-    # /9j/ -> image/jpeg, iVBOR -> image/png, UklGR -> image/webp, R0lGO -> image/gif
-    mtype = "image/png"  # Default
-    if img_data.startswith("/9j/"):
+
+def _get_media_type(image_b64: str) -> str:
+    """Detect media type from base64 string by inspecting magic bytes."""
+    img = _strip_data_uri(image_b64)
+
+    # Magic byte signatures (base64-encoded first bytes):
+    # JPEG  -> /9j/
+    # PNG   -> iVBORw0KGgo
+    # WebP  -> UklGR
+    if img.startswith("/9j/"):
         mtype = "image/jpeg"
-    elif img_data.startswith("iVBOR"):
+    elif img.startswith("iVBOR"):
         mtype = "image/png"
-    elif img_data.startswith("UklGR"):
+    elif img.startswith("UklGR"):
         mtype = "image/webp"
-    
-    logger.debug(f"Detected image media type: {mtype} (prefix: {img_data[:10]}...)")
+    else:
+        mtype = "image/png"  # Safe default
+
+    logger.debug(f"Detected image media type: {mtype} (prefix: {img[:12]}...)")
     return mtype
 
 
@@ -100,7 +109,7 @@ class OllamaProvider(LLMProvider):
                 {
                     "role": "user",
                     "content": prompt,
-                    "images": [image_b64],
+                    "images": [_strip_data_uri(image_b64)],
                 }
             ],
             "stream": False,
@@ -149,7 +158,7 @@ class OpenAIProvider(LLMProvider):
                     "role": "user",
                     "content": [
                         {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:{_get_media_type(image_b64)};base64,{image_b64}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:{_get_media_type(image_b64)};base64,{_strip_data_uri(image_b64)}"}},
                     ],
                 }
             ],
@@ -184,7 +193,7 @@ class AnthropicProvider(LLMProvider):
                             "source": {
                                 "type": "base64",
                                 "media_type": _get_media_type(image_b64),
-                                "data": image_b64,
+                                "data": _strip_data_uri(image_b64),
                             },
                         },
                         {"type": "text", "text": prompt},
