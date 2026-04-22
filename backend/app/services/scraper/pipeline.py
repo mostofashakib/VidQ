@@ -9,7 +9,6 @@ import threading
 import uuid
 from urllib.parse import urljoin
 
-import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
@@ -21,6 +20,7 @@ from app.services.scraper.media import (
     _get_main_playing_video_url,
     _download_video_direct,
     _convert_to_mp4,
+    _probe_file_duration,
 )
 from app.services.scraper.playback import (
     HEADLESS_OPTIONS,
@@ -50,15 +50,8 @@ async def run_extraction(
     Async Playwright scraping pipeline.
     Returns: (html, screenshot_b64, network_video_urls, thumbnail_url, temp_video_url)
     """
-    try:
-        async with httpx.AsyncClient(timeout=12) as client:
-            resp = await client.get(url, headers={"User-Agent": user_agent})
-            resp.raise_for_status()
-            html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
-    except Exception as e:
-        raise Exception(f"Failed to fetch page: {e}")
-
+    html = ""
+    soup = None
     screenshot_b64 = ""
     network_video_urls: list[str] = []
     temp_video_url: str | None = None
@@ -103,6 +96,9 @@ async def run_extraction(
             logger.debug("Navigating (Fast Pass)…")
             await _safe_goto(page, url)
             await asyncio.sleep(1.5)
+
+            html = await page.content()
+            soup = BeautifulSoup(html, "html.parser")
 
             # ── Stage 1: LLM vision navigation analysis ──
             play_selector: str | None = None
@@ -214,26 +210,43 @@ async def run_extraction(
             else:
                 ordered = clean_urls
 
-            best_url: str | None = None
-            for cand_url in ordered[:5]:
+            for cand_url in ordered[:8]:
                 if await _is_forbidden(cand_url, user_agent):
                     logger.warning(f"Forbidden URL (skipped): {cand_url[:80]}")
                     continue
-                best_url = cand_url
-                logger.info(f"Best video URL: {best_url[:100]}")
+
+                logger.info(f"Trying candidate: {cand_url[:100]}")
+                dl_url = await _download_video_direct(cand_url, url, user_agent)
+                if not dl_url:
+                    logger.info("ffmpeg failed for candidate, trying next.")
+                    continue
+
+                # Duration guard: reject downloaded file if it looks like a pre-roll ad.
+                # A candidate whose duration is less than half the page-reported duration
+                # is almost certainly an ad that loaded before the main video stream.
+                if dom_video_duration and dom_video_duration > 30:
+                    filename = dl_url.rstrip("/").split("/")[-1]
+                    local_path = os.path.join(storage, filename)
+                    if os.path.exists(local_path):
+                        dl_duration = _probe_file_duration(local_path)
+                        if dl_duration is not None and dl_duration < dom_video_duration * 0.5:
+                            logger.warning(
+                                f"Duration mismatch: downloaded {dl_duration:.0f}s but page"
+                                f" reports ~{dom_video_duration:.0f}s — likely a pre-roll ad, discarding"
+                            )
+                            try:
+                                os.remove(local_path)
+                            except Exception:
+                                pass
+                            continue
+
+                temp_video_url = dl_url
+                network_video_urls = [cand_url]
+                logger.info(f"Fast Pass: download accepted — {dl_url.split('/')[-1]}")
                 break
 
-            if best_url:
-                dl_url = await _download_video_direct(best_url, url, user_agent)
-                if dl_url:
-                    temp_video_url = dl_url
-                    logger.info("Fast Pass: ffmpeg download succeeded — video saved locally.")
-                else:
-                    logger.info("Fast Pass: ffmpeg failed — URL will be passed as-is.")
-                network_video_urls = [best_url]
-            else:
-                network_video_urls = []
-                logger.info("Fast Pass: no accessible video URL — proceeding to Heavy Pass.")
+            if not network_video_urls:
+                logger.info("Fast Pass: no valid video URL — proceeding to Heavy Pass.")
 
             await context.close()
 
@@ -357,15 +370,16 @@ async def run_extraction(
     except Exception as e:
         raise Exception(f"Playwright pipeline failed: {e}")
 
-    # Extract thumbnail from static HTML
+    # Extract thumbnail from page HTML
     thumbnail_url = None
-    og_img = soup.find("meta", property="og:image", content=True)
-    if og_img:
-        thumbnail_url = og_img["content"]
-    if not thumbnail_url:
-        video_tag = soup.find("video", poster=True)
-        if video_tag:
-            thumbnail_url = video_tag.get("poster")
+    if soup:
+        og_img = soup.find("meta", property="og:image", content=True)
+        if og_img:
+            thumbnail_url = og_img["content"]
+        if not thumbnail_url:
+            video_tag = soup.find("video", poster=True)
+            if video_tag:
+                thumbnail_url = video_tag.get("poster")
     if not thumbnail_url:
         thumbnail_url = f"data:image/png;base64,{screenshot_b64[:100000]}"
 

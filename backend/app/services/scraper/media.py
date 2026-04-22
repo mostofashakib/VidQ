@@ -117,14 +117,96 @@ async def _download_video_direct(
             logger.warning(f"ffmpeg download timed out ({timeout_s}s)")
             return None
         if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
-            size_kb = os.path.getsize(out_path) // 1024
-            logger.info(f"ffmpeg download succeeded: {size_kb}KB → {filename}")
-            return f"{_settings.base_url}/temp_storage/{filename}"
+            final_path = _ensure_min_quality(out_path)
+            final_filename = os.path.basename(final_path)
+            size_kb = os.path.getsize(final_path) // 1024
+            logger.info(f"ffmpeg download succeeded: {size_kb}KB → {final_filename}")
+            return f"{_settings.base_url}/temp_storage/{final_filename}"
         err_tail = (stderr or b'').decode(errors='replace')[-300:]
         logger.warning(f"ffmpeg download failed (rc={proc.returncode}): {err_tail}")
     except Exception as e:
         logger.warning(f"ffmpeg download error: {e}")
     return None
+
+
+def _probe_video_dimensions(video_path: str) -> tuple[int, int] | None:
+    """Return (width, height) by running ffmpeg -i; None if unable to probe."""
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        result = subprocess.run(
+            [ffmpeg_exe, "-i", video_path],
+            capture_output=True, text=True,
+        )
+        # ffmpeg prints stream info to stderr (exit code 1 is expected — no output file)
+        match = re.search(r'Video:.*?(\d{2,5})x(\d{2,5})', result.stderr)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+    except Exception:
+        pass
+    return None
+
+
+def _probe_file_duration(video_path: str) -> float | None:
+    """Return video duration in seconds, or None if unable to probe."""
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        result = subprocess.run(
+            [ffmpeg_exe, "-i", video_path],
+            capture_output=True, text=True,
+        )
+        match = re.search(r'Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)', result.stderr)
+        if match:
+            h, m, s = int(match.group(1)), int(match.group(2)), float(match.group(3))
+            return h * 3600 + m * 60 + s
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_min_quality(video_path: str, min_height: int = 720) -> str:
+    """
+    Resize video to exactly min_height: upscale if below, downscale if above.
+    Uses Lanczos scaling with CRF 18 to preserve visual quality in both directions.
+    Returns the final file path (may differ from input when rescaling occurs).
+    """
+    dims = _probe_video_dimensions(video_path)
+    if dims is None:
+        logger.warning(f"Could not probe {os.path.basename(video_path)} — skipping quality check")
+        return video_path
+
+    width, height = dims
+    if height == min_height:
+        logger.info(f"Video {width}x{height} — already at {min_height}p")
+        return video_path
+
+    direction = "upscaling" if height < min_height else "downscaling"
+    logger.info(f"Video is {width}x{height} — {direction} to {min_height}p with Lanczos")
+    base, ext = os.path.splitext(video_path)
+    out_path = f"{base}_{min_height}p{ext}"
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-i", video_path,
+            "-vf", f"scale=-2:{min_height}:flags=lanczos",
+            "-c:v", "libx264",
+            "-crf", "18",
+            "-preset", "slow",
+            "-c:a", "copy",
+            out_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+            os.remove(video_path)
+            size_kb = os.path.getsize(out_path) // 1024
+            logger.info(f"Rescaled to {min_height}p: {os.path.basename(out_path)} ({size_kb}KB)")
+            return out_path
+        logger.error(f"Rescale failed (rc={result.returncode}): {result.stderr[-300:]}")
+    except subprocess.TimeoutExpired:
+        logger.error(f"Rescale timed out for {os.path.basename(video_path)}")
+    except Exception as e:
+        logger.error(f"Rescale error: {e}")
+    return video_path
 
 
 def _convert_to_mp4(webm_path: str) -> str:
@@ -149,8 +231,9 @@ def _convert_to_mp4(webm_path: str) -> str:
             logger.error(f"FFMPEG error: {result.stderr}")
             return webm_path
         os.remove(webm_path)
-        logger.info(f"Converted to {os.path.basename(mp4_path)}")
-        return mp4_path
+        final_path = _ensure_min_quality(mp4_path)
+        logger.info(f"Converted to {os.path.basename(final_path)}")
+        return final_path
     except Exception as e:
         logger.error(f"MP4 conversion failed: {e}")
         return webm_path

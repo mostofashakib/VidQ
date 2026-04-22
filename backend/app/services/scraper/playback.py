@@ -100,13 +100,19 @@ async def _get_main_video_selector(page, llm_selector: str | None = None) -> str
 
 async def _pre_pass_unblock(page) -> int:
     """
-    Pure-JS heuristic pre-pass: dismiss visible consent banners, ad overlays,
-    countdown timers, and age-gates WITHOUT involving the LLM.
+    Heuristic pre-pass: press Escape then use pure JS to dismiss visible consent
+    banners, ad overlays, countdown timers, and age-gates WITHOUT the LLM.
 
     Returns the number of elements successfully clicked.
     Runs at the start of every _agentic_interact attempt so the LLM always
     sees a cleaner page state.
     """
+    try:
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.3)
+    except Exception:
+        pass
+
     clicked = await page.evaluate(r"""() => {
         let count = 0;
 
@@ -320,7 +326,7 @@ async def _agentic_interact(page, llm_manager, max_attempts: int = 6) -> bool:
     recorded.  Each iteration runs three layers in order:
 
       Layer 1 – No-LLM fast path
-        a. JS pre-pass: dismiss visible consent / ad overlays.
+        a. JS pre-pass: press Escape + dismiss visible consent / ad overlays.
         b. force_play_js: call video.play() directly.
         c. Heuristic selectors: click common play-button CSS selectors.
 
@@ -329,95 +335,126 @@ async def _agentic_interact(page, llm_manager, max_attempts: int = 6) -> bool:
         LLM returns a single CSS selector to click RIGHT NOW.
 
       Layer 3 – Post-click recovery
-        After the LLM click, if still not playing:
-        - For unblocking clicks (consent/ad/age): wait extra, then run
-          force_play_js + heuristic selectors.
-        - For all clicks: run force_play_js.
+        Re-run pre-pass (handles overlays triggered by the click), then
+        force_play_js. For unblocking clicks also try heuristic selectors.
+
+    Throughout: native browser dialogs (alert/confirm/prompt) are
+    auto-dismissed and unexpected popup windows are auto-closed.
     """
     if not llm_manager:
         return False
 
-    for attempt in range(max_attempts):
-        logger.info(f"--- Agentic attempt {attempt + 1}/{max_attempts} ---")
+    # ── Auto-dismiss native browser dialogs ─────────────────────────────────
+    def _on_dialog(dialog):
+        logger.info(f"Auto-dismissing browser dialog: {dialog.type} — '{dialog.message[:60]}'")
+        asyncio.ensure_future(dialog.dismiss())
 
-        # ── Layer 1a: JS pre-pass (no LLM) ──────────────────────────────
-        dismissed = await _pre_pass_unblock(page)
-        if dismissed:
-            await asyncio.sleep(2.0)
-            if await _is_playing(page):
-                logger.info("  Playback after pre-pass dismissal.")
+    # ── Auto-close unexpected popup windows (e.g. opened by play button) ────
+    def _on_popup(new_page):
+        popup_url = getattr(new_page, "url", "") or ""
+        logger.info(f"Closing popup window: {popup_url[:80]}")
+        asyncio.ensure_future(new_page.close())
+
+    page.on("dialog", _on_dialog)
+    page.context.on("page", _on_popup)
+
+    try:
+        for attempt in range(max_attempts):
+            logger.info(f"--- Agentic attempt {attempt + 1}/{max_attempts} ---")
+
+            # ── Layer 1a: JS pre-pass (Escape + consent/ad dismissal) ────
+            dismissed = await _pre_pass_unblock(page)
+            if dismissed:
+                await asyncio.sleep(2.0)
+                if await _is_playing(page):
+                    logger.info("  Playback after pre-pass dismissal.")
+                    return True
+
+            # ── Layer 1b: force video.play() ─────────────────────────────
+            if await _force_play_js(page):
                 return True
 
-        # ── Layer 1b: force video.play() — works once element is loaded ──
-        if await _force_play_js(page):
-            return True
-
-        # ── Layer 1c: heuristic play-button selectors ────────────────────
-        if await _try_direct_play(page):
-            return True
-
-        # ── Layer 2: screenshot + HTML → LLM ────────────────────────────
-        try:
-            screenshot_bytes = await page.screenshot(type="jpeg", quality=80)
-            screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
-        except Exception as e:
-            logger.warning(f"  Screenshot failed: {e}")
-            break
-
-        try:
-            with open(os.path.join(_settings.temp_storage_dir, f"debug_agentic_{attempt}.jpg"), "wb") as f:
-                f.write(screenshot_bytes)
-        except Exception:
-            pass
-
-        try:
-            raw_html = await page.content()
-            interact_html = _clean_for_interaction(raw_html, max_len=10000)
-            logger.info(f"  HTML for LLM: {len(interact_html)} chars")
-        except Exception as e:
-            logger.warning(f"  HTML capture failed: {e}")
-            break
-
-        try:
-            result = await llm_manager.execute(
-                Prompts.agentic_interact(interact_html, attempt),
-                screenshot_b64,
-            )
-            selector = result.get("action_selector")
-            reason = result.get("reason", "—")
-            logger.info(f"  LLM action: '{selector}' — {reason}")
-        except Exception as e:
-            logger.warning(f"  LLM call failed: {e}")
-            break
-
-        if not selector:
-            logger.info("  LLM returned null selector — nothing to click.")
-            break
-
-        # ── Layer 2 click ────────────────────────────────────────────────
-        await _try_click(page, selector)
-
-        reason_ctx = (reason + " " + (selector or "")).lower()
-        is_unblocking = any(kw in reason_ctx for kw in [
-            "cookie", "consent", "accept", "banner", "age", "gdpr",
-            "overlay", "modal", "popup", "close", "dismiss",
-        ])
-        await asyncio.sleep(3.5 if is_unblocking else 2.0)
-
-        if await _is_playing(page):
-            logger.info(f"  Playback confirmed after attempt {attempt + 1}.")
-            return True
-
-        # ── Layer 3: post-click recovery ─────────────────────────────────
-        if await _force_play_js(page):
-            return True
-
-        if is_unblocking:
-            logger.info("  Unblocking click — trying heuristic selectors.")
+            # ── Layer 1c: heuristic play-button selectors ─────────────────
             if await _try_direct_play(page):
                 return True
 
-        logger.info(f"  Still not playing after attempt {attempt + 1}.")
+            # ── Layer 2: screenshot + HTML → LLM ─────────────────────────
+            try:
+                screenshot_bytes = await page.screenshot(type="jpeg", quality=80)
+                screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
+            except Exception as e:
+                logger.warning(f"  Screenshot failed: {e}")
+                break
+
+            try:
+                with open(os.path.join(_settings.temp_storage_dir, f"debug_agentic_{attempt}.jpg"), "wb") as f:
+                    f.write(screenshot_bytes)
+            except Exception:
+                pass
+
+            try:
+                raw_html = await page.content()
+                interact_html = _clean_for_interaction(raw_html, max_len=10000)
+                logger.info(f"  HTML for LLM: {len(interact_html)} chars")
+            except Exception as e:
+                logger.warning(f"  HTML capture failed: {e}")
+                break
+
+            try:
+                result = await llm_manager.execute(
+                    Prompts.agentic_interact(interact_html, attempt),
+                    screenshot_b64,
+                )
+                selector = result.get("action_selector")
+                reason = result.get("reason", "—")
+                logger.info(f"  LLM action: '{selector}' — {reason}")
+            except Exception as e:
+                logger.warning(f"  LLM call failed: {e}")
+                break
+
+            if not selector:
+                logger.info("  LLM returned null selector — nothing to click.")
+                break
+
+            # ── Layer 2 click ─────────────────────────────────────────────
+            await _try_click(page, selector)
+
+            reason_ctx = (reason + " " + (selector or "")).lower()
+            is_unblocking = any(kw in reason_ctx for kw in [
+                "cookie", "consent", "accept", "banner", "age", "gdpr",
+                "overlay", "modal", "popup", "close", "dismiss",
+            ])
+            await asyncio.sleep(3.5 if is_unblocking else 2.0)
+
+            if await _is_playing(page):
+                logger.info(f"  Playback confirmed after attempt {attempt + 1}.")
+                return True
+
+            # ── Layer 3: post-click recovery ──────────────────────────────
+            # Re-run pre-pass: the click may have triggered a new overlay
+            # (e.g. a login wall or age-gate that appears when play is pressed)
+            await _pre_pass_unblock(page)
+            await asyncio.sleep(1.0)
+
+            if await _force_play_js(page):
+                return True
+
+            if is_unblocking:
+                logger.info("  Unblocking click — trying heuristic selectors.")
+                if await _try_direct_play(page):
+                    return True
+
+            logger.info(f"  Still not playing after attempt {attempt + 1}.")
+
+    finally:
+        try:
+            page.remove_listener("dialog", _on_dialog)
+        except Exception:
+            pass
+        try:
+            page.context.remove_listener("page", _on_popup)
+        except Exception:
+            pass
 
     logger.warning("Agentic interact: all attempts exhausted without confirmed playback.")
     return False
