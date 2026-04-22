@@ -40,11 +40,11 @@ export async function deleteVideo(token: string, id: number) {
   });
 }
 
-export async function extractVideo(token: string, url: string) {
+export async function extractVideo(token: string, url: string, signal?: AbortSignal) {
   const res = await axios.post(
     `${API_URL}/extract-video`,
     { url },
-    { headers: { Authorization: `Bearer ${token}` } }
+    { headers: { Authorization: `Bearer ${token}` }, signal }
   );
   return res.data;
 }
@@ -63,4 +63,24 @@ export async function getQueueStatus(token: string, jobId: string) {
     headers: { Authorization: `Bearer ${token}` },
   });
   return res.data;
-} 
+}
+
+export async function getAuthStatus(): Promise<{ auth_enabled: boolean }> {
+  const res = await axios.get(`${API_URL}/auth/status`);
+  return res.data;
+}
+
+export async function cancelJob(token: string, jobId: string) {
+  const res = await axios.delete(`${API_URL}/queue/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function downloadVideo(token: string, id: number): Promise<Blob> {
+  const res = await axios.get(`${API_URL}/videos/${id}/download`, {
+    headers: { Authorization: `Bearer ${token}` },
+    responseType: "blob",
+  });
+  return res.data;
+}

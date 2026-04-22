@@ -1,9 +1,11 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from app.db import get_db, Video
 from app.models import VideoCreate, VideoOut
 from app.routers.auth import verify_token
 from typing import List, Optional
+import os
 import requests
 from bs4 import BeautifulSoup
 from app.services.llm_manager import FallbackLLMManager
@@ -132,11 +134,11 @@ def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = De
     return db_video
 
 @router.get("/videos", response_model=List[VideoOut])
-def list_videos(category: Optional[str] = None, db: Session = Depends(get_db), token: str = Depends(verify_token)):
+def list_videos(category: Optional[str] = None, skip: int = 0, limit: int = 20, db: Session = Depends(get_db), token: str = Depends(verify_token)):
     query = db.query(Video)
     if category:
         query = query.filter(Video.category == category)
-    return query.order_by(Video.created_at.desc()).all()
+    return query.order_by(Video.created_at.desc()).offset(skip).limit(limit).all()
 
 @router.get("/videos/categories", response_model=List[str])
 def list_categories(db: Session = Depends(get_db), token: str = Depends(verify_token)):
@@ -151,6 +153,34 @@ def delete_video(video_id: int, db: Session = Depends(get_db), token: str = Depe
     db.delete(video)
     db.commit()
     return None
+
+
+@router.get("/videos/{video_id}/download")
+def download_video(video_id: int, db: Session = Depends(get_db), token: str = Depends(verify_token)):
+    """Stream a locally stored video with Content-Disposition: attachment so the browser downloads it."""
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    video_url = video.url
+    settings = get_settings()
+
+    if "temp_storage" in video_url and ("localhost" in video_url or "127.0.0.1" in video_url):
+        filename = video_url.split("/")[-1].split("?")[0]
+        filepath = os.path.join(settings.temp_storage_dir, filename)
+        if os.path.exists(filepath):
+            ext = filename.rsplit(".", 1)[-1] if "." in filename else "mp4"
+            safe_title = ''.join(
+                c if (c.isalnum() or c in ' _-.') else '_'
+                for c in (video.title or f"video-{video_id}")
+            )[:80].strip().replace(' ', '_')
+            return FileResponse(
+                filepath,
+                media_type=f"video/{ext}",
+                filename=f"{safe_title}.{ext}",
+            )
+
+    raise HTTPException(status_code=404, detail="No local file available for this video")
 
 async def call_llm_with_html_and_screenshot(llm_manager: FallbackLLMManager, html: str, screenshot_b64: str, network_video_urls: list[str], thumbnail_url: str) -> dict:
     prompt = Prompts.video_metadata(clean_html(html), network_video_urls)
@@ -187,10 +217,10 @@ async def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_
         
     result = await call_llm_with_html_and_screenshot(llm_manager, html, screenshot_b64, network_video_urls, thumbnail_url)
     result["thumbnail"] = result.get("thumbnail") or thumbnail_url
-    
-    if not result.get("video_url") and temp_video_url:
+    # Always prefer the locally downloaded file over an expiring CDN URL
+    if temp_video_url:
         result["video_url"] = temp_video_url
-        
+
     return result
 
 
@@ -238,3 +268,16 @@ def get_queue_status(job_id: str, token: str = Depends(verify_token)):
         response["error"] = job.error
 
     return response
+
+
+@router.delete("/queue/{job_id}", status_code=200)
+def cancel_queue_job(job_id: str, token: str = Depends(verify_token)):
+    """Cancel a queued or processing job."""
+    queue = _get_queue()
+    job = queue.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    cancelled = queue.cancel(job_id)
+    if not cancelled:
+        raise HTTPException(status_code=409, detail=f"Job cannot be cancelled (status: {job.status})")
+    return {"job_id": job_id, "status": "cancelled"}

@@ -12,10 +12,12 @@ from app.services.llm_manager import (
 
 _settings = get_settings()
 
-_providers = [OllamaProvider()]
+_providers = [OllamaProvider(model_name=_settings.ollama_model, host=_settings.ollama_host)]
 if _settings.openai_api_key:
     _providers.append(OpenAIProvider(api_key=_settings.openai_api_key))
 if _settings.anthropic_api_key:
     _providers.append(AnthropicProvider(api_key=_settings.anthropic_api_key))
 
-llm_manager = FallbackLLMManager(_providers)
+# LLM_PROVIDER="" → auto-fallback chain across all configured providers
+# LLM_PROVIDER="ollama"/"openai"/"anthropic" → lock to that provider
+llm_manager = FallbackLLMManager(_providers, default=_settings.llm_provider or None)

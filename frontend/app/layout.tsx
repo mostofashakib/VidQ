@@ -6,8 +6,8 @@ import { AuthProvider } from "./auth-context";
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "VideoSearch",
-  description: "Video search and categorization app",
+  title: "VidQ",
+  description: "Agentic video downloader — capture any video from any site",
 };
 
 export default function RootLayout({

@@ -21,6 +21,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials | None = Depends(secu
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     return token
 
+@router.get("/auth/status")
+def auth_status(settings: Settings = Depends(get_settings)):
+    return {"auth_enabled": settings.auth_enabled}
+
 @router.post("/auth/login", response_model=AuthResponse)
 def login(auth: AuthRequest, settings: Settings = Depends(get_settings)):
     if not settings.auth_enabled:

@@ -9,8 +9,9 @@ import {
   listCategories,
   deleteVideo,
   extractVideo,
-  enqueueVideo,
   getQueueStatus,
+  cancelJob,
+  downloadVideo,
 } from "./api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -30,7 +31,7 @@ import {
   CardFooter,
 } from "@/components/ui/card";
 import Image from "next/image";
-import { Trash, Download } from "lucide-react";
+import { Trash, Download, Check, X, Loader2 } from "lucide-react";
 
 interface Video {
   id: number;
@@ -42,10 +43,31 @@ interface Video {
   thumbnail?: string;
 }
 
+interface DownloadJob {
+  localId: string;
+  url: string;
+  title?: string;
+  status: "extracting" | "adding" | "queued" | "processing" | "done" | "failed" | "cancelled";
+  message: string;
+  jobId?: string;
+  queuePosition?: number;
+  abortController?: AbortController;
+}
+
 const PAGE_SIZE = 20;
 
+const STATUS_STYLES: Record<DownloadJob["status"], string> = {
+  extracting: "bg-yellow-500/20 text-yellow-400",
+  adding:     "bg-indigo-500/20 text-indigo-400",
+  queued:     "bg-orange-500/20 text-orange-400",
+  processing: "bg-blue-500/20 text-blue-400",
+  done:       "bg-green-500/20 text-green-400",
+  failed:     "bg-red-500/20 text-red-400",
+  cancelled:  "bg-gray-500/20 text-gray-400",
+};
+
 export default function HomePage() {
-  const { token, logout, loading } = useAuth();
+  const { token, logout, loading, authEnabled } = useAuth();
   const router = useRouter();
   const [videos, setVideos] = useState<Video[]>([]);
   const [categories, setCategories] = useState<string[]>([]);
@@ -58,8 +80,13 @@ export default function HomePage() {
   const [showDialog, setShowDialog] = useState(false);
   const loaderRef = useRef<HTMLDivElement | null>(null);
   const [fetching, setFetching] = useState(false);
-  const [addLoading, setAddLoading] = useState(false);
-  const [queuedJob, setQueuedJob] = useState<{ job_id: string; message: string; status?: string } | null>(null);
+  const [downloads, setDownloads] = useState<DownloadJob[]>([]);
+  const downloadsRef = useRef<DownloadJob[]>([]);
+
+  // Keep ref in sync so polling interval always sees latest state
+  useEffect(() => {
+    downloadsRef.current = downloads;
+  }, [downloads]);
 
   async function fetchCategories() {
     try {
@@ -76,12 +103,7 @@ export default function HomePage() {
       setFetching(true);
       try {
         const skip = reset ? 0 : videos.length;
-        const newVideos = await listVideos(
-          token,
-          selectedCategory,
-          skip,
-          PAGE_SIZE
-        );
+        const newVideos = await listVideos(token, selectedCategory, skip, PAGE_SIZE);
         setVideos((prev) => (reset ? newVideos : [...prev, ...newVideos]));
         setHasMore(newVideos.length === PAGE_SIZE);
       } catch {
@@ -94,56 +116,77 @@ export default function HomePage() {
   );
 
   useEffect(() => {
-    if (!loading && !token) {
-      router.replace("/login");
-    }
+    if (!loading && !token) router.replace("/login");
   }, [token, loading, router]);
 
-  // Handle queue polling
-  useEffect(() => {
-    if (!token || !queuedJob || !queuedJob.job_id) return;
+  // Poll all active queue jobs in one interval
+  const hasActiveQueueJobs = downloads.some(
+    (d) => d.jobId && (d.status === "queued" || d.status === "processing")
+  );
 
-    let polling = true;
+  // Treat "cancelled" returned by polling as a terminal state
+  const TERMINAL = new Set(["done", "failed", "cancelled"]);
+
+  useEffect(() => {
+    if (!token || !hasActiveQueueJobs) return;
+
     const interval = setInterval(async () => {
-      if (!polling) return;
-      try {
-        const statusData = await getQueueStatus(token, queuedJob.job_id);
-        
-        if (statusData.status === "done") {
-          polling = false;
-          clearInterval(interval);
-          setQueuedJob((prev) => prev ? { ...prev, message: "Video ready!", status: "done" } : null);
-          
-          // Refresh list to show new video
-          setTimeout(() => {
-            setVideos([]);
-            setHasMore(true);
-            fetchMoreVideos(true);
-            // Clear job status after 5s
-            setTimeout(() => setQueuedJob(null), 5000);
-          }, 500);
-        } else if (statusData.status === "failed") {
-          polling = false;
-          clearInterval(interval);
-          setQueuedJob((prev) => prev ? { ...prev, message: `Failed: ${statusData.error}`, status: "failed" } : null);
-        } else {
-          // Update status message
-          const msg = statusData.status === "processing" 
-            ? "Downloading and processing video..." 
-            : `Queued (Position: ${statusData.queue_position ?? "unknown"})`;
-          
-          setQueuedJob((prev) => prev ? { ...prev, message: msg } : null);
-        }
-      } catch (err) {
-        console.error("Polling error:", err);
-      }
+      const active = downloadsRef.current.filter(
+        (d) => d.jobId && (d.status === "queued" || d.status === "processing")
+      );
+      if (active.length === 0) return;
+
+      await Promise.all(
+        active.map(async (job) => {
+          try {
+            const data = await getQueueStatus(token, job.jobId!);
+
+            if (TERMINAL.has(data.status)) {
+              const isDone = data.status === "done";
+              setDownloads((prev) =>
+                prev.map((d) =>
+                  d.localId === job.localId
+                    ? {
+                        ...d,
+                        status: data.status,
+                        message:
+                          isDone ? "Video ready!" :
+                          data.status === "cancelled" ? "Cancelled" :
+                          `Failed: ${data.error}`,
+                      }
+                    : d
+                )
+              );
+              if (isDone) {
+                setVideos([]);
+                setHasMore(true);
+                fetchMoreVideos(true);
+                setTimeout(() => {
+                  setDownloads((prev) => prev.filter((d) => d.localId !== job.localId));
+                }, 5000);
+              }
+            } else {
+              const msg =
+                data.status === "processing"
+                  ? "Downloading and processing video..."
+                  : "Queued for processing";
+              setDownloads((prev) =>
+                prev.map((d) =>
+                  d.localId === job.localId
+                    ? { ...d, status: data.status, message: msg, queuePosition: data.queue_position }
+                    : d
+                )
+              );
+            }
+          } catch (err) {
+            console.error("Polling error for job", job.jobId, err);
+          }
+        })
+      );
     }, 3000);
 
-    return () => {
-      polling = false;
-      clearInterval(interval);
-    };
-  }, [token, queuedJob?.job_id, fetchMoreVideos]);
+    return () => clearInterval(interval);
+  }, [token, hasActiveQueueJobs, fetchMoreVideos]);
 
   useEffect(() => {
     if (!token) return;
@@ -159,9 +202,7 @@ export default function HomePage() {
     if (!hasMore || loading) return;
     const observer = new window.IntersectionObserver(
       (entries) => {
-        if (entries[0].isIntersecting && !fetching) {
-          fetchMoreVideos();
-        }
+        if (entries[0].isIntersecting && !fetching) fetchMoreVideos();
       },
       { threshold: 1 }
     );
@@ -172,53 +213,103 @@ export default function HomePage() {
     // eslint-disable-next-line
   }, [loaderRef.current, hasMore, loading, fetching]);
 
-  async function handleAddVideo(e: React.FormEvent) {
+  async function handleAddVideo(e: { preventDefault(): void }) {
     e.preventDefault();
     if (!url || !category) return;
-    setAddLoading(true);
+
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const submittedUrl = url;
+    const submittedCategory = category;
+    const controller = new AbortController();
+
+    // Clear form immediately so the user can queue the next video right away
+    setUrl("");
+    setCategory("");
     setError("");
-    setQueuedJob(null);
+
+    setDownloads((prev) => [
+      ...prev,
+      { localId, url: submittedUrl, status: "extracting", message: "Extracting video metadata...", abortController: controller },
+    ]);
+
     try {
-      let realUrl = url;
-      let title: string | undefined = undefined;
-      let duration: number | undefined = undefined;
+      let realUrl = submittedUrl;
+      let title: string | undefined;
+      let duration: number | undefined;
+
       try {
-        const res = await extractVideo(token!, url);
+        const res = await extractVideo(token!, submittedUrl, controller.signal);
         if (res.video_url) realUrl = res.video_url;
         if (res.title) title = res.title;
         if (res.duration) duration = res.duration;
 
-        // If the extraction returned a queued job signal (blob stream needing long recording)
+        if (title) {
+          setDownloads((prev) =>
+            prev.map((d) => (d.localId === localId ? { ...d, title } : d))
+          );
+        }
+
         if (res.job_id) {
-          setQueuedJob({ job_id: res.job_id, message: res.message || "Video queued for processing." });
-          setUrl("");
-          setCategory("");
+          setDownloads((prev) =>
+            prev.map((d) =>
+              d.localId === localId
+                ? {
+                    ...d,
+                    status: "queued",
+                    message: res.message || "Video queued for processing.",
+                    jobId: res.job_id,
+                  }
+                : d
+            )
+          );
           return;
         }
       } catch {}
 
+      setDownloads((prev) =>
+        prev.map((d) =>
+          d.localId === localId ? { ...d, status: "adding", message: "Saving video..." } : d
+        )
+      );
+
       try {
-        await addVideo(token!, realUrl, category, title, duration);
-      } catch (addErr: any) {
-        // 409 = already exists, treat as success
-        if (addErr?.response?.status !== 409) throw addErr;
+        await addVideo(token!, realUrl, submittedCategory, title, duration);
+      } catch (addErr: unknown) {
+        const axiosErr = addErr as { response?: { status?: number } };
+        if (axiosErr?.response?.status !== 409) throw addErr;
       }
-      setUrl("");
-      setCategory("");
+
+      setDownloads((prev) =>
+        prev.map((d) =>
+          d.localId === localId
+            ? { ...d, title: title || d.url, status: "done", message: "Video added!" }
+            : d
+        )
+      );
       setVideos([]);
       setHasMore(true);
       fetchMoreVideos(true);
-    } catch (e) {
-      console.log("error", e);
-      setError("Failed to add video");
-    } finally {
-      setAddLoading(false);
+
+      setTimeout(() => {
+        setDownloads((prev) => prev.filter((d) => d.localId !== localId));
+      }, 4000);
+    } catch (err: unknown) {
+      // Silently drop aborted requests (user clicked cancel)
+      const isAbort = (err as { name?: string; code?: string })?.name === "CanceledError"
+        || (err as { code?: string })?.code === "ERR_CANCELED";
+      if (isAbort) return;
+      setDownloads((prev) =>
+        prev.map((d) =>
+          d.localId === localId
+            ? { ...d, status: "failed", message: "Failed to add video" }
+            : d
+        )
+      );
     }
   }
 
   function handlePaste(e: React.ClipboardEvent<HTMLInputElement>) {
-    const pasted = e.clipboardData.getData("text");
-    setUrl(pasted.trim());
+    setUrl(e.clipboardData.getData("text").trim());
     e.preventDefault();
   }
 
@@ -250,27 +341,38 @@ export default function HomePage() {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        Loading...
-      </div>
+      <div className="min-h-screen flex items-center justify-center">Loading...</div>
     );
   }
 
+  const activeCount = downloads.filter(
+    (d) => d.status !== "done" && d.status !== "failed"
+  ).length;
+
   return (
     <div className="min-h-screen text-white pb-20">
+      {/* Header */}
       <div className="flex justify-between items-center px-8 py-5 glass-panel sticky top-0 z-50 rounded-b-2xl mx-4 mb-10 shadow-xl shadow-indigo-500/10">
-        <h1 
-          className="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-purple-400 cursor-pointer"
+        <h1
+          className="text-2xl font-bold bg-clip-text text-transparent bg-linear-to-r from-indigo-400 to-purple-400 cursor-pointer"
           onClick={() => window.location.reload()}
         >
-          VideoSearch
+          VidQ
         </h1>
-        <Button variant="outline" onClick={logout} className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200">
-          Logout
-        </Button>
+        {authEnabled && (
+          <Button
+            variant="outline"
+            onClick={logout}
+            className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200"
+          >
+            Logout
+          </Button>
+        )}
       </div>
+
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
-        <div className="glass-panel p-6 md:p-8 rounded-[2rem] mb-12 shadow-2xl shadow-purple-500/5 transform transition-all hover:scale-[1.01] duration-500">
+        {/* Add Video Form */}
+        <div className="glass-panel p-6 md:p-8 rounded-4xl mb-8 shadow-2xl shadow-purple-500/5 transform transition-all hover:scale-[1.01] duration-500">
           <form onSubmit={handleAddVideo} className="flex flex-col sm:flex-row gap-4">
             <Input
               placeholder="Video URL (YouTube, Vimeo, etc)"
@@ -287,49 +389,149 @@ export default function HomePage() {
             />
             <Button
               type="submit"
-              disabled={addLoading || !url || !category}
-              className="sm:w-auto w-full h-14 px-8 font-semibold rounded-xl bg-gradient-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 transition-all border-none shadow-lg shadow-indigo-500/25 text-white"
+              disabled={!url || !category}
+              className="sm:w-auto w-full h-14 px-8 font-semibold rounded-xl bg-linear-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 transition-all border-none shadow-lg shadow-indigo-500/25 text-white disabled:opacity-50"
             >
-              {addLoading ? (
-                <>
-                  <span className="animate-spin mr-2">⏳</span> Processing...
-                </>
-              ) : (
-                "Add Video"
-              )}
+              Add Video
             </Button>
           </form>
         </div>
+
         {error && <div className="text-red-500 mb-4">{error}</div>}
-        {queuedJob && (
-          <div className={`mb-6 p-4 rounded-2xl border transition-colors ${
-            queuedJob.status === "done" ? "bg-green-500/10 border-green-500/30 text-green-300" :
-            queuedJob.status === "failed" ? "bg-red-500/10 border-red-500/30 text-red-300" :
-            "bg-indigo-500/10 border-indigo-500/30 text-indigo-300"
-          } flex items-start gap-3`}>
-            <span className="text-xl mt-0.5">
-              {queuedJob.status === "done" ? "✅" : queuedJob.status === "failed" ? "❌" : "⏳"}
-            </span>
-            <div className="flex-1">
-              <p className={`font-semibold ${
-                queuedJob.status === "done" ? "text-green-200" :
-                queuedJob.status === "failed" ? "text-red-200" :
-                "text-indigo-200"
-              }`}>
-                {queuedJob.status === "done" ? "Processing Detailed!" : 
-                 queuedJob.status === "failed" ? "Processing Failed" : 
-                 "Video queued for processing"}
-              </p>
-              <p className={`text-sm mt-0.5 ${
-                queuedJob.status === "done" ? "text-green-300/80" :
-                queuedJob.status === "failed" ? "text-red-300/80" :
-                "text-indigo-300/80"
-              }`}>{queuedJob.message}</p>
-              <p className="text-xs text-indigo-400/60 mt-1 font-mono">Job ID: {queuedJob.job_id}</p>
+
+        {/* Downloads Dashboard */}
+        {downloads.length > 0 && (
+          <div className="mb-10">
+            <div className="flex items-center gap-3 mb-4">
+              <h2 className="text-base font-semibold text-white">Downloads</h2>
+              {activeCount > 0 && (
+                <span className="flex items-center gap-1.5 text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-1 rounded-full">
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
+                  {activeCount} active
+                </span>
+              )}
             </div>
-            <button onClick={() => setQueuedJob(null)} className="text-indigo-400 hover:text-white transition-colors text-lg leading-none">✕</button>
+            <div className="space-y-2.5">
+              {downloads.map((dl) => (
+                <div
+                  key={dl.localId}
+                  className={`glass-panel px-5 py-4 rounded-2xl border flex items-center gap-4 transition-all ${
+                    dl.status === "done"
+                      ? "border-green-500/25"
+                      : dl.status === "failed"
+                      ? "border-red-500/25"
+                      : "border-indigo-500/20"
+                  }`}
+                >
+                  {/* Status icon */}
+                  <div className="shrink-0">
+                    {dl.status === "done" ? (
+                      <div className="w-8 h-8 rounded-full bg-green-500/15 flex items-center justify-center">
+                        <Check className="w-4 h-4 text-green-400" />
+                      </div>
+                    ) : dl.status === "failed" ? (
+                      <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
+                        <X className="w-4 h-4 text-red-400" />
+                      </div>
+                    ) : (
+                      <div className="w-8 h-8 rounded-full bg-indigo-500/15 flex items-center justify-center">
+                        <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Info */}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-white truncate">
+                      {dl.title || dl.url}
+                    </p>
+                    <p
+                      className={`text-xs mt-0.5 ${
+                        dl.status === "done"
+                          ? "text-green-400"
+                          : dl.status === "failed"
+                          ? "text-red-400"
+                          : "text-indigo-400"
+                      }`}
+                    >
+                      {dl.message}
+                      {dl.queuePosition && dl.status === "queued"
+                        ? ` · Position: ${dl.queuePosition}`
+                        : ""}
+                    </p>
+                    {dl.jobId && (
+                      <p className="text-[10px] text-gray-600 font-mono mt-0.5">
+                        Job: {dl.jobId.slice(0, 16)}…
+                      </p>
+                    )}
+                  </div>
+
+                  {/* Status badge */}
+                  <span
+                    className={`hidden sm:inline text-[10px] px-2.5 py-1 rounded-full font-medium uppercase tracking-wider shrink-0 ${STATUS_STYLES[dl.status]}`}
+                  >
+                    {dl.status}
+                  </span>
+
+                  {/* Cancel — extracting/adding: abort HTTP request */}
+                  {(dl.status === "extracting" || dl.status === "adding") && (
+                    <button
+                      title="Cancel"
+                      onClick={() => {
+                        dl.abortController?.abort();
+                        setDownloads((prev) => prev.filter((d) => d.localId !== dl.localId));
+                      }}
+                      className="shrink-0 text-orange-400 hover:text-white transition-colors ml-1"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {/* Cancel — queued/processing: call cancel API */}
+                  {dl.jobId && (dl.status === "queued" || dl.status === "processing") && (
+                    <button
+                      title="Cancel"
+                      onClick={async () => {
+                        try {
+                          await cancelJob(token!, dl.jobId!);
+                          setDownloads((prev) =>
+                            prev.map((d) =>
+                              d.localId === dl.localId
+                                ? { ...d, status: "cancelled", message: "Cancelled by user" }
+                                : d
+                            )
+                          );
+                        } catch {
+                          setDownloads((prev) => prev.filter((d) => d.localId !== dl.localId));
+                        }
+                      }}
+                      className="shrink-0 text-orange-400 hover:text-white transition-colors ml-1"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {/* Dismiss — terminal states */}
+                  {(dl.status === "done" || dl.status === "failed" || dl.status === "cancelled") && (
+                    <button
+                      title="Dismiss"
+                      onClick={() =>
+                        setDownloads((prev) =>
+                          prev.filter((d) => d.localId !== dl.localId)
+                        )
+                      }
+                      className="shrink-0 text-gray-500 hover:text-white transition-colors ml-1"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
           </div>
         )}
+
+        {/* Category Tabs */}
         <div className="flex justify-center mb-12">
           <Tabs
             value={selectedCategory}
@@ -338,9 +540,9 @@ export default function HomePage() {
           >
             <TabsList className="bg-white/5 border border-white/10 p-1.5 rounded-2xl w-full flex overflow-x-auto hide-scrollbar h-auto">
               {categories.map((cat) => (
-                <TabsTrigger 
-                  key={cat} 
-                  value={cat} 
+                <TabsTrigger
+                  key={cat}
+                  value={cat}
                   className="capitalize rounded-xl px-6 py-3 text-sm font-medium transition-all data-[state=active]:bg-indigo-500 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=active]:shadow-indigo-500/30 text-gray-400 hover:text-white"
                 >
                   {cat || "all"}
@@ -349,6 +551,8 @@ export default function HomePage() {
             </TabsList>
           </Tabs>
         </div>
+
+        {/* Video Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
           {videos.length === 0 && !loading && (
             <div className="text-gray-500 col-span-3">No videos found.</div>
@@ -356,7 +560,7 @@ export default function HomePage() {
           {videos.map((video) => (
             <Card
               key={`${video.id}-${video.url}`}
-              className="glass-panel overflow-hidden flex flex-col min-h-[360px] min-w-[320px] rounded-3xl border border-white/10 hover:border-indigo-500/30 shadow-xl hover:shadow-indigo-500/20 transform transition-all hover:-translate-y-2 duration-500 group bg-transparent"
+              className="glass-panel overflow-hidden flex flex-col min-h-90 min-w-[320px] rounded-3xl border border-white/10 hover:border-indigo-500/30 shadow-xl hover:shadow-indigo-500/20 transform transition-all hover:-translate-y-2 duration-500 group bg-transparent"
             >
               {video.thumbnail && (
                 <div className="w-full aspect-video relative overflow-hidden bg-black/40">
@@ -368,12 +572,12 @@ export default function HomePage() {
                     sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
                     priority={true}
                   />
-                  <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-transparent"></div>
+                  <div className="absolute inset-0 bg-linear-to-t from-black/80 via-transparent to-transparent" />
                 </div>
               )}
               <CardHeader className="pb-3 pt-5 relative z-10">
                 <CardTitle
-                  className="text-lg font-bold break-words whitespace-pre-line leading-tight truncate text-white drop-shadow-md"
+                  className="text-lg font-bold wrap-break-word whitespace-pre-line leading-tight truncate text-white drop-shadow-md"
                   title={video.title}
                 >
                   {video.title || "Untitled Video"}
@@ -410,20 +614,19 @@ export default function HomePage() {
                   onClick={async (e) => {
                     e.stopPropagation();
                     try {
-                      const res = await fetch(video.url);
-                      const blob = await res.blob();
-                      const url = window.URL.createObjectURL(blob);
+                      const blob = await downloadVideo(token!, video.id);
+                      const blobUrl = window.URL.createObjectURL(blob);
                       const a = document.createElement("a");
-                      a.href = url;
-                      const ext = video.url.split('.').pop()?.split('?')[0] || 'mp4';
-                      a.download = video.title ? `${video.title.replace(/[^a-z0-9]/gi, '_').toLowerCase()}.${ext}` : `video-${video.id}.${ext}`;
+                      a.href = blobUrl;
+                      const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
+                      a.download = video.title
+                        ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${ext}`
+                        : `video-${video.id}.${ext}`;
                       document.body.appendChild(a);
                       a.click();
                       document.body.removeChild(a);
-                      window.URL.revokeObjectURL(url);
-                    } catch (err) {
-                      console.error("Download failed", err);
-                      // Fallback
+                      window.URL.revokeObjectURL(blobUrl);
+                    } catch {
                       window.open(video.url, "_blank");
                     }
                   }}
@@ -446,21 +649,29 @@ export default function HomePage() {
             </Card>
           ))}
         </div>
-        <div ref={loaderRef} className="h-8"></div>
+        <div ref={loaderRef} className="h-8" />
+
+        {/* Delete Confirmation */}
         <Dialog open={showDialog} onOpenChange={setShowDialog}>
-          <DialogContent className="glass-panel border-white/10 bg-gray-950/90 text-white rounded-[2rem] p-6 sm:p-8 shadow-2xl shadow-black">
+          <DialogContent className="glass-panel border-white/10 bg-gray-950/90 text-white rounded-4xl p-6 sm:p-8 shadow-2xl shadow-black">
             <DialogHeader>
               <DialogTitle className="text-xl">Delete Video</DialogTitle>
             </DialogHeader>
             <div className="text-gray-300 my-2">
-              Are you sure you want to delete this video? This action cannot be
-              undone.
+              Are you sure you want to delete this video? This action cannot be undone.
             </div>
             <DialogFooter className="mt-4 gap-2">
-              <Button variant="outline" onClick={() => setShowDialog(false)} className="rounded-xl border-white/10 hover:bg-white/10 hover:text-white text-gray-300">
+              <Button
+                variant="outline"
+                onClick={() => setShowDialog(false)}
+                className="rounded-xl border-white/10 hover:bg-white/10 hover:text-white text-gray-300"
+              >
                 Cancel
               </Button>
-              <Button onClick={confirmDelete} className="bg-red-500/20 text-red-400 hover:bg-red-500/40 hover:text-white border border-red-500/30 transition-all rounded-xl shadow-lg shadow-red-500/20">
+              <Button
+                onClick={confirmDelete}
+                className="bg-red-500/20 text-red-400 hover:bg-red-500/40 hover:text-white border border-red-500/30 transition-all rounded-xl shadow-lg shadow-red-500/20"
+              >
                 Delete
               </Button>
             </DialogFooter>

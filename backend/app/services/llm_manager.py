@@ -83,26 +83,43 @@ class OllamaProvider(LLMProvider):
                 ) from e
             return res.json()
 
+    @staticmethod
+    def _parse(content: str) -> dict:
+        """
+        Robust parser for Ollama output.
+        qwen3.x emits <think>…</think> reasoning blocks before the JSON —
+        strip those first, then fall back to the generic _parse_json extractor.
+        """
+        import re as _re
+        # Strip <think>…</think> blocks (qwen3 chain-of-thought output)
+        content = _re.sub(r'<think>.*?</think>', '', content, flags=_re.DOTALL).strip()
+        # Try direct parse first (fast path)
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            pass
+        # Extract first {...} block
+        return _parse_json(content)
+
     async def call_text(self, prompt: str) -> dict:
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
-            "format": "json",              # important
-            "options": {"temperature": 0}, # more reliable for JSON
+            "format": "json",
+            "options": {"temperature": 0},
         }
-        logger.debug(f"Submitting payload to Ollama: {self.model_name}")
+        logger.info(f"Ollama call_text → model={self.model_name}")
         data = await self._post(payload)
         content = data["message"]["content"].strip()
-        logger.debug(f"Ollama raw response (first 200 chars): {content[:200]}")
+        logger.debug(f"Ollama raw (first 300): {content[:300]}")
         try:
-            return json.loads(content)
+            return self._parse(content)
         except Exception as e:
-            logger.error(f"Failed to parse JSON from Ollama response: {content}")
+            logger.error(f"Ollama JSON parse failed. Raw: {content[:500]}")
             raise e
 
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
-        # image_b64 must be raw base64 only, not data:image/...;base64,...
         payload = {
             "model": self.model_name,
             "messages": [
@@ -113,25 +130,24 @@ class OllamaProvider(LLMProvider):
                 }
             ],
             "stream": False,
-            "format": "json",              # important
-            "options": {"temperature": 0}, # more reliable for JSON
+            "format": "json",
+            "options": {"temperature": 0},
         }
-        logger.debug(f"Submitting vision payload to Ollama: {self.model_name}")
+        logger.info(f"Ollama call_vision → model={self.model_name}")
         try:
             data = await self._post(payload)
             content = data["message"]["content"].strip()
-            logger.debug(f"Ollama vision raw response (first 200 chars): {content[:200]}")
-            return json.loads(content)
+            logger.debug(f"Ollama vision raw (first 300): {content[:300]}")
+            return self._parse(content)
         except Exception as e:
-            # Fallback: Many local models (like qwen3.5 text version) don't support vision
-            # and will error out if 'images' is present. We retry without the image.
-            logger.warning(f"Ollama vision call failed ({e}), falling back to text-only mode...")
-            payload["messages"][0].pop("images")
+            # qwen3.5 is text-only — retry without the image
+            logger.warning(f"Ollama vision failed ({e}), retrying text-only…")
+            payload["messages"][0].pop("images", None)
             try:
                 data = await self._post(payload)
                 content = data["message"]["content"].strip()
-                logger.info("Ollama fallback text-only successful.")
-                return json.loads(content)
+                logger.info("Ollama text-only fallback succeeded.")
+                return self._parse(content)
             except Exception as e2:
                 logger.error(f"Ollama text-only fallback also failed: {e2}")
                 raise e2
@@ -205,7 +221,7 @@ class AnthropicProvider(LLMProvider):
 
 
 class FallbackLLMManager:
-    def __init__(self, providers: list[LLMProvider], default: str | None = "Anthropic"):
+    def __init__(self, providers: list[LLMProvider], default: str | None = None):
         """
         :param providers: List of available LLM providers.
         :param default: Optional name of the provider to use exclusively (e.g., 'Ollama', 'OpenAI').
@@ -236,26 +252,33 @@ class FallbackLLMManager:
             return ordered
         return list(enumerate(self.providers))
 
+    @staticmethod
+    def _provider_label(provider: "LLMProvider") -> str:
+        name = provider.__class__.__name__
+        if hasattr(provider, "model_name"):
+            return f"{name}({provider.model_name})"
+        return name
+
     async def _run(self, method_name: str, *args) -> dict:
         last_error = None
         for original_idx, provider in self._ordered_providers():
-            provider_name = provider.__class__.__name__
+            provider_label = self._provider_label(provider)
             method = getattr(provider, method_name)
             for attempt in range(1):
                 try:
                     if attempt == 0:
-                        logger.info(f"[{method_name}] Attempting with {provider_name}")
+                        logger.info(f"[{method_name}] Using {provider_label}")
                     else:
-                        logger.warning(f"[{method_name}] Retrying {provider_name} (attempt 2)...")
+                        logger.warning(f"[{method_name}] Retrying {provider_label} (attempt 2)...")
                     result = await method(*args)
                     if self._working_provider_index != original_idx:
-                        logger.info(f"Promoting {provider_name} as preferred provider.")
+                        logger.info(f"Promoting {provider_label} as preferred provider.")
                         self._working_provider_index = original_idx
                     return result
                 except Exception as e:
-                    logger.warning(f"[{method_name}] Attempt {attempt + 1} failed for {provider_name}: {e}")
+                    logger.warning(f"[{method_name}] Attempt {attempt + 1} failed for {provider_label}: {e}")
                     last_error = e
-            logger.error(f"[{method_name}] Both attempts failed for {provider_name}. Trying next...")
+            logger.error(f"[{method_name}] Both attempts failed for {provider_label}. Trying next...")
         raise Exception(f"All LLM providers failed. Last error: {last_error}")
 
     async def execute_text(self, prompt: str) -> dict:

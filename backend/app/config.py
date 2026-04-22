@@ -14,6 +14,10 @@ class Settings:
         self.openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
         self.anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
         self.auth_enabled: bool = os.getenv("AUTH_ENABLED", "False").lower() in ("true", "1", "yes")
+        # LLM provider selection: "ollama" | "openai" | "anthropic" | "" (auto-fallback chain)
+        self.llm_provider: str = os.getenv("LLM_PROVIDER", "anthropic").lower().strip()
+        self.ollama_host: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
+        self.ollama_model: str = os.getenv("OLLAMA_MODEL", "qwen3.5:latest")
         
         # Determine the temp storage directory path
         default_storage = str(Path(__file__).parent.parent / "temp_storage")
