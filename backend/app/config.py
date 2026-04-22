@@ -23,6 +23,9 @@ class Settings:
         default_storage = str(Path(__file__).parent.parent / "temp_storage")
         self.temp_storage_dir: str = os.getenv("TEMP_STORAGE_DIR", default_storage)
 
+        # Base URL for generating self-referencing URLs (e.g. temp_storage links)
+        self.base_url: str = os.getenv("BASE_URL", "http://localhost:8000")
+
         if not self.database_url:
             raise ValueError("Missing required environment variable: DATABASE_URL")
 settings = Settings()

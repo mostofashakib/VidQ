@@ -1,9 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from app.logging_config import configure_logging
 from app.routers.auth import router as auth_router
 from app.routers.video import router as video_router
 from app.config import get_settings
+
+configure_logging()
 
 app = FastAPI()
 

@@ -6,8 +6,7 @@ temp_storage/
 videos.db
 .env
 backend/.venv/
-backend/__pycache__/
-backend/app/__pycache__/
+**/__pycache__/
 .next/
 frontend/.next/
 frontend/out/

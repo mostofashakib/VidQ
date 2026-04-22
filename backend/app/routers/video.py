@@ -18,11 +18,6 @@ import ipaddress
 import logging
 
 logger = logging.getLogger("VideoRouter")
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter('[%(levelname)s] [Router] %(message)s'))
-    logger.addHandler(handler)
 
 router = APIRouter()
 

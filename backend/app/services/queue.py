@@ -14,11 +14,6 @@ from enum import Enum
 from typing import Optional
 
 logger = logging.getLogger("VideoQueue")
-logger.setLevel(logging.DEBUG)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    handler.setFormatter(logging.Formatter('[%(levelname)s] [Queue] %(message)s'))
-    logger.addHandler(handler)
 
 
 class JobStatus(str, Enum):
