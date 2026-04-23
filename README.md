@@ -1,57 +1,83 @@
 # VidQ
 
-An agentic video downloader that download any video from any website. Paste a URL, and VidQ navigates the page autonomously, handling cookie banners, ad overlays, and custom video players and then downloads and saves the video locally so you can play it anytime.
+**Paste a URL. VidQ downloads the video.** No browser extensions, no site-specific configs — it works by navigating the page like a human, handling cookie banners, ad overlays, and custom video players automatically.
 
 ---
 
-## How it works
+## How It Works
 
-1. You paste a URL and a category into the UI.
-2. VidQ opens the page in a headless Chromium browser.
-3. A 3-layer agentic loop runs to get the video playing:
-   - **Layer 1 (no LLM)** — JS heuristics dismiss consent banners, skip-ad buttons, and age-gates, then call `video.play()` directly on the largest video element.
-   - **Layer 2 (LLM vision)** — A screenshot + the page HTML are sent to the vision model (OpenAI / Anthropic / Ollama). The model returns the CSS selector of the next thing to click (play button, close button, etc.).
-   - **Layer 3 (recovery)** — After each click, force-play and heuristic selectors run again to confirm playback started.
-4. Once the video is playing, VidQ identifies the **main video** — the one with the largest screen dimensions — and reads its `currentSrc` URL.
-5. It downloads the video directly via **ffmpeg** with the correct `Referer` and `User-Agent` headers so CDN session tokens are honoured.
-6. If ffmpeg can't download it (e.g. DRM-adjacent content), a **MediaRecorder fallback** captures the stream in real time.
-7. The saved file is stored locally and streamed back to the browser on demand — no expiring CDN links.
+VidQ runs a two-pass pipeline inside a headless Chromium browser:
+
+### Pass 1 — Fast Download
+1. Opens the page and intercepts network requests for video files (`.mp4`, `.m3u8`, `.webm`, etc.)
+2. Runs a **3-layer agentic loop** to get the video playing:
+   - **Layer 1** — Pure JS heuristics dismiss cookie banners, skip-ad buttons, countdowns, and age-gates. Calls `video.play()` directly.
+   - **Layer 2** — Takes a screenshot + page HTML and asks an LLM vision model which element to click next (play button, close overlay, etc.)
+   - **Layer 3** — After each click, force-play and heuristic selectors re-run to confirm playback started.
+3. Identifies the **main video** — the one with the largest on-screen dimensions — and downloads it via `ffmpeg` with the correct `Referer` and `User-Agent` headers so CDN session tokens are honored.
+
+### Pass 2 — MediaRecorder Fallback
+If `ffmpeg` can't download the file (e.g. DRM-adjacent content or blob-URL streams), VidQ injects a `MediaRecorder` into the page and captures the stream in real time, then converts the result to MP4.
+
+Videos are stored locally — no expiring CDN links.
 
 ---
 
 ## Features
 
-| Feature | Detail |
-|---|---|
-| **Agentic navigation** | LLM vision + HTML guide click decisions on any site — no per-site config |
-| **Smart main video detection** | Selects the largest video element by screen area, ignoring ads and related-video thumbnails |
-| **Ad URL filtering** | Blocks known ad-network domains and dimension-pattern URLs (e.g. `440x250.mp4`) at the network intercept layer |
-| **ffmpeg direct download** | Downloads with `Referer` + `User-Agent` headers — works on most CDNs without browser session hacks |
-| **MediaRecorder fallback** | Captures the stream live for any video a browser can play |
-| **Parallel job queue** | Queue as many URLs as you want; they process one at a time in the background |
-| **Cancellation** | Cancel any job at any stage — HTTP request, queued, or mid-recording |
-| **LLM fallback chain** | Tries OpenAI → Anthropic → Ollama in order; remembers the last working provider |
-| **Video player + download** | Watch saved videos in-browser or download them with one click |
-| **Categories** | Tag videos at add-time; filter by category in the grid |
+### Agentic Navigation
+- Works on any website without per-site configuration
+- LLM vision model guides click decisions when JS heuristics aren't enough
+- Supports **OpenAI (GPT-4o)**, **Anthropic (Claude Haiku)**, and **Ollama** — tries them in order and remembers the last working provider
+
+### Smart Video Detection
+- Selects the video element with the largest screen area, ignoring ads and thumbnail previews
+- Filters ad URLs by domain blocklist (`doubleclick.net`, `adnxs.com`, etc.) and dimension patterns (`440x250.mp4`)
+- **Duration guard** — if a downloaded file is less than half the duration reported by the page, VidQ discards it as a pre-roll ad and tries the next candidate
+
+### Quality Processing
+- All videos are scaled to **720p** using Lanczos + libx264 CRF 18 (upscales if below, downscales if above)
+- MediaRecorder captures are converted from WebM to MP4 automatically
+
+### Job Queue
+- Add as many URLs as you want — they process one at a time in the background
+- Live status updates: `extracting → queued → processing → done`
+- **Cancel any job at any stage** — queued jobs are removed immediately; in-progress jobs stop at the next checkpoint (within ~300ms)
+
+### Video Library
+- Saved videos stream directly from local storage — watch in-browser or download with one click
+- Tag videos with a category at add-time and filter by category in the grid
+- Infinite scroll with deduplication (same URL or title won't be saved twice)
+
+### Security
+- URL validation blocks SSRF attacks (private IPs, loopback addresses, non-HTTP schemes)
+- Optional password authentication with timing-safe token comparison
+- Auth can be disabled entirely for local-only use
 
 ---
 
 ## Architecture
 
 ```
-frontend/   Next.js 15 (App Router) — video grid, download queue UI, player
+frontend/   Next.js 15 (App Router) — video grid, download queue panel, in-browser player
 backend/    FastAPI
-  routers/  REST endpoints (auth, videos, queue, download)
+  routers/
+    auth.py         Password login, Bearer token validation
+    video.py        Add video, list, delete, queue status, file serving
   services/
-    scraper.py      Playwright pipeline — agentic interact, ffmpeg download, MediaRecorder
-    llm_manager.py  Provider abstraction + fallback chain (OpenAI, Anthropic, Ollama)
-    queue.py        Background job queue with per-job cancellation
+    scraper/
+      pipeline.py   Two-pass Playwright pipeline (Fast Pass + MediaRecorder fallback)
+      playback.py   Agentic interact loop, JS heuristics, force-play
+      media.py      ffmpeg download, quality scaling, ad URL filtering
+      html.py       HTML cleaning for LLM context
+    llm_manager.py  Provider abstraction + fallback chain (OpenAI → Anthropic → Ollama)
+    queue.py        Thread-safe background job queue with per-job cancellation
   db.py     SQLite via SQLAlchemy
 ```
 
 ---
 
-## Getting started
+## Getting Started
 
 ### Prerequisites
 
@@ -68,20 +94,20 @@ git clone https://github.com/mostofashakib/VidQ.git
 cd VidQ
 ```
 
-**2. Backend environment**
+**2. Configure the backend**
 
 Create `backend/.env`:
 ```env
-OPENAI_API_KEY=sk-...          # optional
-ANTHROPIC_API_KEY=sk-ant-...   # optional
-OLLAMA_HOST=http://127.0.0.1:11434  # optional, defaults to this
-LLM_PROVIDER=                  # leave blank for auto-fallback, or set "openai" / "anthropic" / "ollama"
-AUTH_PASSWORD=yourpassword     # leave blank to disable auth
+OPENAI_API_KEY=sk-...                    # optional
+ANTHROPIC_API_KEY=sk-ant-...             # optional
+OLLAMA_HOST=http://127.0.0.1:11434       # optional, defaults to this
+LLM_PROVIDER=                            # leave blank for auto-fallback, or set "openai" / "anthropic" / "ollama"
+AUTH_PASSWORD=yourpassword               # leave blank to disable auth
 CORS_ORIGINS=http://localhost:3000
 TEMP_STORAGE_DIR=temp_storage
 ```
 
-**3. Run**
+**3. Start**
 ```bash
 ./run.sh
 ```
@@ -95,8 +121,8 @@ Open [http://localhost:3000](http://localhost:3000).
 1. Paste a video page URL (any site).
 2. Enter a category name.
 3. Click **Add Video**.
-4. Watch progress in the Downloads panel — the job moves through `extracting → queued → processing → done`.
-5. Once done, the video appears in the grid. Click ▶ to play in-browser, or the download icon to save to disk.
+4. Watch the job move through `extracting → queued → processing → done` in the Downloads panel.
+5. Once done, the video appears in the grid — click ▶ to play in-browser, or the download icon to save to disk.
 
 ---
 
@@ -106,4 +132,8 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-Created by Mostofa Shakib
+<div align="center">
+
+Built by [Variant Labs](https://www.vriantlabs.com) · [hello@vriantlabs.com](mailto:hello@vriantlabs.com)
+
+</div>
