@@ -1,6 +1,6 @@
 # VidQ
 
-An agentic video downloader that captures any video from any website. Paste a URL, and VidQ navigates the page autonomously — handling cookie banners, ad overlays, and custom video players — then downloads and saves the video locally so you can play it anytime.
+An agentic video downloader that download any video from any website. Paste a URL, and VidQ navigates the page autonomously, handling cookie banners, ad overlays, and custom video players and then downloads and saves the video locally so you can play it anytime.
 
 ---
 
