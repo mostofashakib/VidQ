@@ -210,11 +210,21 @@ async def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_
         logger.error(f"Playwright scraping failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
         
-    result = await call_llm_with_html_and_screenshot(llm_manager, html, screenshot_b64, network_video_urls, thumbnail_url)
-    result["thumbnail"] = result.get("thumbnail") or thumbnail_url
-    # Always prefer the locally downloaded file over an expiring CDN URL
-    if temp_video_url:
-        result["video_url"] = temp_video_url
+    if not screenshot_b64:
+        # Embed fast-path: metadata already extractable from HTML, no LLM needed
+        embed_soup = BeautifulSoup(html, "html.parser") if html else None
+        title = None
+        if embed_soup:
+            og_title = embed_soup.find("meta", property="og:title", content=True)
+            title = og_title["content"] if og_title else (
+                embed_soup.title.text.strip() if embed_soup.title else None
+            )
+        result = {"title": title or url, "thumbnail": thumbnail_url, "video_url": temp_video_url or ""}
+    else:
+        result = await call_llm_with_html_and_screenshot(llm_manager, html, screenshot_b64, network_video_urls, thumbnail_url)
+        result["thumbnail"] = result.get("thumbnail") or thumbnail_url
+        if temp_video_url:
+            result["video_url"] = temp_video_url
 
     return result
 

@@ -4,12 +4,14 @@ import os
 import re
 import subprocess
 import uuid
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 
 import httpx
 import imageio_ffmpeg
+from bs4 import BeautifulSoup
 
 from app.config import get_settings
+from app.services.video_utils import ensure_min_quality
 
 logger = logging.getLogger("VideoScraper")
 
@@ -80,6 +82,151 @@ async def _get_main_playing_video_url(page) -> str | None:
     return None
 
 
+_DIRECT_VIDEO_EXTENSIONS = frozenset([".mp4", ".m3u8", ".webm", ".mov", ".flv", ".avi", ".mkv"])
+_DIRECT_VIDEO_CONTENT_TYPES = frozenset(["video/mp4", "video/webm", "video/ogg", "application/x-mpegurl",
+                                          "application/vnd.apple.mpegurl", "video/x-flv", "video/quicktime"])
+
+
+async def _detect_direct_video_embed(url: str, user_agent: str) -> tuple[str, str] | None:
+    """
+    Determine if the URL is a directly downloadable video (returns (url, ""))
+    or a minimal embed page wrapping a video (returns (video_src, html)).
+    Returns None for full web pages that need Playwright.
+    """
+    headers = {"User-Agent": user_agent}
+
+    # Fast path: URL path ends with a known video extension — no HTTP needed
+    path = urlparse(url).path.lower()
+    if any(path.endswith(ext) for ext in _DIRECT_VIDEO_EXTENSIONS):
+        logger.info(f"Direct video URL detected by extension: {url[:100]}")
+        return url, ""
+
+    # Cheap HEAD request to check Content-Type before downloading the body
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            head = await client.head(url, headers=headers)
+            content_type = head.headers.get("content-type", "").split(";")[0].strip().lower()
+            if content_type in _DIRECT_VIDEO_CONTENT_TYPES:
+                logger.info(f"Direct video URL detected by Content-Type ({content_type}): {url[:100]}")
+                return url, ""
+            if head.status_code != 200 or "text/html" not in content_type:
+                return None
+    except Exception:
+        return None
+
+    # Full GET only for HTML pages — check if it's a minimal video embed
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                return None
+            html = resp.text
+    except Exception:
+        return None
+
+    soup = BeautifulSoup(html, "html.parser")
+    body = soup.body
+    if not body:
+        return None
+
+    videos = body.find_all("video")
+    if not videos:
+        return None
+
+    # Extract the first usable direct HTTP video URL
+    video_url: str | None = None
+    for video in videos:
+        src = video.get("src") or ""
+        if src and not src.startswith("blob:"):
+            if src.startswith("/"):
+                src = urljoin(url, src)
+            if src.startswith("http"):
+                video_url = src
+                break
+        source = video.find("source")
+        if source:
+            src = source.get("src") or ""
+            if src:
+                if src.startswith("/"):
+                    src = urljoin(url, src)
+                if src.startswith("http") and not src.startswith("blob:"):
+                    video_url = src
+                    break
+
+    if not video_url:
+        return None
+
+    # Reject pages with substantial surrounding content
+    for tag in body.find_all(["script", "style", "noscript"]):
+        tag.decompose()
+    block_tags = body.find_all(["p", "article", "section", "nav", "header", "footer", "aside",
+                                 "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "table"])
+    if len(block_tags) > 3:
+        return None
+    if len(body.get_text(separator=" ", strip=True)) > 500:
+        return None
+
+    logger.info(f"Embedded video page detected, src: {video_url[:100]}")
+    return video_url, html
+
+
+async def _download_embed_video(
+    video_url: str,
+    referer: str,
+    timeout_s: int = 300,
+) -> str | None:
+    """
+    Download a direct embed video using curl (mp4/webm) or yt-dlp (m3u8/HLS).
+    Resizes to 720p if needed. Returns a localhost URL or None on failure.
+    """
+    storage = _settings.temp_storage_dir
+    os.makedirs(storage, exist_ok=True)
+    filename = f"{uuid.uuid4().hex}.mp4"
+    out_path = os.path.join(storage, filename)
+
+    is_m3u8 = ".m3u8" in video_url.lower()
+
+    if is_m3u8:
+        cmd = [
+            "yt-dlp",
+            "--merge-output-format", "mp4",
+            "-o", out_path,
+            video_url,
+        ]
+        label = "yt-dlp"
+    else:
+        cmd = [
+            "curl", "-L", "-s",
+            "--referer", referer,
+            "-o", out_path,
+            video_url,
+        ]
+        label = "curl"
+
+    logger.info(f"{label} embed download: {video_url[:100]}")
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        proc.kill()
+        logger.warning(f"{label} embed download timed out ({timeout_s}s)")
+        return None
+
+    if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+        final_path = ensure_min_quality(out_path)
+        size_kb = os.path.getsize(final_path) // 1024
+        logger.info(f"{label} embed download succeeded: {size_kb}KB → {os.path.basename(final_path)}")
+        return f"{_settings.base_url}/temp_storage/{os.path.basename(final_path)}"
+
+    err_tail = (stderr or b"").decode(errors="replace")[-300:]
+    logger.warning(f"{label} embed download failed (rc={proc.returncode}): {err_tail}")
+    return None
+
+
 async def _download_video_direct(
     video_url: str,
     referer: str,
@@ -117,7 +264,7 @@ async def _download_video_direct(
             logger.warning(f"ffmpeg download timed out ({timeout_s}s)")
             return None
         if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
-            final_path = _ensure_min_quality(out_path)
+            final_path = ensure_min_quality(out_path)
             final_filename = os.path.basename(final_path)
             size_kb = os.path.getsize(final_path) // 1024
             logger.info(f"ffmpeg download succeeded: {size_kb}KB → {final_filename}")
@@ -126,23 +273,6 @@ async def _download_video_direct(
         logger.warning(f"ffmpeg download failed (rc={proc.returncode}): {err_tail}")
     except Exception as e:
         logger.warning(f"ffmpeg download error: {e}")
-    return None
-
-
-def _probe_video_dimensions(video_path: str) -> tuple[int, int] | None:
-    """Return (width, height) by running ffmpeg -i; None if unable to probe."""
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run(
-            [ffmpeg_exe, "-i", video_path],
-            capture_output=True, text=True,
-        )
-        # ffmpeg prints stream info to stderr (exit code 1 is expected — no output file)
-        match = re.search(r'Video:.*?(\d{2,5})x(\d{2,5})', result.stderr)
-        if match:
-            return int(match.group(1)), int(match.group(2))
-    except Exception:
-        pass
     return None
 
 
@@ -161,52 +291,6 @@ def _probe_file_duration(video_path: str) -> float | None:
     except Exception:
         pass
     return None
-
-
-def _ensure_min_quality(video_path: str, min_height: int = 720) -> str:
-    """
-    Resize video to exactly min_height: upscale if below, downscale if above.
-    Uses Lanczos scaling with CRF 18 to preserve visual quality in both directions.
-    Returns the final file path (may differ from input when rescaling occurs).
-    """
-    dims = _probe_video_dimensions(video_path)
-    if dims is None:
-        logger.warning(f"Could not probe {os.path.basename(video_path)} — skipping quality check")
-        return video_path
-
-    width, height = dims
-    if height == min_height:
-        logger.info(f"Video {width}x{height} — already at {min_height}p")
-        return video_path
-
-    direction = "upscaling" if height < min_height else "downscaling"
-    logger.info(f"Video is {width}x{height} — {direction} to {min_height}p with Lanczos")
-    base, ext = os.path.splitext(video_path)
-    out_path = f"{base}_{min_height}p{ext}"
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        cmd = [
-            ffmpeg_exe, "-y",
-            "-i", video_path,
-            "-vf", f"scale=-2:{min_height}:flags=lanczos",
-            "-c:v", "libx264",
-            "-crf", "18",
-            "-preset", "slow",
-            "-c:a", "copy",
-            out_path,
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
-            os.remove(video_path)
-            size_kb = os.path.getsize(out_path) // 1024
-            logger.info(f"Rescaled to {min_height}p: {os.path.basename(out_path)} ({size_kb}KB)")
-            return out_path
-        logger.error(f"Rescale failed (rc={result.returncode}): {result.stderr[-300:]}")
-    except subprocess.TimeoutExpired:
-        logger.error(f"Rescale timed out for {os.path.basename(video_path)}")
-    except Exception as e:
-        logger.error(f"Rescale error: {e}")
-    return video_path
 
 
 def _convert_to_mp4(webm_path: str) -> str:
@@ -231,7 +315,7 @@ def _convert_to_mp4(webm_path: str) -> str:
             logger.error(f"FFMPEG error: {result.stderr}")
             return webm_path
         os.remove(webm_path)
-        final_path = _ensure_min_quality(mp4_path)
+        final_path = ensure_min_quality(mp4_path)
         logger.info(f"Converted to {os.path.basename(final_path)}")
         return final_path
     except Exception as e:

@@ -13,11 +13,15 @@ kill_port() {
     fi
 }
 
-# 1. Kill any existing instances avoiding port conflicts
+# 1. Clear temp_storage
+echo "Clearing temp_storage..."
+rm -rf backend/temp_storage/*
+
+# 2. Kill any existing instances avoiding port conflicts
 kill_port 8000
 kill_port 3000
 
-# 2. Setup and run Backend
+# 3. Setup and run Backend
 echo "Setting up backend..."
 cd backend
 
@@ -54,12 +58,12 @@ uv pip install -r requirements.txt
 playwright install chromium
 
 echo "Starting backend..."
-uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 &
 BACKEND_PID=$!
 
 cd ..
 
-# 3. Setup and run Frontend
+# 4. Setup and run Frontend
 echo "Setting up frontend..."
 cd frontend
 if [ ! -d "node_modules" ]; then

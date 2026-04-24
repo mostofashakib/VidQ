@@ -9,3 +9,4 @@ playwright
 httpx
 imageio
 imageio-ffmpeg
+yt-dlp

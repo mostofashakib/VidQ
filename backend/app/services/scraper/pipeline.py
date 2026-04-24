@@ -18,6 +18,8 @@ from app.services.scraper.media import (
     _is_ad_video_url,
     _is_forbidden,
     _get_main_playing_video_url,
+    _detect_direct_video_embed,
+    _download_embed_video,
     _download_video_direct,
     _convert_to_mp4,
     _probe_file_duration,
@@ -61,6 +63,25 @@ async def run_extraction(
     os.makedirs(storage, exist_ok=True)
 
     logger.debug(f"Starting extraction pipeline for: {url}")
+
+    # ── Embedded-video fast-path (no Playwright, no LLM) ──
+    embed_result = await _detect_direct_video_embed(url, user_agent)
+    if embed_result:
+        embedded_src, embed_html = embed_result
+        dl_url = await _download_embed_video(embedded_src, referer=url)
+        if dl_url:
+            logger.info("Embedded fast-path succeeded — skipping Playwright and LLM.")
+            embed_soup = BeautifulSoup(embed_html, "html.parser")
+            embed_thumbnail = None
+            og_img = embed_soup.find("meta", property="og:image", content=True)
+            if og_img:
+                embed_thumbnail = og_img["content"]
+            if not embed_thumbnail:
+                vt = embed_soup.find("video", poster=True)
+                if vt:
+                    embed_thumbnail = vt.get("poster")
+            return embed_html, "", [embedded_src], embed_thumbnail or "", dl_url
+        logger.warning("Embedded fast-path: download failed, falling through to Playwright.")
 
     try:
         async with async_playwright() as p:
