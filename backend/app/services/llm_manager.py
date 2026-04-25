@@ -1,8 +1,9 @@
 import abc
+import asyncio
 import json
 import logging
 import httpx
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, RateLimitError
 from anthropic import AsyncAnthropic
 
 logger = logging.getLogger(__name__)
@@ -134,23 +135,10 @@ class OllamaProvider(LLMProvider):
             "options": {"temperature": 0},
         }
         logger.info(f"Ollama call_vision → model={self.model_name}")
-        try:
-            data = await self._post(payload)
-            content = data["message"]["content"].strip()
-            logger.debug(f"Ollama vision raw (first 300): {content[:300]}")
-            return self._parse(content)
-        except Exception as e:
-            # qwen3.5 is text-only — retry without the image
-            logger.warning(f"Ollama vision failed ({e}), retrying text-only…")
-            payload["messages"][0].pop("images", None)
-            try:
-                data = await self._post(payload)
-                content = data["message"]["content"].strip()
-                logger.info("Ollama text-only fallback succeeded.")
-                return self._parse(content)
-            except Exception as e2:
-                logger.error(f"Ollama text-only fallback also failed: {e2}")
-                raise e2
+        data = await self._post(payload)
+        content = data["message"]["content"].strip()
+        logger.debug(f"Ollama vision raw (first 300): {content[:300]}")
+        return self._parse(content)
 
 
 class OpenAIProvider(LLMProvider):
@@ -182,6 +170,55 @@ class OpenAIProvider(LLMProvider):
             temperature=0.2,
         )
         return _parse_json(response.choices[0].message.content.strip())
+
+
+class OpenRouterProvider(LLMProvider):
+    def __init__(self, api_key: str, model: str = "google/gemma-4-31b-it:free"):
+        self.model_name = model
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url="https://openrouter.ai/api/v1",
+            default_headers={"HTTP-Referer": "https://vidq.app", "X-Title": "vidQ"},
+        )
+
+    async def _create(self, **kwargs) -> str:
+        """Call completions with exponential backoff on 429s."""
+        for attempt in range(4):
+            try:
+                response = await self.client.chat.completions.create(**kwargs)
+                return response.choices[0].message.content.strip()
+            except RateLimitError:
+                if attempt == 3:
+                    raise
+                wait = 2 ** attempt
+                logger.warning(f"OpenRouter 429 — retrying in {wait}s (attempt {attempt + 1}/4)…")
+                await asyncio.sleep(wait)
+
+    async def call_text(self, prompt: str) -> dict:
+        content = await self._create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=1000,
+            temperature=0.2,
+        )
+        return _parse_json(content)
+
+    async def call_vision(self, prompt: str, image_b64: str) -> dict:
+        content = await self._create(
+            model=self.model_name,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": f"data:{_get_media_type(image_b64)};base64,{_strip_data_uri(image_b64)}"}},
+                    ],
+                }
+            ],
+            max_tokens=1000,
+            temperature=0.2,
+        )
+        return _parse_json(content)
 
 
 class AnthropicProvider(LLMProvider):
