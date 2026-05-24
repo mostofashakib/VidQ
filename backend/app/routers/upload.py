@@ -22,7 +22,7 @@ router = APIRouter()
 @router.post("/upload-video", response_model=VideoOut)
 async def upload_video(
     file: UploadFile = File(...),
-    category: str = Form(...),
+    category: str = Form(default="uploads"),
     db: Session = Depends(get_db),
     token: str = Depends(verify_token),
 ):

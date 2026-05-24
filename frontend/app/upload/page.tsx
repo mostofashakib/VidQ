@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
 import { uploadVideo, listUploadedVideos, deleteVideo, downloadVideo } from "../api";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Card, CardHeader, CardTitle, CardContent, CardFooter,
 } from "@/components/ui/card";
@@ -40,7 +39,6 @@ export default function UploadPage() {
 
   const [videos, setVideos] = useState<UploadedVideo[]>([]);
   const [jobs, setJobs] = useState<UploadJob[]>([]);
-  const [category, setCategory] = useState("");
   const [error, setError] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [showDialog, setShowDialog] = useState(false);
@@ -67,10 +65,6 @@ export default function UploadPage() {
 
   async function handleFiles(files: FileList | null) {
     if (!files || !files.length) return;
-    if (!category.trim()) {
-      setError("Please enter a category before uploading.");
-      return;
-    }
     setError("");
 
     for (const file of Array.from(files)) {
@@ -81,7 +75,7 @@ export default function UploadPage() {
       ]);
 
       try {
-        const result = await uploadVideo(token!, file, category.trim(), (pct) => {
+        const result = await uploadVideo(token!, file, (pct) => {
           setJobs((prev) =>
             prev.map((j) => j.localId === localId ? { ...j, progress: pct, message: pct < 100 ? `Uploading… ${pct}%` : "Scaling to 720p…" } : j)
           );
@@ -158,15 +152,6 @@ export default function UploadPage() {
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
         {/* Upload zone */}
         <div className="glass-panel p-6 md:p-8 rounded-4xl mb-8 shadow-2xl shadow-purple-500/5">
-          <div className="flex flex-col sm:flex-row gap-4 mb-6">
-            <Input
-              placeholder="Category Name"
-              value={category}
-              onChange={(e) => setCategory(e.target.value)}
-              className="w-full sm:w-64 bg-white/5 border-white/10 focus-visible:ring-indigo-500 rounded-xl h-14 text-white placeholder:text-gray-400 px-5 text-base"
-            />
-          </div>
-
           {/* Drag-and-drop zone */}
           <div
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
@@ -273,9 +258,6 @@ export default function UploadPage() {
               </CardHeader>
               <CardContent className="flex-1 flex flex-col justify-between z-10 px-6">
                 <div className="mb-5 text-xs flex gap-2">
-                  <span className="inline-block px-3 py-1.5 bg-white/10 rounded-full text-indigo-300 font-medium tracking-wider uppercase text-[10px] border border-white/5">
-                    {video.category}
-                  </span>
                   {video.duration !== undefined && video.duration !== null && (
                     <span className="inline-block px-3 py-1.5 bg-black/30 rounded-full text-gray-300 font-mono text-[10px] border border-white/5">
                       {formatDuration(video.duration)}

@@ -26,24 +26,19 @@ def test_upload_video_returns_200(client):
         r = client.post(
             "/upload-video",
             files={"file": ("test_video.mp4", io.BytesIO(_fake_mp4_bytes()), "video/mp4")},
-            data={"category": "test"},
             headers=AUTH,
         )
     assert r.status_code == 200
     data = r.json()
     assert data["source"] == "upload"
-    assert data["category"] == "test"
+    assert data["category"] == "uploads"
     assert data["title"] == "test_video"
     assert data["duration"] == 30.0
     assert "temp_storage" in data["url"]
 
 
-def test_upload_video_missing_category_returns_422(client):
-    r = client.post(
-        "/upload-video",
-        files={"file": ("video.mp4", io.BytesIO(_fake_mp4_bytes()), "video/mp4")},
-        headers=AUTH,
-    )
+def test_upload_video_no_file_returns_422(client):
+    r = client.post("/upload-video", headers=AUTH)
     assert r.status_code == 422
 
 

@@ -88,7 +88,6 @@ export async function downloadVideo(token: string, id: number): Promise<Blob> {
 export async function uploadVideo(
   token: string,
   file: File,
-  category: string,
   onProgress?: (percent: number) => void
 ): Promise<{
   id: number; url: string; category: string; title?: string;
@@ -96,13 +95,9 @@ export async function uploadVideo(
 }> {
   const form = new FormData();
   form.append("file", file);
-  form.append("category", category);
 
   const res = await axios.post(`${API_URL}/upload-video`, form, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "multipart/form-data",
-    },
+    headers: { Authorization: `Bearer ${token}` },
     onUploadProgress: (e) => {
       if (onProgress && e.total) {
         onProgress(Math.round((e.loaded / e.total) * 100));
