@@ -127,3 +127,42 @@ def test_add_video_rejects_localhost_url(client):
 def test_add_video_rejects_private_ip(client):
     r = client.post("/videos", json={**VIDEO_PAYLOAD, "url": "http://192.168.1.1/video"}, headers=AUTH)
     assert r.status_code == 400
+
+
+def test_list_videos_excludes_uploads(client, db_session):
+    from app.db import Video
+    from datetime import datetime
+    upload = Video(
+        url="http://localhost:8000/temp_storage/uploaded.mp4",
+        category="test",
+        title="Uploaded",
+        duration=10.0,
+        source="upload",
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(upload)
+    db_session.commit()
+
+    r = client.get("/videos", headers=AUTH)
+    assert r.status_code == 200
+    titles = [v["title"] for v in r.json()]
+    assert "Uploaded" not in titles
+
+
+def test_list_categories_excludes_uploads(client, db_session):
+    from app.db import Video
+    from datetime import datetime
+    upload = Video(
+        url="http://localhost:8000/temp_storage/cat_upload.mp4",
+        category="upload-only-cat",
+        title="Upload Cat",
+        duration=5.0,
+        source="upload",
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(upload)
+    db_session.commit()
+
+    r = client.get("/videos/categories", headers=AUTH)
+    assert r.status_code == 200
+    assert "upload-only-cat" not in r.json()

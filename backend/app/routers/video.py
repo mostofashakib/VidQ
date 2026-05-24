@@ -130,14 +130,14 @@ def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = De
 
 @router.get("/videos", response_model=List[VideoOut])
 def list_videos(category: Optional[str] = None, skip: int = 0, limit: int = 20, db: Session = Depends(get_db), token: str = Depends(verify_token)):
-    query = db.query(Video)
+    query = db.query(Video).filter(Video.source != "upload")
     if category:
         query = query.filter(Video.category == category)
     return query.order_by(Video.created_at.desc()).offset(skip).limit(limit).all()
 
 @router.get("/videos/categories", response_model=List[str])
 def list_categories(db: Session = Depends(get_db), token: str = Depends(verify_token)):
-    categories = db.query(Video.category).distinct().all()
+    categories = db.query(Video.category).filter(Video.source != "upload").distinct().all()
     return [c[0] for c in categories]
 
 @router.delete("/videos/{video_id}", status_code=204)
