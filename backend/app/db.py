@@ -19,9 +19,10 @@ class Video(Base):
     title = Column(String, nullable=True)
     duration = Column(Float, nullable=True)  # duration in seconds
     thumbnail = Column(String, nullable=True)  # URL or base64
+    source = Column(String, nullable=False, default="url")
     created_at = Column(DateTime, default=datetime.utcnow)
 
-# For local dev: drop and recreate table to add 'duration' column
+# For local dev: drop and recreate table to add 'source' column
 Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
