@@ -27,7 +27,7 @@ def test_upload_video_creates_job(client):
     )
     assert r.status_code == 200
     data = r.json()
-    assert data["status"] == "processing"
+    assert data["status"] == "queued"
     assert "job_id" in data
     assert data["filename"] == "test.mp4"
 
@@ -56,15 +56,12 @@ def test_upload_job_completes_and_video_appears(client):
     assert status_data["status"] == "done"
     assert status_data["video_id"] is not None
 
-    # Ensure the video appears in the upload list
-    db_session = client.app.dependency_overrides.get(
-        __import__("app.db", fromlist=["get_db"]).get_db
-    )
     r3 = client.get("/upload-videos", headers=AUTH)
     videos = r3.json()
-    assert len(videos) == 1
-    assert videos[0]["title"] == "myvid"
-    assert videos[0]["source"] == "upload"
+    matched = [v for v in videos if v["id"] == status_data["video_id"]]
+    assert matched, "Completed job's video not found in /upload-videos"
+    assert matched[0]["title"] == "myvid"
+    assert matched[0]["source"] == "upload"
 
 
 def test_get_upload_job_not_found(client):

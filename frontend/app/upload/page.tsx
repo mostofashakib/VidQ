@@ -14,7 +14,7 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle,
 } from "@/components/ui/dialog";
-import { Trash, Download, Check, X, Loader2, Upload, Ban } from "lucide-react";
+import { Trash, Download, Check, X, Loader2, Upload, Ban, Clock } from "lucide-react";
 import Link from "next/link";
 
 interface UploadedVideo {
@@ -30,8 +30,8 @@ interface UploadedVideo {
 interface UploadJob {
   localId: string;
   filename: string;
-  /** uploading = HTTP transfer in progress; processing = ffmpeg running on server */
-  status: "uploading" | "processing" | "done" | "failed" | "cancelled";
+  /** uploading = HTTP transfer; queued = waiting for a worker slot; processing = ffmpeg running */
+  status: "uploading" | "queued" | "processing" | "done" | "failed" | "cancelled";
   message: string;
   progress: number;
   jobId?: string;
@@ -88,23 +88,24 @@ export default function UploadPage() {
       try {
         const data = await getUploadJob(token!, jobId);
 
-        if (data.status === "done") {
+        if (data.status === "queued") {
+          updateJob(localId, { status: "queued", message: "Waiting for worker…" });
+        } else if (data.status === "processing") {
+          updateJob(localId, { status: "processing", message: "Scaling to 720p…" });
+        } else if (data.status === "done") {
           clearInterval(intervalId);
           pollRefs.current.delete(localId);
           abortRefs.current.delete(localId);
           updateJob(localId, { status: "done", message: "Done! Scaled to 720p." });
-          // Refresh the completed videos list
           listUploadedVideos(token!).then(setVideos).catch(() => {});
           setTimeout(() => {
             setJobs((prev) => prev.filter((j) => j.localId !== localId));
           }, 4000);
-
         } else if (data.status === "failed") {
           clearInterval(intervalId);
           pollRefs.current.delete(localId);
           abortRefs.current.delete(localId);
           updateJob(localId, { status: "failed", message: data.error || "Processing failed." });
-
         } else if (data.status === "cancelled") {
           clearInterval(intervalId);
           pollRefs.current.delete(localId);
@@ -157,8 +158,8 @@ export default function UploadPage() {
       });
 
       updateJob(localId, {
-        status: "processing",
-        message: "Scaling to 720p…",
+        status: jobData.status as "queued" | "processing",
+        message: jobData.status === "queued" ? "Waiting for worker…" : "Scaling to 720p…",
         progress: 100,
         jobId: jobData.job_id,
       });
@@ -302,6 +303,10 @@ export default function UploadPage() {
                     <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
                       <X className="w-4 h-4 text-red-400" />
                     </div>
+                  ) : job.status === "queued" ? (
+                    <div className="w-8 h-8 rounded-full bg-yellow-500/15 flex items-center justify-center">
+                      <Clock className="w-4 h-4 text-yellow-400" />
+                    </div>
                   ) : (
                     <div className="w-8 h-8 rounded-full bg-indigo-500/15 flex items-center justify-center">
                       <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
@@ -314,6 +319,7 @@ export default function UploadPage() {
                   <p className={`text-xs mt-0.5 ${
                     job.status === "done" ? "text-green-400"
                     : job.status === "failed" ? "text-red-400"
+                    : job.status === "queued" ? "text-yellow-400"
                     : "text-indigo-400"
                   }`}>
                     {job.message}
@@ -326,15 +332,15 @@ export default function UploadPage() {
                       />
                     </div>
                   )}
-                  {job.status === "processing" && (
+                  {(job.status === "processing" || job.status === "queued") && (
                     <div className="mt-1.5 h-1 bg-white/10 rounded-full overflow-hidden">
-                      <div className="h-full bg-indigo-500/60 rounded-full animate-pulse w-full" />
+                      <div className={`h-full rounded-full animate-pulse w-full ${job.status === "queued" ? "bg-yellow-500/60" : "bg-indigo-500/60"}`} />
                     </div>
                   )}
                 </div>
 
                 {/* Cancel button for active jobs */}
-                {(job.status === "uploading" || job.status === "processing") && (
+                {(job.status === "uploading" || job.status === "queued" || job.status === "processing") && (
                   <button
                     title="Cancel"
                     onClick={() => handleCancel(job.localId)}

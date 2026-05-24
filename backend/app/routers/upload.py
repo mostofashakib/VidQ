@@ -44,8 +44,8 @@ async def upload_video(
         shutil.copyfileobj(file.file, f)
 
     job_id = start_upload_job(file_path, original_name)
-    logger.info(f"Upload started: job_id={job_id} file={original_name}")
-    return UploadJobOut(job_id=job_id, filename=original_name, status="processing")
+    logger.info(f"Upload queued: job_id={job_id} file={original_name}")
+    return UploadJobOut(job_id=job_id, filename=original_name, status="queued")
 
 
 @router.get("/upload-jobs/{job_id}", response_model=UploadJobOut)
