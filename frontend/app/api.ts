@@ -84,3 +84,42 @@ export async function downloadVideo(token: string, id: number): Promise<Blob> {
   });
   return res.data;
 }
+
+export async function uploadVideo(
+  token: string,
+  file: File,
+  category: string,
+  onProgress?: (percent: number) => void
+): Promise<{
+  id: number; url: string; category: string; title?: string;
+  duration?: number; thumbnail?: string; source: string; created_at: string;
+}> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("category", category);
+
+  const res = await axios.post(`${API_URL}/upload-video`, form, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "multipart/form-data",
+    },
+    onUploadProgress: (e) => {
+      if (onProgress && e.total) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    },
+  });
+  return res.data;
+}
+
+export async function listUploadedVideos(token: string): Promise<
+  Array<{
+    id: number; url: string; category: string; title?: string;
+    duration?: number; thumbnail?: string; source: string; created_at: string;
+  }>
+> {
+  const res = await axios.get(`${API_URL}/upload-videos`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
