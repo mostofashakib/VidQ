@@ -145,6 +145,17 @@ def delete_video(video_id: int, db: Session = Depends(get_db), token: str = Depe
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
+
+    if video.source == "upload":
+        settings = get_settings()
+        filename = video.url.rstrip("/").split("/")[-1].split("?")[0]
+        filepath = os.path.join(settings.temp_storage_dir, filename)
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception:
+                logger.warning(f"Could not delete upload file: {filepath}")
+
     db.delete(video)
     db.commit()
     return None

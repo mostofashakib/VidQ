@@ -4,6 +4,7 @@ Title and duration are always supplied so extract_title_and_duration()
 (which makes a real network request) is never called during tests.
 """
 import pytest
+import os
 
 AUTH = {"Authorization": "Bearer test-token"}
 
@@ -166,3 +167,34 @@ def test_list_categories_excludes_uploads(client, db_session):
     r = client.get("/videos/categories", headers=AUTH)
     assert r.status_code == 200
     assert "upload-only-cat" not in r.json()
+
+
+def test_delete_upload_removes_file(client, db_session, tmp_path):
+    import shutil
+    from app.db import Video
+    from datetime import datetime
+    from app.config import get_settings
+
+    settings = get_settings()
+    # Create a real file in temp_storage
+    fake_file = tmp_path / "fake_upload.mp4"
+    fake_file.write_bytes(b"fake video content")
+    dest = os.path.join(settings.temp_storage_dir, "fake_upload.mp4")
+    shutil.copy(str(fake_file), dest)
+
+    video_url = f"{settings.base_url}/temp_storage/fake_upload.mp4"
+    upload = Video(
+        url=video_url.lower(),
+        category="test",
+        title="Fake Upload",
+        duration=5.0,
+        source="upload",
+        created_at=datetime.utcnow(),
+    )
+    db_session.add(upload)
+    db_session.commit()
+    video_id = upload.id
+
+    r = client.delete(f"/videos/{video_id}", headers=AUTH)
+    assert r.status_code == 204
+    assert not os.path.exists(dest)
