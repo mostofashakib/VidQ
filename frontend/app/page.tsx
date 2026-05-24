@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { useAuth } from "./auth-context";
 import {
   addVideo,
@@ -359,15 +360,25 @@ export default function HomePage() {
         >
           VidQ
         </h1>
-        {authEnabled && (
-          <Button
-            variant="outline"
-            onClick={logout}
-            className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200"
-          >
-            Logout
-          </Button>
-        )}
+        <div className="flex items-center gap-3">
+          <Link href="/upload">
+            <Button
+              variant="outline"
+              className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200 text-sm"
+            >
+              Upload Video
+            </Button>
+          </Link>
+          {authEnabled && (
+            <Button
+              variant="outline"
+              onClick={logout}
+              className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200"
+            >
+              Logout
+            </Button>
+          )}
+        </div>
       </div>
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
