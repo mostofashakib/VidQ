@@ -85,19 +85,26 @@ export async function downloadVideo(token: string, id: number): Promise<Blob> {
   return res.data;
 }
 
+export interface UploadJobData {
+  job_id: string;
+  filename: string;
+  status: string;
+  video_id?: number;
+  error?: string;
+}
+
 export async function uploadVideo(
   token: string,
   file: File,
-  onProgress?: (percent: number) => void
-): Promise<{
-  id: number; url: string; category: string; title?: string;
-  duration?: number; thumbnail?: string; source: string; created_at: string;
-}> {
+  onProgress?: (percent: number) => void,
+  signal?: AbortSignal
+): Promise<UploadJobData> {
   const form = new FormData();
   form.append("file", file);
 
   const res = await axios.post(`${API_URL}/upload-video`, form, {
     headers: { Authorization: `Bearer ${token}` },
+    signal,
     onUploadProgress: (e) => {
       if (onProgress && e.total) {
         onProgress(Math.round((e.loaded / e.total) * 100));
@@ -105,6 +112,19 @@ export async function uploadVideo(
     },
   });
   return res.data;
+}
+
+export async function getUploadJob(token: string, jobId: string): Promise<UploadJobData> {
+  const res = await axios.get(`${API_URL}/upload-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function cancelUploadJob(token: string, jobId: string): Promise<void> {
+  await axios.delete(`${API_URL}/upload-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 }
 
 export async function listUploadedVideos(token: string): Promise<

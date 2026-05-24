@@ -1,9 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
-import { uploadVideo, listUploadedVideos, deleteVideo, downloadVideo } from "../api";
+import {
+  uploadVideo, getUploadJob, cancelUploadJob,
+  listUploadedVideos, deleteVideo, downloadVideo,
+} from "../api";
 import { Button } from "@/components/ui/button";
 import {
   Card, CardHeader, CardTitle, CardContent, CardFooter,
@@ -11,7 +14,7 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle,
 } from "@/components/ui/dialog";
-import { Trash, Download, Check, X, Loader2, Upload } from "lucide-react";
+import { Trash, Download, Check, X, Loader2, Upload, Ban } from "lucide-react";
 import Link from "next/link";
 
 interface UploadedVideo {
@@ -20,7 +23,6 @@ interface UploadedVideo {
   category: string;
   title?: string;
   duration?: number;
-  thumbnail?: string;
   source: string;
   created_at: string;
 }
@@ -28,9 +30,11 @@ interface UploadedVideo {
 interface UploadJob {
   localId: string;
   filename: string;
-  status: "uploading" | "done" | "failed";
+  /** uploading = HTTP transfer in progress; processing = ffmpeg running on server */
+  status: "uploading" | "processing" | "done" | "failed" | "cancelled";
   message: string;
   progress: number;
+  jobId?: string;
 }
 
 export default function UploadPage() {
@@ -45,6 +49,11 @@ export default function UploadPage() {
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Maps localId → abort function for the current phase
+  const abortRefs = useRef<Map<string, () => void>>(new Map());
+  // Maps localId → polling interval id
+  const pollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+
   useEffect(() => {
     if (!loading && !token) router.replace("/login");
   }, [token, loading, router]);
@@ -56,6 +65,13 @@ export default function UploadPage() {
       .catch(() => setError("Failed to load uploaded videos"));
   }, [token]);
 
+  // Clean up polling intervals on unmount
+  useEffect(() => {
+    return () => {
+      pollRefs.current.forEach((id) => clearInterval(id));
+    };
+  }, []);
+
   function formatDuration(seconds?: number) {
     if (!seconds || isNaN(seconds)) return "Unknown";
     const m = Math.floor(seconds / 60);
@@ -63,37 +79,119 @@ export default function UploadPage() {
     return `${m}:${s.toString().padStart(2, "0")}`;
   }
 
+  function updateJob(localId: string, patch: Partial<UploadJob>) {
+    setJobs((prev) => prev.map((j) => j.localId === localId ? { ...j, ...patch } : j));
+  }
+
+  function startPolling(localId: string, jobId: string) {
+    const intervalId = setInterval(async () => {
+      try {
+        const data = await getUploadJob(token!, jobId);
+
+        if (data.status === "done") {
+          clearInterval(intervalId);
+          pollRefs.current.delete(localId);
+          abortRefs.current.delete(localId);
+          updateJob(localId, { status: "done", message: "Done! Scaled to 720p." });
+          // Refresh the completed videos list
+          listUploadedVideos(token!).then(setVideos).catch(() => {});
+          setTimeout(() => {
+            setJobs((prev) => prev.filter((j) => j.localId !== localId));
+          }, 4000);
+
+        } else if (data.status === "failed") {
+          clearInterval(intervalId);
+          pollRefs.current.delete(localId);
+          abortRefs.current.delete(localId);
+          updateJob(localId, { status: "failed", message: data.error || "Processing failed." });
+
+        } else if (data.status === "cancelled") {
+          clearInterval(intervalId);
+          pollRefs.current.delete(localId);
+          abortRefs.current.delete(localId);
+          setJobs((prev) => prev.filter((j) => j.localId !== localId));
+        }
+      } catch {
+        // transient poll error — keep trying
+      }
+    }, 2000);
+
+    pollRefs.current.set(localId, intervalId);
+  }
+
   async function handleFiles(files: FileList | null) {
     if (!files || !files.length) return;
     setError("");
 
-    for (const file of Array.from(files)) {
+    // Kick off all uploads in parallel — each is independent
+    Array.from(files).forEach((file) => {
       const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
       setJobs((prev) => [
         ...prev,
-        { localId, filename: file.name, status: "uploading", message: "Uploading and scaling to 720p…", progress: 0 },
+        { localId, filename: file.name, status: "uploading", message: "Uploading…", progress: 0 },
       ]);
+      runUpload(localId, file);
+    });
+  }
 
-      try {
-        const result = await uploadVideo(token!, file, (pct) => {
-          setJobs((prev) =>
-            prev.map((j) => j.localId === localId ? { ...j, progress: pct, message: pct < 100 ? `Uploading… ${pct}%` : "Scaling to 720p…" } : j)
-          );
-        });
+  async function runUpload(localId: string, file: File) {
+    const controller = new AbortController();
+    abortRefs.current.set(localId, () => controller.abort());
 
-        setJobs((prev) =>
-          prev.map((j) => j.localId === localId ? { ...j, status: "done", message: "Done! Video scaled to 720p.", progress: 100 } : j)
-        );
-        setVideos((prev) => [result, ...prev]);
-        setTimeout(() => {
-          setJobs((prev) => prev.filter((j) => j.localId !== localId));
-        }, 4000);
-      } catch {
-        setJobs((prev) =>
-          prev.map((j) => j.localId === localId ? { ...j, status: "failed", message: "Upload failed." } : j)
-        );
+    try {
+      const jobData = await uploadVideo(
+        token!,
+        file,
+        (pct) => {
+          updateJob(localId, {
+            progress: pct,
+            message: pct < 100 ? `Uploading… ${pct}%` : "Waiting for server…",
+          });
+        },
+        controller.signal,
+      );
+
+      // Switch abort to cancel the server-side ffmpeg job
+      abortRefs.current.set(localId, () => {
+        cancelUploadJob(token!, jobData.job_id).catch(() => {});
+      });
+
+      updateJob(localId, {
+        status: "processing",
+        message: "Scaling to 720p…",
+        progress: 100,
+        jobId: jobData.job_id,
+      });
+
+      startPolling(localId, jobData.job_id);
+
+    } catch (err: unknown) {
+      // Abort throws a CanceledError — treat that as cancelled, not failure
+      const isCancelled =
+        err && typeof err === "object" && "code" in err && (err as { code: string }).code === "ERR_CANCELED";
+      if (!isCancelled) {
+        updateJob(localId, { status: "failed", message: "Upload failed." });
+      } else {
+        setJobs((prev) => prev.filter((j) => j.localId !== localId));
       }
+      abortRefs.current.delete(localId);
     }
+  }
+
+  function handleCancel(localId: string) {
+    // Stop polling if in processing phase
+    const interval = pollRefs.current.get(localId);
+    if (interval) {
+      clearInterval(interval);
+      pollRefs.current.delete(localId);
+    }
+    // Abort the current phase (HTTP upload or ffmpeg job)
+    const abort = abortRefs.current.get(localId);
+    if (abort) {
+      abort();
+      abortRefs.current.delete(localId);
+    }
+    setJobs((prev) => prev.filter((j) => j.localId !== localId));
   }
 
   function onInputChange(e: React.ChangeEvent<HTMLInputElement>) {
@@ -150,9 +248,8 @@ export default function UploadPage() {
       </div>
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
-        {/* Upload zone */}
+        {/* Drop zone */}
         <div className="glass-panel p-6 md:p-8 rounded-4xl mb-8 shadow-2xl shadow-purple-500/5">
-          {/* Drag-and-drop zone */}
           <div
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
             onDragLeave={() => setDragging(false)}
@@ -167,7 +264,7 @@ export default function UploadPage() {
             <div className="w-14 h-14 rounded-full bg-indigo-500/15 flex items-center justify-center">
               <Upload className="w-6 h-6 text-indigo-400" />
             </div>
-            <p className="text-white font-medium">Drop a video file here</p>
+            <p className="text-white font-medium">Drop video files here</p>
             <p className="text-gray-400 text-sm">or click to browse — any resolution, auto-scaled to 720p</p>
             <input
               ref={fileInputRef}
@@ -182,7 +279,7 @@ export default function UploadPage() {
 
         {error && <div className="text-red-400 mb-4">{error}</div>}
 
-        {/* Upload progress cards */}
+        {/* Active upload / processing cards */}
         {jobs.length > 0 && (
           <div className="mb-10 space-y-2.5">
             {jobs.map((job) => (
@@ -211,9 +308,14 @@ export default function UploadPage() {
                     </div>
                   )}
                 </div>
+
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-white truncate">{job.filename}</p>
-                  <p className={`text-xs mt-0.5 ${job.status === "done" ? "text-green-400" : job.status === "failed" ? "text-red-400" : "text-indigo-400"}`}>
+                  <p className={`text-xs mt-0.5 ${
+                    job.status === "done" ? "text-green-400"
+                    : job.status === "failed" ? "text-red-400"
+                    : "text-indigo-400"
+                  }`}>
                     {job.message}
                   </p>
                   {job.status === "uploading" && job.progress > 0 && job.progress < 100 && (
@@ -224,7 +326,25 @@ export default function UploadPage() {
                       />
                     </div>
                   )}
+                  {job.status === "processing" && (
+                    <div className="mt-1.5 h-1 bg-white/10 rounded-full overflow-hidden">
+                      <div className="h-full bg-indigo-500/60 rounded-full animate-pulse w-full" />
+                    </div>
+                  )}
                 </div>
+
+                {/* Cancel button for active jobs */}
+                {(job.status === "uploading" || job.status === "processing") && (
+                  <button
+                    title="Cancel"
+                    onClick={() => handleCancel(job.localId)}
+                    className="shrink-0 text-gray-500 hover:text-red-400 transition-colors"
+                  >
+                    <Ban className="w-4 h-4" />
+                  </button>
+                )}
+
+                {/* Dismiss button for finished/failed jobs */}
                 {(job.status === "done" || job.status === "failed") && (
                   <button
                     onClick={() => setJobs((prev) => prev.filter((j) => j.localId !== job.localId))}
@@ -238,7 +358,7 @@ export default function UploadPage() {
           </div>
         )}
 
-        {/* Video grid */}
+        {/* Completed video grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
           {videos.length === 0 && jobs.length === 0 && (
             <div className="text-gray-500 col-span-3">No uploaded videos yet.</div>
@@ -267,7 +387,7 @@ export default function UploadPage() {
                     720p
                   </span>
                 </div>
-                <div className="flex justify-between items-center rounded-xl overflow-hidden shadow-inner bg-black/40 relative group-hover:shadow-indigo-500/20 transition-all aspect-video">
+                <div className="rounded-xl overflow-hidden shadow-inner bg-black/40 aspect-video">
                   <video
                     className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity duration-300"
                     controls
@@ -275,7 +395,6 @@ export default function UploadPage() {
                   >
                     <source src={video.url} type="video/mp4" />
                     <source src={video.url} type="video/webm" />
-                    Your browser does not support the video tag.
                   </video>
                 </div>
               </CardContent>
@@ -283,7 +402,7 @@ export default function UploadPage() {
                 <Button
                   variant="outline"
                   size="icon"
-                  title="Download Video"
+                  title="Download"
                   onClick={async (e) => {
                     e.stopPropagation();
                     try {
@@ -332,7 +451,7 @@ export default function UploadPage() {
             <DialogTitle className="text-xl">Delete Video</DialogTitle>
           </DialogHeader>
           <div className="text-gray-300 my-2">
-            Are you sure you want to delete this video? The file will be permanently removed.
+            Are you sure? The file will be permanently removed.
           </div>
           <DialogFooter className="mt-4 gap-2">
             <Button

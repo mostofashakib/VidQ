@@ -2,28 +2,34 @@ import os
 import shutil
 import uuid
 import logging
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import List
 
 from app.config import get_settings
 from app.db import get_db, Video
 from app.models import VideoOut
 from app.routers.auth import verify_token
-from app.services.video_utils import ensure_min_quality
-from app.services.scraper.media import _probe_file_duration
+from app.services.upload_worker import cancel_job, get_job, start_upload_job
 
 logger = logging.getLogger("UploadRouter")
 
 router = APIRouter()
 
 
-@router.post("/upload-video", response_model=VideoOut)
+class UploadJobOut(BaseModel):
+    job_id: str
+    filename: str
+    status: str
+    video_id: Optional[int] = None
+    error: Optional[str] = None
+
+
+@router.post("/upload-video", response_model=UploadJobOut)
 async def upload_video(
     file: UploadFile = File(...),
-    category: str = Form(default="uploads"),
-    db: Session = Depends(get_db),
     token: str = Depends(verify_token),
 ):
     settings = get_settings()
@@ -37,30 +43,31 @@ async def upload_video(
     with open(file_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    final_path = ensure_min_quality(file_path)
-    final_filename = os.path.basename(final_path)
-    video_url = f"{settings.base_url}/temp_storage/{final_filename}"
+    job_id = start_upload_job(file_path, original_name)
+    logger.info(f"Upload started: job_id={job_id} file={original_name}")
+    return UploadJobOut(job_id=job_id, filename=original_name, status="processing")
 
-    duration: float | None = None
-    try:
-        duration = _probe_file_duration(final_path)
-    except Exception:
-        pass
 
-    title = os.path.splitext(original_name)[0]
-
-    db_video = Video(
-        url=video_url.strip().lower(),
-        category=category,
-        title=title,
-        duration=duration,
-        source="upload",
+@router.get("/upload-jobs/{job_id}", response_model=UploadJobOut)
+def get_upload_job(job_id: str, token: str = Depends(verify_token)):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return UploadJobOut(
+        job_id=job.job_id,
+        filename=job.filename,
+        status=job.status,
+        video_id=job.video_id,
+        error=job.error,
     )
-    db.add(db_video)
-    db.commit()
-    db.refresh(db_video)
-    logger.info(f"Uploaded video saved: id={db_video.id} path={final_path}")
-    return db_video
+
+
+@router.delete("/upload-jobs/{job_id}", status_code=204)
+def cancel_upload_job(job_id: str, token: str = Depends(verify_token)):
+    ok = cancel_job(job_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Job not found or not cancellable")
+    return None
 
 
 @router.get("/upload-videos", response_model=List[VideoOut])

@@ -1,6 +1,6 @@
 """Integration tests for the video upload endpoints."""
 import io
-import os
+import time
 import pytest
 from unittest.mock import patch
 
@@ -16,28 +16,68 @@ def clean_videos(db_session):
 
 
 def _fake_mp4_bytes() -> bytes:
-    """Minimal valid-looking file content for tests (not a real video)."""
     return b"\x00" * 1024
 
 
-def test_upload_video_returns_200(client):
-    with patch("app.routers.upload.ensure_min_quality", side_effect=lambda p: p), \
-         patch("app.routers.upload._probe_file_duration", return_value=30.0):
+def test_upload_video_creates_job(client):
+    r = client.post(
+        "/upload-video",
+        files={"file": ("test.mp4", io.BytesIO(_fake_mp4_bytes()), "video/mp4")},
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    data = r.json()
+    assert data["status"] == "processing"
+    assert "job_id" in data
+    assert data["filename"] == "test.mp4"
+
+
+def test_upload_job_completes_and_video_appears(client):
+    with patch("app.services.upload_worker.probe_video_dimensions", return_value=None), \
+         patch("app.services.upload_worker._probe_duration", return_value=30.0):
         r = client.post(
             "/upload-video",
-            files={"file": ("test_video.mp4", io.BytesIO(_fake_mp4_bytes()), "video/mp4")},
+            files={"file": ("myvid.mp4", io.BytesIO(_fake_mp4_bytes()), "video/mp4")},
             headers=AUTH,
         )
     assert r.status_code == 200
-    data = r.json()
-    assert data["source"] == "upload"
-    assert data["category"] == "uploads"
-    assert data["title"] == "test_video"
-    assert data["duration"] == 30.0
-    assert "temp_storage" in data["url"]
+    job_id = r.json()["job_id"]
+
+    # Poll until done (max 5s)
+    deadline = time.time() + 5
+    status_data = {}
+    while time.time() < deadline:
+        r2 = client.get(f"/upload-jobs/{job_id}", headers=AUTH)
+        status_data = r2.json()
+        if status_data["status"] != "processing":
+            break
+        time.sleep(0.05)
+
+    assert status_data["status"] == "done"
+    assert status_data["video_id"] is not None
+
+    # Ensure the video appears in the upload list
+    db_session = client.app.dependency_overrides.get(
+        __import__("app.db", fromlist=["get_db"]).get_db
+    )
+    r3 = client.get("/upload-videos", headers=AUTH)
+    videos = r3.json()
+    assert len(videos) == 1
+    assert videos[0]["title"] == "myvid"
+    assert videos[0]["source"] == "upload"
 
 
-def test_upload_video_no_file_returns_422(client):
+def test_get_upload_job_not_found(client):
+    r = client.get("/upload-jobs/nonexistent", headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_cancel_upload_job_not_found(client):
+    r = client.delete("/upload-jobs/nonexistent", headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_upload_no_file_returns_422(client):
     r = client.post("/upload-video", headers=AUTH)
     assert r.status_code == 422
 
@@ -58,7 +98,7 @@ def test_list_upload_videos_returns_only_uploads(client, db_session):
                       title="URL Video", source="url", created_at=datetime.utcnow())
     upload_video = Video(
         url=f"{settings.base_url}/temp_storage/up.mp4",
-        category="test", title="Upload Video", source="upload",
+        category="uploads", title="Upload Video", source="upload",
         created_at=datetime.utcnow(),
     )
     db_session.add_all([url_video, upload_video])
