@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
 import {
   uploadVideo, getUploadJob, cancelUploadJob,
-  listUploadedVideos, deleteVideo, downloadVideo,
+  listUploadedVideos, deleteVideo, deleteAllUploadVideos, downloadVideo,
 } from "../api";
 import { Button } from "@/components/ui/button";
 import {
@@ -14,7 +14,7 @@ import {
 import {
   Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle,
 } from "@/components/ui/dialog";
-import { Trash, Download, Check, X, Loader2, Upload, Ban, Clock } from "lucide-react";
+import { Trash, Download, Check, X, Loader2, Upload, Ban, Clock, Trash2 } from "lucide-react";
 import Link from "next/link";
 
 interface UploadedVideo {
@@ -34,6 +34,7 @@ interface UploadJob {
   status: "uploading" | "queued" | "processing" | "done" | "failed" | "cancelled";
   message: string;
   progress: number;
+  scaleProgress?: number;
   jobId?: string;
 }
 
@@ -46,6 +47,8 @@ export default function UploadPage() {
   const [error, setError] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [showDialog, setShowDialog] = useState(false);
+  const [showDeleteAllDialog, setShowDeleteAllDialog] = useState(false);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -91,7 +94,12 @@ export default function UploadPage() {
         if (data.status === "queued") {
           updateJob(localId, { status: "queued", message: "Waiting for worker…" });
         } else if (data.status === "processing") {
-          updateJob(localId, { status: "processing", message: "Scaling to 720p…" });
+          const pct = data.scale_progress ?? 0;
+          updateJob(localId, {
+            status: "processing",
+            message: pct > 0 ? `Scaling to 720p… ${pct}%` : "Scaling to 720p…",
+            scaleProgress: pct,
+          });
         } else if (data.status === "done") {
           clearInterval(intervalId);
           pollRefs.current.delete(localId);
@@ -204,6 +212,41 @@ export default function UploadPage() {
     e.preventDefault();
     setDragging(false);
     handleFiles(e.dataTransfer.files);
+  }
+
+  async function handleDeleteAll() {
+    try {
+      await deleteAllUploadVideos(token!);
+      setVideos([]);
+      setShowDeleteAllDialog(false);
+    } catch {
+      setError("Failed to delete all videos");
+      setShowDeleteAllDialog(false);
+    }
+  }
+
+  async function handleDownloadAll() {
+    setDownloadingAll(true);
+    for (const video of videos) {
+      try {
+        const blob = await downloadVideo(token!, video.id);
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
+        a.download = video.title
+          ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_720p.${ext}`
+          : `upload-${video.id}.${ext}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(blobUrl);
+        await new Promise((r) => setTimeout(r, 400));
+      } catch {
+        // skip and continue
+      }
+    }
+    setDownloadingAll(false);
   }
 
   async function confirmDelete() {
@@ -332,9 +375,21 @@ export default function UploadPage() {
                       />
                     </div>
                   )}
-                  {(job.status === "processing" || job.status === "queued") && (
+                  {job.status === "queued" && (
                     <div className="mt-1.5 h-1 bg-white/10 rounded-full overflow-hidden">
-                      <div className={`h-full rounded-full animate-pulse w-full ${job.status === "queued" ? "bg-yellow-500/60" : "bg-indigo-500/60"}`} />
+                      <div className="h-full rounded-full animate-pulse w-full bg-yellow-500/60" />
+                    </div>
+                  )}
+                  {job.status === "processing" && (
+                    <div className="mt-1.5 h-1 bg-white/10 rounded-full overflow-hidden">
+                      {job.scaleProgress && job.scaleProgress > 0 ? (
+                        <div
+                          className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+                          style={{ width: `${job.scaleProgress}%` }}
+                        />
+                      ) : (
+                        <div className="h-full rounded-full animate-pulse w-full bg-indigo-500/60" />
+                      )}
                     </div>
                   )}
                 </div>
@@ -361,6 +416,34 @@ export default function UploadPage() {
                 )}
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Bulk actions */}
+        {videos.length > 0 && (
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-sm text-gray-500">{videos.length} video{videos.length !== 1 ? "s" : ""}</span>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownloadAll}
+                disabled={downloadingAll}
+                className="border-white/10 bg-transparent hover:bg-indigo-500/10 hover:text-white text-gray-300 rounded-xl text-xs gap-1.5"
+              >
+                {downloadingAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                {downloadingAll ? "Downloading…" : "Download All"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowDeleteAllDialog(true)}
+                className="border-red-500/20 bg-transparent hover:bg-red-500/10 hover:text-red-300 text-gray-400 rounded-xl text-xs gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Delete All
+              </Button>
+            </div>
           </div>
         )}
 
@@ -449,6 +532,33 @@ export default function UploadPage() {
           ))}
         </div>
       </div>
+
+      {/* Delete All confirmation */}
+      <Dialog open={showDeleteAllDialog} onOpenChange={setShowDeleteAllDialog}>
+        <DialogContent className="glass-panel border-white/10 bg-gray-950/90 text-white rounded-4xl p-6 sm:p-8 shadow-2xl shadow-black">
+          <DialogHeader>
+            <DialogTitle className="text-xl">Delete All Uploads</DialogTitle>
+          </DialogHeader>
+          <div className="text-gray-300 my-2">
+            This will permanently delete all {videos.length} uploaded video{videos.length !== 1 ? "s" : ""} and their files. This cannot be undone.
+          </div>
+          <DialogFooter className="mt-4 gap-2">
+            <Button
+              variant="outline"
+              onClick={() => setShowDeleteAllDialog(false)}
+              className="rounded-xl border-white/10 hover:bg-white/10 hover:text-white text-gray-300"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleDeleteAll}
+              className="bg-red-500/20 text-red-400 hover:bg-red-500/40 hover:text-white border border-red-500/30 transition-all rounded-xl shadow-lg shadow-red-500/20"
+            >
+              Delete All
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Delete confirmation */}
       <Dialog open={showDialog} onOpenChange={setShowDialog}>

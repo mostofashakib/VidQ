@@ -4,7 +4,7 @@ from datetime import datetime
 
 class VideoCreate(BaseModel):
     url: str
-    category: str
+    category: str = "uncategorized"
     title: Optional[str] = None
     duration: Optional[float] = None
     thumbnail: Optional[str] = None

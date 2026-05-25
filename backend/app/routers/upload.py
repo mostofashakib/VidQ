@@ -25,6 +25,7 @@ class UploadJobOut(BaseModel):
     status: str
     video_id: Optional[int] = None
     error: Optional[str] = None
+    scale_progress: int = 0
 
 
 @router.post("/upload-video", response_model=UploadJobOut)
@@ -59,6 +60,7 @@ def get_upload_job(job_id: str, token: str = Depends(verify_token)):
         status=job.status,
         video_id=job.video_id,
         error=job.error,
+        scale_progress=job.scale_progress,
     )
 
 
@@ -81,3 +83,24 @@ def list_upload_videos(
         .order_by(Video.created_at.desc())
         .all()
     )
+
+
+@router.delete("/upload-videos", status_code=204)
+def delete_all_upload_videos(
+    db: Session = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    """Delete every uploaded video and its local file."""
+    settings = get_settings()
+    videos = db.query(Video).filter(Video.source == "upload").all()
+    for video in videos:
+        filename = video.url.rstrip("/").split("/")[-1].split("?")[0]
+        filepath = os.path.join(settings.temp_storage_dir, filename)
+        if os.path.exists(filepath):
+            try:
+                os.remove(filepath)
+            except Exception:
+                logger.warning(f"Could not delete file: {filepath}")
+        db.delete(video)
+    db.commit()
+    return None

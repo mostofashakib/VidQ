@@ -7,8 +7,8 @@ import { useAuth } from "./auth-context";
 import {
   addVideo,
   listVideos,
-  listCategories,
   deleteVideo,
+  deleteAllVideos,
   extractVideo,
   getQueueStatus,
   cancelJob,
@@ -16,7 +16,6 @@ import {
 } from "./api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Dialog,
   DialogContent,
@@ -32,7 +31,7 @@ import {
   CardFooter,
 } from "@/components/ui/card";
 import Image from "next/image";
-import { Trash, Download, Check, X, Loader2 } from "lucide-react";
+import { Trash, Download, Check, X, Loader2, Trash2 } from "lucide-react";
 
 interface Video {
   id: number;
@@ -71,14 +70,13 @@ export default function HomePage() {
   const { token, logout, loading, authEnabled } = useAuth();
   const router = useRouter();
   const [videos, setVideos] = useState<Video[]>([]);
-  const [categories, setCategories] = useState<string[]>([]);
-  const [selectedCategory, setSelectedCategory] = useState<string>("all");
   const [url, setUrl] = useState("");
-  const [category, setCategory] = useState("");
   const [error, setError] = useState("");
   const [hasMore, setHasMore] = useState(true);
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [showDialog, setShowDialog] = useState(false);
+  const [showDeleteAllDialog, setShowDeleteAllDialog] = useState(false);
+  const [downloadingAll, setDownloadingAll] = useState(false);
   const loaderRef = useRef<HTMLDivElement | null>(null);
   const [fetching, setFetching] = useState(false);
   const [downloads, setDownloads] = useState<DownloadJob[]>([]);
@@ -89,23 +87,18 @@ export default function HomePage() {
     downloadsRef.current = downloads;
   }, [downloads]);
 
-  async function fetchCategories() {
-    try {
-      const cats = await listCategories(token!);
-      setCategories(["all", ...cats.filter((c: string) => c !== "all")]);
-    } catch {
-      setError("Failed to load categories");
-    }
-  }
-
   const fetchMoreVideos = useCallback(
     async (reset = false) => {
       if (!token) return;
       setFetching(true);
       try {
         const skip = reset ? 0 : videos.length;
-        const newVideos = await listVideos(token, selectedCategory, skip, PAGE_SIZE);
-        setVideos((prev) => (reset ? newVideos : [...prev, ...newVideos]));
+        const newVideos = await listVideos(token, undefined, skip, PAGE_SIZE);
+        setVideos((prev) => {
+          if (reset) return newVideos;
+          const existingIds = new Set(prev.map((v) => v.id));
+          return [...prev, ...newVideos.filter((v) => !existingIds.has(v.id))];
+        });
         setHasMore(newVideos.length === PAGE_SIZE);
       } catch {
         setError("Failed to load videos");
@@ -113,7 +106,7 @@ export default function HomePage() {
         setFetching(false);
       }
     },
-    [token, selectedCategory, videos.length]
+    [token, videos.length]
   );
 
   useEffect(() => {
@@ -193,10 +186,9 @@ export default function HomePage() {
     if (!token) return;
     setVideos([]);
     setHasMore(true);
-    fetchCategories();
     fetchMoreVideos(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, selectedCategory]);
+  }, [token]);
 
   // Infinite scroll
   useEffect(() => {
@@ -216,16 +208,14 @@ export default function HomePage() {
 
   async function handleAddVideo(e: { preventDefault(): void }) {
     e.preventDefault();
-    if (!url || !category) return;
+    if (!url) return;
 
     const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const submittedUrl = url;
-    const submittedCategory = category;
     const controller = new AbortController();
 
     // Clear form immediately so the user can queue the next video right away
     setUrl("");
-    setCategory("");
     setError("");
 
     setDownloads((prev) => [
@@ -274,7 +264,7 @@ export default function HomePage() {
       );
 
       try {
-        await addVideo(token!, realUrl, submittedCategory, title, duration);
+        await addVideo(token!, realUrl, title, duration);
       } catch (addErr: unknown) {
         const axiosErr = addErr as { response?: { status?: number } };
         if (axiosErr?.response?.status !== 409) throw addErr;
@@ -307,6 +297,43 @@ export default function HomePage() {
         )
       );
     }
+  }
+
+  async function handleDeleteAll() {
+    try {
+      await deleteAllVideos(token!);
+      setVideos([]);
+      setHasMore(false);
+      setShowDeleteAllDialog(false);
+    } catch {
+      setError("Failed to delete all videos");
+      setShowDeleteAllDialog(false);
+    }
+  }
+
+  async function handleDownloadAll() {
+    setDownloadingAll(true);
+    for (const video of videos) {
+      try {
+        const blob = await downloadVideo(token!, video.id);
+        const blobUrl = window.URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
+        a.download = video.title
+          ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${ext}`
+          : `video-${video.id}.${ext}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        window.URL.revokeObjectURL(blobUrl);
+        // Brief pause so the browser can initiate each download
+        await new Promise((r) => setTimeout(r, 400));
+      } catch {
+        // skip failed downloads, continue with rest
+      }
+    }
+    setDownloadingAll(false);
   }
 
   function handlePaste(e: React.ClipboardEvent<HTMLInputElement>) {
@@ -392,15 +419,9 @@ export default function HomePage() {
               onPaste={handlePaste}
               className="flex-1 bg-white/5 border-white/10 focus-visible:ring-indigo-500 rounded-xl h-14 text-white placeholder:text-gray-400 px-5 text-base"
             />
-            <Input
-              placeholder="Category Name"
-              value={category}
-              onChange={(e) => setCategory(e.target.value)}
-              className="w-full sm:w-56 bg-white/5 border-white/10 focus-visible:ring-indigo-500 rounded-xl h-14 text-white placeholder:text-gray-400 px-5 text-base"
-            />
             <Button
               type="submit"
-              disabled={!url || !category}
+              disabled={!url}
               className="sm:w-auto w-full h-14 px-8 font-semibold rounded-xl bg-linear-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 transition-all border-none shadow-lg shadow-indigo-500/25 text-white disabled:opacity-50"
             >
               Add Video
@@ -542,26 +563,33 @@ export default function HomePage() {
           </div>
         )}
 
-        {/* Category Tabs */}
-        <div className="flex justify-center mb-12">
-          <Tabs
-            value={selectedCategory}
-            onValueChange={setSelectedCategory}
-            className="w-full max-w-3xl"
-          >
-            <TabsList className="bg-white/5 border border-white/10 p-1.5 rounded-2xl w-full flex overflow-x-auto hide-scrollbar h-auto">
-              {categories.map((cat) => (
-                <TabsTrigger
-                  key={cat}
-                  value={cat}
-                  className="capitalize rounded-xl px-6 py-3 text-sm font-medium transition-all data-[state=active]:bg-indigo-500 data-[state=active]:text-white data-[state=active]:shadow-lg data-[state=active]:shadow-indigo-500/30 text-gray-400 hover:text-white"
-                >
-                  {cat || "all"}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
-        </div>
+        {/* Bulk actions */}
+        {videos.length > 0 && (
+          <div className="flex items-center justify-between mb-4">
+            <span className="text-sm text-gray-500">{videos.length} video{videos.length !== 1 ? "s" : ""}</span>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleDownloadAll}
+                disabled={downloadingAll}
+                className="border-white/10 bg-transparent hover:bg-indigo-500/10 hover:text-white text-gray-300 rounded-xl text-xs gap-1.5"
+              >
+                {downloadingAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                {downloadingAll ? "Downloading…" : "Download All"}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setShowDeleteAllDialog(true)}
+                className="border-red-500/20 bg-transparent hover:bg-red-500/10 hover:text-red-300 text-gray-400 rounded-xl text-xs gap-1.5"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                Delete All
+              </Button>
+            </div>
+          </div>
+        )}
 
         {/* Video Grid */}
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-8">
@@ -596,9 +624,6 @@ export default function HomePage() {
               </CardHeader>
               <CardContent className="flex-1 flex flex-col justify-between z-10 px-6">
                 <div className="mb-5 text-xs flex gap-2">
-                  <span className="inline-block px-3 py-1.5 bg-white/10 rounded-full text-indigo-300 font-medium tracking-wider uppercase text-[10px] border border-white/5">
-                    {video.category}
-                  </span>
                   {video.duration !== undefined && video.duration !== null && (
                     <span className="inline-block px-3 py-1.5 bg-black/30 rounded-full text-gray-300 font-mono text-[10px] border border-white/5">
                       {formatDuration(video.duration)}
@@ -661,6 +686,33 @@ export default function HomePage() {
           ))}
         </div>
         <div ref={loaderRef} className="h-8" />
+
+        {/* Delete All Confirmation */}
+        <Dialog open={showDeleteAllDialog} onOpenChange={setShowDeleteAllDialog}>
+          <DialogContent className="glass-panel border-white/10 bg-gray-950/90 text-white rounded-4xl p-6 sm:p-8 shadow-2xl shadow-black">
+            <DialogHeader>
+              <DialogTitle className="text-xl">Delete All Videos</DialogTitle>
+            </DialogHeader>
+            <div className="text-gray-300 my-2">
+              This will permanently delete all {videos.length} video{videos.length !== 1 ? "s" : ""} in your library. This cannot be undone.
+            </div>
+            <DialogFooter className="mt-4 gap-2">
+              <Button
+                variant="outline"
+                onClick={() => setShowDeleteAllDialog(false)}
+                className="rounded-xl border-white/10 hover:bg-white/10 hover:text-white text-gray-300"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleDeleteAll}
+                className="bg-red-500/20 text-red-400 hover:bg-red-500/40 hover:text-white border border-red-500/30 transition-all rounded-xl shadow-lg shadow-red-500/20"
+              >
+                Delete All
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
 
         {/* Delete Confirmation */}
         <Dialog open={showDialog} onOpenChange={setShowDialog}>

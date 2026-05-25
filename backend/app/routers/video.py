@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from app.db import get_db, Video
 from app.models import VideoCreate, VideoOut
@@ -122,7 +122,7 @@ def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = De
             title = scraped_title
         if duration is None:
             duration = scraped_duration
-    db_video = Video(url=norm_url, category=video.category, title=title, duration=duration)
+    db_video = Video(url=norm_url, category=video.category or "uncategorized", title=title, duration=duration)
     db.add(db_video)
     db.commit()
     db.refresh(db_video)
@@ -130,14 +130,14 @@ def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = De
 
 @router.get("/videos", response_model=List[VideoOut])
 def list_videos(category: Optional[str] = None, skip: int = 0, limit: int = 20, db: Session = Depends(get_db), token: str = Depends(verify_token)):
-    query = db.query(Video).filter(Video.source != "upload")
+    query = db.query(Video).filter(Video.source == "url")
     if category:
         query = query.filter(Video.category == category)
     return query.order_by(Video.created_at.desc()).offset(skip).limit(limit).all()
 
 @router.get("/videos/categories", response_model=List[str])
 def list_categories(db: Session = Depends(get_db), token: str = Depends(verify_token)):
-    categories = db.query(Video.category).filter(Video.source != "upload").distinct().all()
+    categories = db.query(Video.category).filter(Video.source == "url").distinct().all()
     return [c[0] for c in categories]
 
 @router.delete("/videos/{video_id}", status_code=204)
@@ -161,32 +161,71 @@ def delete_video(video_id: int, db: Session = Depends(get_db), token: str = Depe
     return None
 
 
+def _safe_title(title: str, video_id: int) -> str:
+    return ''.join(
+        c if (c.isalnum() or c in ' _-.') else '_'
+        for c in (title or f"video-{video_id}")
+    )[:80].strip().replace(' ', '_')
+
+
 @router.get("/videos/{video_id}/download")
 def download_video(video_id: int, db: Session = Depends(get_db), token: str = Depends(verify_token)):
-    """Stream a locally stored video with Content-Disposition: attachment so the browser downloads it."""
+    """Download a video — serves local files directly, proxies external URLs."""
     video = db.query(Video).filter(Video.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
 
     video_url = video.url
     settings = get_settings()
+    title = _safe_title(video.title or "", video_id)
 
+    # Local uploaded file
     if "temp_storage" in video_url and ("localhost" in video_url or "127.0.0.1" in video_url):
         filename = video_url.split("/")[-1].split("?")[0]
         filepath = os.path.join(settings.temp_storage_dir, filename)
         if os.path.exists(filepath):
             ext = filename.rsplit(".", 1)[-1] if "." in filename else "mp4"
-            safe_title = ''.join(
-                c if (c.isalnum() or c in ' _-.') else '_'
-                for c in (video.title or f"video-{video_id}")
-            )[:80].strip().replace(' ', '_')
             return FileResponse(
                 filepath,
                 media_type=f"video/{ext}",
-                filename=f"{safe_title}.{ext}",
+                filename=f"{title}.{ext}",
             )
 
-    raise HTTPException(status_code=404, detail="No local file available for this video")
+    # External URL: proxy so the browser receives Content-Disposition: attachment
+    if is_safe_url(video_url):
+        raw_path = video_url.split("?")[0].rsplit("/", 1)[-1]
+        ext = raw_path.rsplit(".", 1)[-1] if "." in raw_path else "mp4"
+        if len(ext) > 5 or not ext.isalnum():
+            ext = "mp4"
+
+        def _stream():
+            try:
+                with requests.get(
+                    video_url, stream=True, timeout=30,
+                    headers={"User-Agent": random.choice(USER_AGENTS)},
+                ) as r:
+                    r.raise_for_status()
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            yield chunk
+            except Exception as exc:
+                logger.error(f"Proxy download error for video {video_id}: {exc}")
+
+        return StreamingResponse(
+            _stream(),
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'attachment; filename="{title}.{ext}"'},
+        )
+
+    raise HTTPException(status_code=404, detail="No downloadable source for this video")
+
+
+@router.delete("/videos", status_code=204)
+def delete_all_videos(db: Session = Depends(get_db), token: str = Depends(verify_token)):
+    """Delete every URL-sourced video."""
+    db.query(Video).filter(Video.source == "url").delete(synchronize_session=False)
+    db.commit()
+    return None
 
 async def call_llm_with_html_and_screenshot(llm_manager: FallbackLLMManager, html: str, screenshot_b64: str, network_video_urls: list[str], thumbnail_url: str) -> dict:
     prompt = Prompts.video_metadata(clean_html(html), network_video_urls)

@@ -7,10 +7,10 @@ export async function login(password: string) {
   return res.data.token as string;
 }
 
-export async function addVideo(token: string, url: string, category: string, title?: string, duration?: number) {
+export async function addVideo(token: string, url: string, title?: string, duration?: number) {
   const res = await axios.post(
     `${API_URL}/videos`,
-    { url, category, title, duration },
+    { url, title, duration },
     { headers: { Authorization: `Bearer ${token}` } }
   );
   return res.data;
@@ -91,6 +91,7 @@ export interface UploadJobData {
   status: string;
   video_id?: number;
   error?: string;
+  scale_progress?: number;
 }
 
 export async function uploadVideo(
@@ -123,6 +124,18 @@ export async function getUploadJob(token: string, jobId: string): Promise<Upload
 
 export async function cancelUploadJob(token: string, jobId: string): Promise<void> {
   await axios.delete(`${API_URL}/upload-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function deleteAllVideos(token: string): Promise<void> {
+  await axios.delete(`${API_URL}/videos`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+export async function deleteAllUploadVideos(token: string): Promise<void> {
+  await axios.delete(`${API_URL}/upload-videos`, {
     headers: { Authorization: `Bearer ${token}` },
   });
 }

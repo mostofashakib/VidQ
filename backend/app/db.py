@@ -15,7 +15,7 @@ class Video(Base):
     __tablename__ = "videos"
     id = Column(Integer, primary_key=True, index=True)
     url = Column(String, nullable=False)
-    category = Column(String, nullable=False)
+    category = Column(String, nullable=True, default="uncategorized")
     title = Column(String, nullable=True)
     duration = Column(Float, nullable=True)  # duration in seconds
     thumbnail = Column(String, nullable=True)  # URL or base64
