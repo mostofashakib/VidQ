@@ -7,7 +7,7 @@ import random
 import re
 import threading
 import uuid
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -30,9 +30,11 @@ from app.services.scraper.playback import (
     _interruptible_sleep,
     _get_main_video_selector,
     _agentic_interact,
+    _is_playing,
     _set_quality,
     _force_play_js,
     _try_click,
+    _wait_for_media_ready,
 )
 from app.services.prompts import Prompts
 
@@ -47,6 +49,7 @@ async def run_extraction(
     llm_manager=None,
     max_record_seconds: int = 10800,
     cancel_event: threading.Event | None = None,
+    phase_callback=None,
 ) -> tuple[str, str, list[str], str, str]:
     """
     Async Playwright scraping pipeline.
@@ -92,6 +95,8 @@ async def run_extraction(
             # FAST PASS  (metadata + network sniff)
             # ─────────────────────────────────────────
             logger.debug("--- FAST PASS ---")
+            if phase_callback:
+                phase_callback("fast_pass")
             context = await browser.new_context()
             page = await context.new_page()
             await page.set_extra_http_headers({"User-Agent": user_agent})
@@ -100,7 +105,10 @@ async def run_extraction(
 
             def handle_request(request):
                 r_url = request.url
-                if any(r_url.endswith(ext) for ext in [".mp4", ".m3u8", ".webm", ".mov", ".flv", ".avi"]):
+                # Use path-only matching so query-string tokens don't break extension checks
+                # e.g. https://cdn.example.com/video.m3u8?token=abc  →  path ends in .m3u8
+                r_path = urlparse(r_url).path.lower()
+                if any(r_path.endswith(ext) for ext in [".mp4", ".m3u8", ".webm", ".mov", ".flv", ".avi"]):
                     if _is_ad_video_url(r_url):
                         logger.debug(f"Ad URL filtered: {r_url[:80]}")
                         return
@@ -112,7 +120,27 @@ async def run_extraction(
                         logger.debug(f"Network intercept: {r_url}")
                         video_urls.add(r_url)
 
+            def handle_response(response):
+                # Catch video URLs by content-type — covers HLS manifests and direct
+                # video files that don't have a standard extension in their path.
+                try:
+                    r_url = response.url
+                    if _is_ad_video_url(r_url) or r_url.startswith("blob:"):
+                        return
+                    ct = (response.headers.get("content-type") or "").lower().split(";")[0].strip()
+                    if ct in ("application/x-mpegurl", "application/vnd.apple.mpegurl"):
+                        logger.debug(f"HLS manifest (content-type): {r_url[:80]}")
+                        video_urls.add(r_url)
+                    elif ct in ("video/mp4", "video/webm", "video/ogg", "video/x-flv", "video/quicktime"):
+                        cl = int(response.headers.get("content-length") or 0)
+                        if cl > 100_000:
+                            logger.debug(f"Video response (content-type, {cl // 1024}KB): {r_url[:80]}")
+                            video_urls.add(r_url)
+                except Exception:
+                    pass
+
             page.on("request", handle_request)
+            page.on("response", handle_response)
 
             logger.debug("Navigating (Fast Pass)…")
             await _safe_goto(page, url)
@@ -160,7 +188,10 @@ async def run_extraction(
 
             # ── Try to trigger playback (agentic if LLM available) ──
             if llm_manager:
-                await _agentic_interact(page, llm_manager, max_attempts=5)
+                if await _is_playing(page):
+                    logger.info("Fast Pass: video auto-playing — skipping agentic interact.")
+                else:
+                    await _agentic_interact(page, llm_manager, max_attempts=5)
             else:
                 for sel in [play_selector, 'button[aria-label*="play" i]', '.vjs-big-play-button', 'video']:
                     if sel and await _try_click(page, sel):
@@ -293,16 +324,48 @@ async def run_extraction(
                 await heavy_page.set_extra_http_headers({"User-Agent": user_agent})
 
                 await _safe_goto(heavy_page, url)
-                await asyncio.sleep(1)
+                if phase_callback:
+                    phase_callback("heavy_pass_waiting")
+                logger.info("Heavy Pass: polling for media readiness (up to 15s)…")
+                media_ready = await _wait_for_media_ready(heavy_page, timeout_s=15)
+                if media_ready:
+                    logger.info("Heavy Pass: media ready (play button / video visible).")
+                else:
+                    logger.info("Heavy Pass: media readiness timeout — proceeding anyway.")
 
                 main_selector = await _get_main_video_selector(heavy_page, main_video_selector)
                 logger.debug(f"Targeting main video: {main_selector}")
 
-                playing = await _agentic_interact(heavy_page, llm_manager, max_attempts=5)
-                if not playing:
-                    playing = await _force_play_js(heavy_page)
+                # After page has settled, take HTML → LLM for fresh selectors
+                if llm_manager:
+                    try:
+                        logger.info("Heavy Pass: capturing HTML for LLM navigation analysis…")
+                        raw_html = await heavy_page.content()
+                        pre_html = clean_html(raw_html)
+                        heavy_nav_bytes = await heavy_page.screenshot(type="jpeg", quality=80)
+                        heavy_nav_b64 = base64.b64encode(heavy_nav_bytes).decode()
+                        heavy_nav_map = await llm_manager.execute(
+                            Prompts.navigation_selectors_vision(pre_html), heavy_nav_b64
+                        )
+                        if heavy_nav_map.get("play_selector"):
+                            play_selector = heavy_nav_map["play_selector"]
+                            logger.info(f"Heavy Pass: updated play_selector=[{play_selector}]")
+                        if heavy_nav_map.get("main_video_selector"):
+                            main_video_selector = heavy_nav_map["main_video_selector"]
+                            main_selector = await _get_main_video_selector(heavy_page, main_video_selector)
+                            logger.info(f"Heavy Pass: updated main_selector=[{main_selector}]")
+                    except Exception as e:
+                        logger.warning(f"Heavy Pass LLM navigation analysis failed: {e}")
+
+                if await _is_playing(heavy_page):
+                    logger.info("Heavy Pass: video already playing (autoplay) — skipping agentic interact.")
+                    playing = True
+                else:
+                    playing = await _agentic_interact(heavy_page, llm_manager, max_attempts=5)
                     if not playing:
-                        logger.warning("Could not confirm playback — recording anyway (may capture blank stream).")
+                        playing = await _force_play_js(heavy_page)
+                        if not playing:
+                            logger.warning("Could not confirm playback — recording anyway (may capture blank stream).")
 
                 if settings_selector or quality_selector:
                     await _set_quality(heavy_page, settings_selector, quality_selector)
@@ -313,8 +376,26 @@ async def run_extraction(
                     except Exception:
                         pass
 
+                # Find the frame that actually holds the video element.
+                # Streaming platforms embed their player
+                # inside an <iframe>; calling captureStream() must happen inside
+                # that frame's execution context, not the parent page.
+                target_frame = heavy_page
+                for frame in heavy_page.frames[1:]:
+                    try:
+                        if await frame.evaluate("() => document.querySelectorAll('video').length > 0"):
+                            target_frame = frame
+                            logger.info(f"Heavy Pass: video located in iframe — {frame.url[:60]}")
+                            break
+                    except Exception:
+                        pass
+                main_selector = await _get_main_video_selector(target_frame, main_video_selector)
+                logger.debug(f"MediaRecorder target: {'iframe' if target_frame is not heavy_page else 'main'} / {main_selector}")
+
+                if phase_callback:
+                    phase_callback("heavy_pass_recording")
                 logger.info("Injecting MediaRecorder…")
-                await heavy_page.evaluate(f'''async () => {{
+                await target_frame.evaluate(f'''async () => {{
                     window.recorderChunks = [];
                     const video = document.querySelector({repr(main_selector)});
                     if (video) {{
@@ -349,7 +430,7 @@ async def run_extraction(
                 logger.debug("Stopping MediaRecorder…")
                 try:
                     async with heavy_page.expect_download(timeout=15000) as dl_info:
-                        await heavy_page.evaluate('''() => {
+                        await target_frame.evaluate('''() => {
                             if (window.mediaRecorder) {
                                 window.mediaRecorder.stop();
                                 setTimeout(() => {

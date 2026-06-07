@@ -317,6 +317,9 @@ def get_queue_status(job_id: str, token: str = Depends(verify_token)):
 
     if job.status == "queued":
         response["queue_position"] = queue.position(job_id)
+    elif job.status == "processing":
+        response["phase"] = job.phase
+        response["recording_started_at"] = job.recording_started_at
     elif job.status == "done":
         response["result"] = job.result
     elif job.status == "failed":

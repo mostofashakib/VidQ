@@ -7,6 +7,7 @@ The API returns immediately with a job_id so the client can poll
 """
 import asyncio
 import threading
+import time
 import uuid
 import logging
 from dataclasses import dataclass, field
@@ -33,6 +34,9 @@ class RecordingJob:
     status: JobStatus = JobStatus.QUEUED
     result: Optional[dict] = None
     error: Optional[str] = None
+    phase: Optional[str] = None               # current pipeline phase
+    started_at: Optional[float] = None        # time.time() when processing began
+    recording_started_at: Optional[float] = None  # time.time() when MediaRecorder fired
     # Per-job cancellation flag checked during the recording sleep
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
@@ -123,6 +127,12 @@ class VideoQueue:
 
         logger.info(f"Processing job {job.job_id} — {job.url}")
         job.status = JobStatus.PROCESSING
+        job.started_at = time.time()
+
+        def _set_phase(phase: str) -> None:
+            job.phase = phase
+            if phase == "heavy_pass_recording":
+                job.recording_started_at = time.time()
 
         async def _actual_work():
             from app.services.scraper import run_extraction, USER_AGENTS
@@ -138,6 +148,7 @@ class VideoQueue:
                 llm_manager=llm_manager,
                 max_record_seconds=10800,
                 cancel_event=job.cancel_event,
+                phase_callback=_set_phase,
             )
 
             if not screenshot_b64:

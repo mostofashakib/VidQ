@@ -52,6 +52,29 @@ interface DownloadJob {
   jobId?: string;
   queuePosition?: number;
   abortController?: AbortController;
+  phase?: string;               // pipeline phase from backend
+  recordingStartedAt?: number;  // ms timestamp when heavy_pass_recording began
+  errorDetail?: string;         // raw error string when status === "failed"
+}
+
+function phaseMessage(phase?: string): string {
+  switch (phase) {
+    case "fast_pass": return "Analyzing video source…";
+    case "heavy_pass_waiting": return "Loading video player…";
+    case "heavy_pass_recording": return "Recording video stream…";
+    default: return "Processing video…";
+  }
+}
+
+function RecordingTimer({ startedAt }: { startedAt: number }) {
+  const [elapsed, setElapsed] = useState(() => Math.floor((Date.now() - startedAt) / 1000));
+  useEffect(() => {
+    const id = setInterval(() => setElapsed(Math.floor((Date.now() - startedAt) / 1000)), 1000);
+    return () => clearInterval(id);
+  }, [startedAt]);
+  const m = Math.floor(elapsed / 60);
+  const s = elapsed % 60;
+  return <span>{m}:{s.toString().padStart(2, "0")}</span>;
 }
 
 const PAGE_SIZE = 20;
@@ -146,7 +169,8 @@ export default function HomePage() {
                         message:
                           isDone ? "Video ready!" :
                           data.status === "cancelled" ? "Cancelled" :
-                          `Failed: ${data.error}`,
+                          "Recording failed",
+                        errorDetail: data.status === "failed" ? data.error : undefined,
                       }
                     : d
                 )
@@ -160,14 +184,19 @@ export default function HomePage() {
                 }, 5000);
               }
             } else {
+              const phase = data.phase as string | undefined;
+              const recordingStartedAt =
+                data.recording_started_at != null
+                  ? data.recording_started_at * 1000
+                  : job.recordingStartedAt;
               const msg =
                 data.status === "processing"
-                  ? "Downloading and processing video..."
-                  : "Queued for processing";
+                  ? phaseMessage(phase)
+                  : `Queued for processing${data.queue_position != null ? ` · Position ${data.queue_position}` : ""}`;
               setDownloads((prev) =>
                 prev.map((d) =>
                   d.localId === job.localId
-                    ? { ...d, status: data.status, message: msg, queuePosition: data.queue_position }
+                    ? { ...d, status: data.status, message: msg, queuePosition: data.queue_position, phase, recordingStartedAt }
                     : d
                 )
               );
@@ -451,6 +480,8 @@ export default function HomePage() {
                     dl.status === "done"
                       ? "border-green-500/25"
                       : dl.status === "failed"
+                      ? "border-red-500/40 bg-red-500/5"
+                      : dl.phase === "heavy_pass_recording"
                       ? "border-red-500/25"
                       : "border-indigo-500/20"
                   }`}
@@ -465,6 +496,10 @@ export default function HomePage() {
                       <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
                         <X className="w-4 h-4 text-red-400" />
                       </div>
+                    ) : dl.phase === "heavy_pass_recording" ? (
+                      <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
+                        <span className="w-3 h-3 rounded-full bg-red-500 animate-pulse" />
+                      </div>
                     ) : (
                       <div className="w-8 h-8 rounded-full bg-indigo-500/15 flex items-center justify-center">
                         <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
@@ -477,24 +512,48 @@ export default function HomePage() {
                     <p className="text-sm font-medium text-white truncate">
                       {dl.title || dl.url}
                     </p>
-                    <p
-                      className={`text-xs mt-0.5 ${
-                        dl.status === "done"
-                          ? "text-green-400"
-                          : dl.status === "failed"
-                          ? "text-red-400"
-                          : "text-indigo-400"
-                      }`}
-                    >
-                      {dl.message}
-                      {dl.queuePosition && dl.status === "queued"
-                        ? ` · Position: ${dl.queuePosition}`
-                        : ""}
-                    </p>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <p
+                        className={`text-xs mt-0.5 ${
+                          dl.status === "done"
+                            ? "text-green-400"
+                            : dl.status === "failed"
+                            ? "text-red-400"
+                            : dl.phase === "heavy_pass_recording"
+                            ? "text-red-400"
+                            : "text-indigo-400"
+                        }`}
+                      >
+                        {dl.message}
+                      </p>
+                      {dl.phase === "heavy_pass_recording" && dl.recordingStartedAt && (
+                        <span className="flex items-center gap-1 text-[10px] text-red-400 font-mono mt-0.5">
+                          <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" />
+                          REC <RecordingTimer startedAt={dl.recordingStartedAt} />
+                        </span>
+                      )}
+                    </div>
+                    {dl.status === "failed" && dl.errorDetail && (
+                      <p className="text-[10px] text-red-500/70 font-mono mt-1 truncate" title={dl.errorDetail}>
+                        {dl.errorDetail}
+                      </p>
+                    )}
                     {dl.jobId && (
                       <p className="text-[10px] text-gray-600 font-mono mt-0.5">
                         Job: {dl.jobId.slice(0, 16)}…
                       </p>
+                    )}
+                    {/* Progress bar — shown for all in-progress states */}
+                    {dl.status !== "done" && dl.status !== "failed" && dl.status !== "cancelled" && (
+                      <div className="w-full h-0.5 rounded-full overflow-hidden mt-2 bg-white/5">
+                        <div
+                          className={`h-full rounded-full animate-pulse ${
+                            dl.phase === "heavy_pass_recording"
+                              ? "bg-linear-to-r from-red-500/0 via-red-500/60 to-red-500/0"
+                              : "bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0"
+                          }`}
+                        />
+                      </div>
                     )}
                   </div>
 

@@ -234,8 +234,9 @@ async def _download_video_direct(
     timeout_s: int = 120,
 ) -> str | None:
     """
-    Download video_url via ffmpeg stream-copy with Referer + User-Agent headers.
-    Returns a localhost URL to the saved file, or None on failure.
+    Download video_url. Tries ffmpeg first (fast stream-copy); falls back to
+    yt-dlp for m3u8/DASH URLs where ffmpeg fails due to token refresh or
+    segment encryption.
     """
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -262,7 +263,7 @@ async def _download_video_direct(
         except asyncio.TimeoutError:
             proc.kill()
             logger.warning(f"ffmpeg download timed out ({timeout_s}s)")
-            return None
+            stderr = b""
         if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
             final_path = ensure_min_quality(out_path)
             final_filename = os.path.basename(final_path)
@@ -273,6 +274,44 @@ async def _download_video_direct(
         logger.warning(f"ffmpeg download failed (rc={proc.returncode}): {err_tail}")
     except Exception as e:
         logger.warning(f"ffmpeg download error: {e}")
+
+    # yt-dlp fallback — handles tokenized HLS/DASH that ffmpeg can't reassemble
+    r_path = urlparse(video_url).path.lower()
+    if any(r_path.endswith(ext) for ext in (".m3u8", ".mpd")):
+        logger.info(f"yt-dlp fallback: {video_url[:100]}")
+        try:
+            storage = _settings.temp_storage_dir
+            filename = f"{uuid.uuid4().hex}.mp4"
+            out_path = os.path.join(storage, filename)
+            cmd = [
+                "yt-dlp",
+                "--merge-output-format", "mp4",
+                "--add-header", f"Referer:{referer}",
+                "-o", out_path,
+                video_url,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.warning(f"yt-dlp download timed out ({timeout_s}s)")
+                return None
+            if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+                final_path = ensure_min_quality(out_path)
+                final_filename = os.path.basename(final_path)
+                size_kb = os.path.getsize(final_path) // 1024
+                logger.info(f"yt-dlp download succeeded: {size_kb}KB → {final_filename}")
+                return f"{_settings.base_url}/temp_storage/{final_filename}"
+            err_tail = (stderr or b'').decode(errors='replace')[-300:]
+            logger.warning(f"yt-dlp download failed (rc={proc.returncode}): {err_tail}")
+        except Exception as e:
+            logger.warning(f"yt-dlp download error: {e}")
+
     return None
 
 

@@ -42,6 +42,59 @@ _PLAYING_JS = '''() => {
     return vs.length > 0 && vs.some(v => !v.paused || v.currentTime > 0.5);
 }'''
 
+_IS_MEDIA_READY_JS = '''() => {
+    function isLikelyMediaReady(container) {
+        const video = container.querySelector("video");
+        const playButton = container.querySelector(
+            'button[aria-label*="Play"], button[title*="Play"], [role="button"][aria-label*="Play"]'
+        );
+        const loader = container.querySelector(
+            '[class*="loading"], [class*="spinner"], [aria-busy="true"]'
+        );
+        const visiblePlay =
+            playButton &&
+            playButton.offsetParent !== null &&
+            !playButton.disabled;
+        const videoReady =
+            video &&
+            video.readyState >= 2 &&
+            video.videoWidth > 0 &&
+            video.videoHeight > 0;
+        const noLoader = !loader || loader.offsetParent === null;
+        return noLoader && (visiblePlay || videoReady);
+    }
+    return isLikelyMediaReady(document.body);
+}'''
+
+
+async def _wait_for_media_ready(page, timeout_s: int = 15) -> bool:
+    """
+    Poll the page AND all child frames up to `timeout_s` seconds.
+    Returns True as soon as the video is playing or the player UI is ready.
+    Prioritises _PLAYING_JS (video actively playing) over the readiness heuristic,
+    and checks child frames so iframe-embedded players are detected.
+    """
+    for _ in range(timeout_s):
+        try:
+            if await page.evaluate(_PLAYING_JS):
+                logger.info("Media already playing (autoplay detected).")
+                return True
+            if await page.evaluate(_IS_MEDIA_READY_JS):
+                return True
+            for frame in page.frames[1:]:
+                try:
+                    if await frame.evaluate(_PLAYING_JS):
+                        logger.info("Media playing in iframe (autoplay detected).")
+                        return True
+                    if await frame.evaluate(_IS_MEDIA_READY_JS):
+                        return True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await asyncio.sleep(1)
+    return False
+
 
 async def _safe_goto(page, target_url: str, timeout: int = 30000) -> None:
     """Navigate with one retry on ERR_SOCKET connection errors."""
@@ -204,8 +257,9 @@ async def _pre_pass_unblock(page) -> int:
 
 async def _try_click(page, selector: str) -> bool:
     """
-    Try a Playwright-native click first (dispatches real pointer events),
-    then fall back to JS click.
+    Try a Playwright-native click first, then a JS click, then both in each
+    child frame. Covers iframe-embedded players without the caller needing to
+    know which frame the element lives in.
     """
     try:
         await page.click(selector, timeout=2500, force=False)
@@ -219,15 +273,34 @@ async def _try_click(page, selector: str) -> bool:
         )
         if hit:
             logger.info(f"JS fallback click: {selector}")
-        return bool(hit)
+            return True
     except Exception:
-        return False
+        pass
+    for frame in page.frames[1:]:
+        try:
+            el = await frame.query_selector(selector)
+            if el and await el.is_visible():
+                await el.click(timeout=2500, force=False)
+                logger.info(f"Frame click: {selector} in {frame.url[:50]}")
+                return True
+        except Exception:
+            pass
+        try:
+            hit = await frame.evaluate(
+                f"() => {{ const el = document.querySelector({repr(selector)}); if (el) {{ el.click(); return true; }} return false; }}"
+            )
+            if hit:
+                logger.info(f"Frame JS click: {selector} in {frame.url[:50]}")
+                return True
+        except Exception:
+            pass
+    return False
 
 
 async def _try_direct_play(page) -> bool:
     """
     Heuristic play-button trigger — no LLM. Tries common video player selectors
-    and falls back to clicking the <video> element itself.
+    in the main frame and each child frame (handles iframe-embedded players).
     """
     selectors = [
         '.vjs-big-play-button',
@@ -245,27 +318,28 @@ async def _try_direct_play(page) -> bool:
         '.mejs__play',
         '.video-js .vjs-play-control',
     ]
-    for sel in selectors:
+    for target in [page, *page.frames[1:]]:
+        for sel in selectors:
+            try:
+                el = await target.query_selector(sel)
+                if el and await el.is_visible():
+                    await el.click()
+                    await asyncio.sleep(1.5)
+                    if await _is_playing(page):
+                        logger.info(f"Direct play via '{sel}'.")
+                        return True
+            except Exception:
+                pass
         try:
-            el = await page.query_selector(sel)
-            if el and await el.is_visible():
+            el = await target.query_selector('video')
+            if el:
                 await el.click()
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(1.0)
                 if await _is_playing(page):
-                    logger.info(f"Direct play via '{sel}'.")
+                    logger.info("Direct play via <video> click.")
                     return True
         except Exception:
             pass
-    try:
-        el = await page.query_selector('video')
-        if el:
-            await el.click()
-            await asyncio.sleep(1.0)
-            if await _is_playing(page):
-                logger.info("Direct play via <video> click.")
-                return True
-    except Exception:
-        pass
     return False
 
 
@@ -344,6 +418,12 @@ async def _agentic_interact(page, llm_manager, max_attempts: int = 6) -> bool:
     if not llm_manager:
         return False
 
+    # Short-circuit: video is already playing (e.g. autoplay on page load).
+    # Skip all interaction to avoid accidentally pausing it.
+    if await _is_playing(page):
+        logger.info("Agentic interact: video already playing — nothing to do.")
+        return True
+
     # ── Auto-dismiss native browser dialogs ─────────────────────────────────
     def _on_dialog(dialog):
         logger.info(f"Auto-dismissing browser dialog: {dialog.type} — '{dialog.message[:60]}'")
@@ -361,6 +441,10 @@ async def _agentic_interact(page, llm_manager, max_attempts: int = 6) -> bool:
     try:
         for attempt in range(max_attempts):
             logger.info(f"--- Agentic attempt {attempt + 1}/{max_attempts} ---")
+
+            if await _is_playing(page):
+                logger.info(f"  Video playing at attempt {attempt + 1} entry — done.")
+                return True
 
             # ── Layer 1a: JS pre-pass (Escape + consent/ad dismissal) ────
             dismissed = await _pre_pass_unblock(page)
@@ -394,6 +478,15 @@ async def _agentic_interact(page, llm_manager, max_attempts: int = 6) -> bool:
 
             try:
                 raw_html = await page.content()
+                # Append inner HTML of child frames so the LLM can see inside
+                # iframe-embedded players (main page HTML only has <iframe> tags).
+                for frame in page.frames[1:]:
+                    try:
+                        frame_html = await frame.content()
+                        if frame_html and len(frame_html) > 500:
+                            raw_html += f"\n<!-- IFRAME ({frame.url[:80]}) -->\n" + frame_html
+                    except Exception:
+                        pass
                 interact_html = _clean_for_interaction(raw_html, max_len=10000)
                 logger.info(f"  HTML for LLM: {len(interact_html)} chars")
             except Exception as e:
