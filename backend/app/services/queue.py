@@ -37,6 +37,8 @@ class RecordingJob:
     phase: Optional[str] = None               # current pipeline phase
     started_at: Optional[float] = None        # time.time() when processing began
     recording_started_at: Optional[float] = None  # time.time() when MediaRecorder fired
+    download_progress: int = 0                # 0-100, ffmpeg download percentage
+    recording_duration: Optional[int] = None  # progress target; detected video duration or recording cap
     # Per-job cancellation flag checked during the recording sleep
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
@@ -129,10 +131,15 @@ class VideoQueue:
         job.status = JobStatus.PROCESSING
         job.started_at = time.time()
 
-        def _set_phase(phase: str) -> None:
+        def _set_phase(phase: str, recording_duration: int | None = None) -> None:
             job.phase = phase
             if phase == "heavy_pass_recording":
                 job.recording_started_at = time.time()
+                if recording_duration is not None:
+                    job.recording_duration = recording_duration
+
+        def _on_progress(pct: int) -> None:
+            job.download_progress = pct
 
         async def _actual_work():
             from app.services.scraper import run_extraction, USER_AGENTS
@@ -149,6 +156,7 @@ class VideoQueue:
                 max_record_seconds=10800,
                 cancel_event=job.cancel_event,
                 phase_callback=_set_phase,
+                progress_callback=_on_progress,
             )
 
             if not screenshot_b64:

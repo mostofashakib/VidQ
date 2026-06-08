@@ -170,60 +170,181 @@ async def _detect_direct_video_embed(url: str, user_agent: str) -> tuple[str, st
     return video_url, html
 
 
-async def _download_embed_video(
-    video_url: str,
-    referer: str,
-    timeout_s: int = 300,
+async def _try_ytdlp_on_page(
+    url: str,
+    user_agent: str,
+    referer: str | None = None,
+    timeout_s: int = 90,
 ) -> str | None:
     """
-    Download a direct embed video using curl (mp4/webm) or yt-dlp (m3u8/HLS).
-    Resizes to 720p if needed. Returns a localhost URL or None on failure.
+    Try yt-dlp directly on a web page URL.
+
+    yt-dlp has extractors for hundreds of video hosting platforms and a
+    generic extractor that understands jwplayer, video.js, and similar
+    embedded players.  It also handles token refresh for HLS streams and
+    cookie-based auth — things that raw ffmpeg can't do.
+
+    Returns a localhost temp URL for the downloaded file, or None when
+    yt-dlp doesn't support the site or the download fails.
     """
     storage = _settings.temp_storage_dir
     os.makedirs(storage, exist_ok=True)
     filename = f"{uuid.uuid4().hex}.mp4"
     out_path = os.path.join(storage, filename)
 
-    is_m3u8 = ".m3u8" in video_url.lower()
-
-    if is_m3u8:
-        cmd = [
-            "yt-dlp",
-            "--merge-output-format", "mp4",
-            "-o", out_path,
-            video_url,
-        ]
-        label = "yt-dlp"
-    else:
-        cmd = [
-            "curl", "-L", "-s",
-            "--referer", referer,
-            "-o", out_path,
-            video_url,
-        ]
-        label = "curl"
-
-    logger.info(f"{label} embed download: {video_url[:100]}")
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--user-agent", user_agent,
+        "--add-header", f"Referer:{referer or url}",
+        "-o", out_path,
+        url,
+    ]
+    logger.info(f"yt-dlp page extraction: {url[:100]}")
     try:
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        proc.kill()
-        logger.warning(f"{label} embed download timed out ({timeout_s}s)")
-        return None
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning(f"yt-dlp page extraction timed out ({timeout_s}s)")
+            return None
 
-    if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
-        final_path = ensure_min_quality(out_path)
-        size_kb = os.path.getsize(final_path) // 1024
-        logger.info(f"{label} embed download succeeded: {size_kb}KB → {os.path.basename(final_path)}")
-        return f"{_settings.base_url}/temp_storage/{os.path.basename(final_path)}"
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+            final_path = ensure_min_quality(out_path)
+            if not _validate_mp4(final_path):
+                logger.warning("yt-dlp page extraction: file failed MP4 validation — discarding")
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+                return None
+            size_kb = os.path.getsize(final_path) // 1024
+            logger.info(f"yt-dlp page extraction succeeded: {size_kb}KB → {os.path.basename(final_path)}")
+            return f"{_settings.base_url}/temp_storage/{os.path.basename(final_path)}"
 
-    err_tail = (stderr or b"").decode(errors="replace")[-300:]
-    logger.warning(f"{label} embed download failed (rc={proc.returncode}): {err_tail}")
+        stderr_text = (stderr or b"").decode(errors="replace")
+        if "Unsupported URL" in stderr_text or "Unable to extract" in stderr_text:
+            logger.debug(f"yt-dlp: site not supported or no video found ({url[:60]})")
+        else:
+            logger.warning(f"yt-dlp page extraction failed (rc={proc.returncode}): {stderr_text[-300:]}")
+    except Exception as e:
+        logger.warning(f"yt-dlp page extraction error: {e}")
+    return None
+
+
+async def _download_embed_video(
+    video_url: str,
+    referer: str,
+    user_agent: str = "",
+    timeout_s: int = 300,
+) -> str | None:
+    """
+    Download a direct embed video using ffmpeg (mp4/webm/m3u8) with curl as
+    fallback for plain files.  Resizes to 720p if needed.
+    Returns a localhost URL or None on failure.
+    """
+    storage = _settings.temp_storage_dir
+    os.makedirs(storage, exist_ok=True)
+
+    v_lower = video_url.lower()
+    is_m3u8 = ".m3u8" in v_lower or "m3u8" in urlparse(video_url).path.lower()
+
+    ffmpeg_exe = None
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+
+    # ── Primary: ffmpeg stream-copy (fast, handles m3u8 + direct video) ──────
+    if ffmpeg_exe:
+        filename = f"{uuid.uuid4().hex}.mp4"
+        out_path = os.path.join(storage, filename)
+        ffmpeg_headers = f"Referer: {referer}\r\n"
+        if user_agent:
+            ffmpeg_headers += f"User-Agent: {user_agent}\r\n"
+        cmd = [
+            ffmpeg_exe, "-y",
+            "-headers", ffmpeg_headers,
+            "-i", video_url,
+            "-c", "copy",
+            out_path,
+        ]
+        logger.info(f"ffmpeg embed download: {video_url[:100]}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning(f"ffmpeg embed download timed out ({timeout_s}s)")
+            stderr_bytes = b""
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+            final_path = ensure_min_quality(out_path)
+            if _validate_mp4(final_path):
+                size_kb = os.path.getsize(final_path) // 1024
+                logger.info(f"ffmpeg embed download succeeded: {size_kb}KB → {os.path.basename(final_path)}")
+                return f"{_settings.base_url}/temp_storage/{os.path.basename(final_path)}"
+            try:
+                os.remove(final_path)
+            except Exception:
+                pass
+        err_tail = (stderr_bytes or b"").decode(errors="replace")[-200:]
+        logger.warning(f"ffmpeg embed download failed (rc={proc.returncode}): {err_tail}")
+
+    # ── Fallback: yt-dlp (handles auth-gated HLS, encrypted segments, etc.) ──
+    filename = f"{uuid.uuid4().hex}.mp4"
+    out_path = os.path.join(storage, filename)
+    ytdlp_cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--merge-output-format", "mp4",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--add-header", f"Referer:{referer}",
+        "-o", out_path,
+    ]
+    if user_agent:
+        ytdlp_cmd += ["--user-agent", user_agent]
+    ytdlp_cmd.append(video_url)
+
+    logger.info(f"yt-dlp embed fallback: {video_url[:100]}")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *ytdlp_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            logger.warning(f"yt-dlp embed fallback timed out ({timeout_s}s)")
+            return None
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+            final_path = ensure_min_quality(out_path)
+            if not _validate_mp4(final_path):
+                logger.warning("yt-dlp embed fallback: file failed validation — discarding")
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+                return None
+            size_kb = os.path.getsize(final_path) // 1024
+            logger.info(f"yt-dlp embed fallback succeeded: {size_kb}KB → {os.path.basename(final_path)}")
+            return f"{_settings.base_url}/temp_storage/{os.path.basename(final_path)}"
+        err_tail = (stderr_bytes or b"").decode(errors="replace")[-300:]
+        logger.warning(f"yt-dlp embed fallback failed (rc={proc.returncode}): {err_tail}")
+    except Exception as e:
+        logger.warning(f"yt-dlp embed fallback error: {e}")
     return None
 
 
@@ -232,6 +353,8 @@ async def _download_video_direct(
     referer: str,
     user_agent: str,
     timeout_s: int = 120,
+    total_duration_s: float | None = None,
+    progress_callback=None,
 ) -> str | None:
     """
     Download video_url. Tries ffmpeg first (fast stream-copy); falls back to
@@ -250,9 +373,110 @@ async def _download_video_direct(
             "-headers", f"Referer: {referer}\r\n",
             "-i", video_url,
             "-c", "copy",
+            "-progress", "pipe:1",
+            "-nostats",
             out_path,
         ]
         logger.info(f"ffmpeg direct download: {video_url[:100]}")
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stderr_chunks: list[bytes] = []
+
+        async def _drain_stderr() -> None:
+            try:
+                while True:
+                    chunk = await proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    stderr_chunks.append(chunk)
+            except Exception:
+                pass
+
+        stderr_task = asyncio.create_task(_drain_stderr())
+
+        # Stream stdout for real-time progress (ffmpeg -progress pipe:1 output)
+        deadline = asyncio.get_event_loop().time() + timeout_s
+        try:
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    proc.kill()
+                    logger.warning(f"ffmpeg download timed out ({timeout_s}s)")
+                    break
+                try:
+                    line = await asyncio.wait_for(proc.stdout.readline(), timeout=min(remaining, 10))
+                except asyncio.TimeoutError:
+                    if asyncio.get_event_loop().time() >= deadline:
+                        proc.kill()
+                        logger.warning(f"ffmpeg download timed out ({timeout_s}s)")
+                    break
+                if not line:
+                    break
+                line_str = line.decode(errors="replace").strip()
+                if line_str.startswith("out_time=") and total_duration_s and total_duration_s > 0:
+                    time_str = line_str[len("out_time="):]
+                    try:
+                        parts = time_str.split(":")
+                        current_s = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+                        pct = min(99, int(current_s / total_duration_s * 100))
+                        if progress_callback:
+                            progress_callback(pct)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        await proc.wait()
+        stderr_task.cancel()
+        try:
+            await asyncio.wait_for(stderr_task, timeout=2)
+        except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+            pass
+        stderr = b"".join(stderr_chunks)
+
+        if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
+            final_path = ensure_min_quality(out_path)
+            if not _validate_mp4(final_path):
+                logger.warning("ffmpeg download: file failed MP4 validation — discarding")
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+            else:
+                final_filename = os.path.basename(final_path)
+                size_kb = os.path.getsize(final_path) // 1024
+                logger.info(f"ffmpeg download succeeded: {size_kb}KB → {final_filename}")
+                return f"{_settings.base_url}/temp_storage/{final_filename}"
+        err_tail = (stderr or b'').decode(errors='replace')[-300:]
+        logger.warning(f"ffmpeg download failed (rc={proc.returncode}): {err_tail}")
+    except Exception as e:
+        logger.warning(f"ffmpeg download error: {e}")
+
+    # yt-dlp fallback — handles tokenized HLS/DASH and CDN URLs that ffmpeg
+    # can't authenticate.  Always triggered after ffmpeg failure so that auth-
+    # gated direct MP4s and encrypted HLS segments both get a second chance.
+    v_lower = video_url.lower()
+    r_path = urlparse(video_url).path.lower()
+    is_manifest = r_path.endswith(".m3u8") or r_path.endswith(".mpd") or "m3u8" in v_lower
+    logger.info(f"yt-dlp {'manifest' if is_manifest else 'direct'} fallback: {video_url[:100]}")
+    try:
+        storage = _settings.temp_storage_dir
+        filename = f"{uuid.uuid4().hex}.mp4"
+        out_path = os.path.join(storage, filename)
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--merge-output-format", "mp4",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--user-agent", user_agent,
+            "--add-header", f"Referer:{referer}",
+            "-o", out_path,
+            video_url,
+        ]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -262,57 +486,87 @@ async def _download_video_direct(
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
         except asyncio.TimeoutError:
             proc.kill()
-            logger.warning(f"ffmpeg download timed out ({timeout_s}s)")
-            stderr = b""
+            logger.warning(f"yt-dlp download timed out ({timeout_s}s)")
+            return None
         if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
             final_path = ensure_min_quality(out_path)
-            final_filename = os.path.basename(final_path)
-            size_kb = os.path.getsize(final_path) // 1024
-            logger.info(f"ffmpeg download succeeded: {size_kb}KB → {final_filename}")
-            return f"{_settings.base_url}/temp_storage/{final_filename}"
-        err_tail = (stderr or b'').decode(errors='replace')[-300:]
-        logger.warning(f"ffmpeg download failed (rc={proc.returncode}): {err_tail}")
-    except Exception as e:
-        logger.warning(f"ffmpeg download error: {e}")
-
-    # yt-dlp fallback — handles tokenized HLS/DASH that ffmpeg can't reassemble
-    r_path = urlparse(video_url).path.lower()
-    if any(r_path.endswith(ext) for ext in (".m3u8", ".mpd")):
-        logger.info(f"yt-dlp fallback: {video_url[:100]}")
-        try:
-            storage = _settings.temp_storage_dir
-            filename = f"{uuid.uuid4().hex}.mp4"
-            out_path = os.path.join(storage, filename)
-            cmd = [
-                "yt-dlp",
-                "--merge-output-format", "mp4",
-                "--add-header", f"Referer:{referer}",
-                "-o", out_path,
-                video_url,
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
-            except asyncio.TimeoutError:
-                proc.kill()
-                logger.warning(f"yt-dlp download timed out ({timeout_s}s)")
-                return None
-            if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
-                final_path = ensure_min_quality(out_path)
+            if not _validate_mp4(final_path):
+                logger.warning("yt-dlp download: file failed MP4 validation — discarding")
+                try:
+                    os.remove(final_path)
+                except Exception:
+                    pass
+            else:
                 final_filename = os.path.basename(final_path)
                 size_kb = os.path.getsize(final_path) // 1024
                 logger.info(f"yt-dlp download succeeded: {size_kb}KB → {final_filename}")
                 return f"{_settings.base_url}/temp_storage/{final_filename}"
-            err_tail = (stderr or b'').decode(errors='replace')[-300:]
-            logger.warning(f"yt-dlp download failed (rc={proc.returncode}): {err_tail}")
-        except Exception as e:
-            logger.warning(f"yt-dlp download error: {e}")
+        err_tail = (stderr or b'').decode(errors='replace')[-300:]
+        logger.warning(f"yt-dlp download failed (rc={proc.returncode}): {err_tail}")
+    except Exception as e:
+        logger.warning(f"yt-dlp download error: {e}")
 
     return None
+
+
+def _validate_video_file(path: str, label: str = "video") -> bool:
+    """
+    Return True if `path` is a valid media file with a real video stream.
+
+    Uses `ffmpeg -i` stderr parsing — the same pattern used elsewhere in this
+    file — to verify three conditions:
+      1. File exists and is at least 50 KB (rules out empty/HTML error saves).
+      2. A Video: stream line is present with non-zero dimensions.
+      3. Duration is at least 1 second.
+    """
+    if not os.path.exists(path):
+        logger.warning(f"Validation: {label} file not found: {path}")
+        return False
+    size = os.path.getsize(path)
+    if size < 50_000:
+        logger.warning(
+            f"Validation: {label} {os.path.basename(path)} is only {size} bytes — "
+            "likely corrupt or empty"
+        )
+        return False
+    try:
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        result = subprocess.run(
+            [ffmpeg_exe, "-i", path],
+            capture_output=True, text=True, timeout=15,
+        )
+        stderr = result.stderr
+        if not re.search(r"Video:.*\d{2,5}x\d{2,5}", stderr):
+            logger.warning(
+                f"Validation: no video stream found in {label} {os.path.basename(path)}"
+            )
+            return False
+        dur_match = re.search(r"Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
+        if not dur_match:
+            logger.warning(
+                f"Validation: could not parse duration in {label} {os.path.basename(path)}"
+            )
+            return False
+        h, m, s = int(dur_match.group(1)), int(dur_match.group(2)), float(dur_match.group(3))
+        duration = h * 3600 + m * 60 + s
+        if duration < 1.0:
+            logger.warning(
+                f"Validation: {label} {os.path.basename(path)} duration too short "
+                f"({duration:.2f}s)"
+            )
+            return False
+        logger.debug(
+            f"Validation OK: {label} {os.path.basename(path)} "
+            f"({duration:.1f}s, has video stream)"
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Validation error for {label} {os.path.basename(path)}: {e}")
+        return False
+
+
+def _validate_mp4(path: str) -> bool:
+    return _validate_video_file(path, label="MP4")
 
 
 def _probe_file_duration(video_path: str) -> float | None:
@@ -332,10 +586,21 @@ def _probe_file_duration(video_path: str) -> float | None:
     return None
 
 
-def _convert_to_mp4(webm_path: str) -> str:
-    """Convert webm to mp4 via ffmpeg, return final path."""
+def _convert_to_mp4(webm_path: str) -> str | None:
+    """Convert WebM to MP4 via ffmpeg. Return final path, or None if invalid."""
     if not os.path.exists(webm_path):
-        return webm_path
+        logger.warning(f"WebM conversion skipped: file not found: {webm_path}")
+        return None
+    if not _validate_video_file(webm_path, label="WebM recording"):
+        logger.error(
+            f"MediaRecorder WebM is invalid before conversion: "
+            f"{os.path.basename(webm_path)}"
+        )
+        try:
+            os.remove(webm_path)
+        except Exception:
+            pass
+        return None
     mp4_path = webm_path.replace(".webm", ".mp4")
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -352,11 +617,15 @@ def _convert_to_mp4(webm_path: str) -> str:
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             logger.error(f"FFMPEG error: {result.stderr}")
-            return webm_path
+            return None
         os.remove(webm_path)
         final_path = ensure_min_quality(mp4_path)
-        logger.info(f"Converted to {os.path.basename(final_path)}")
+        if not _validate_mp4(final_path):
+            logger.warning(f"Converted MP4 failed validation: {os.path.basename(final_path)}")
+            return None
+        else:
+            logger.info(f"Converted to {os.path.basename(final_path)}")
         return final_path
     except Exception as e:
         logger.error(f"MP4 conversion failed: {e}")
-        return webm_path
+        return None

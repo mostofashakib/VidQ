@@ -1,6 +1,6 @@
 # VidQ
 
-**Paste a URL. VidQ downloads the video.** No browser extensions, no site-specific configs — it works by navigating the page like a human, handling cookie banners, ad overlays, and custom video players automatically. Works on standard video sites as well as streaming platforms like vidara.so and lulustream that embed players inside iframes and serve HLS streams with token-based URLs.
+**Paste a URL. VidQ downloads the video.** No browser extensions, no site-specific configs — it works by navigating the page like a human, handling cookie banners, ad overlays, and custom video players automatically. Works on standard video sites as well as streaming platforms that embed players inside iframes and serve HLS streams with token-based URLs.
 
 ---
 

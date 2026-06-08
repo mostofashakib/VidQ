@@ -38,6 +38,15 @@ interface UploadJob {
   jobId?: string;
 }
 
+function isWebmFilename(filename: string): boolean {
+  return filename.toLowerCase().endsWith(".webm");
+}
+
+function processingMessage(filename: string, pct: number): string {
+  const action = isWebmFilename(filename) ? "Converting WebM to MP4" : "Scaling to 720p";
+  return pct > 0 ? `${action}… ${pct}%` : `${action}…`;
+}
+
 export default function UploadPage() {
   const { token, loading, authEnabled, logout } = useAuth();
   const router = useRouter();
@@ -97,14 +106,17 @@ export default function UploadPage() {
           const pct = data.scale_progress ?? 0;
           updateJob(localId, {
             status: "processing",
-            message: pct > 0 ? `Scaling to 720p… ${pct}%` : "Scaling to 720p…",
+            message: processingMessage(data.filename, pct),
             scaleProgress: pct,
           });
         } else if (data.status === "done") {
           clearInterval(intervalId);
           pollRefs.current.delete(localId);
           abortRefs.current.delete(localId);
-          updateJob(localId, { status: "done", message: "Done! Scaled to 720p." });
+          updateJob(localId, {
+            status: "done",
+            message: isWebmFilename(data.filename) ? "Done! Converted to MP4." : "Done! Scaled to 720p.",
+          });
           listUploadedVideos(token!).then(setVideos).catch(() => {});
           setTimeout(() => {
             setJobs((prev) => prev.filter((j) => j.localId !== localId));
@@ -167,7 +179,7 @@ export default function UploadPage() {
 
       updateJob(localId, {
         status: jobData.status as "queued" | "processing",
-        message: jobData.status === "queued" ? "Waiting for worker…" : "Scaling to 720p…",
+        message: jobData.status === "queued" ? "Waiting for worker…" : processingMessage(file.name, 0),
         progress: 100,
         jobId: jobData.job_id,
       });
@@ -179,7 +191,11 @@ export default function UploadPage() {
       const isCancelled =
         err && typeof err === "object" && "code" in err && (err as { code: string }).code === "ERR_CANCELED";
       if (!isCancelled) {
-        updateJob(localId, { status: "failed", message: "Upload failed." });
+        const detail =
+          err && typeof err === "object" && "response" in err
+            ? (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
+            : undefined;
+        updateJob(localId, { status: "failed", message: detail || "Upload failed." });
       } else {
         setJobs((prev) => prev.filter((j) => j.localId !== localId));
       }
@@ -309,7 +325,7 @@ export default function UploadPage() {
               <Upload className="w-6 h-6 text-indigo-400" />
             </div>
             <p className="text-white font-medium">Drop video files here</p>
-            <p className="text-gray-400 text-sm">or click to browse — any resolution, auto-scaled to 720p</p>
+            <p className="text-gray-400 text-sm">or click to browse — WebM converts to MP4, videos auto-scale to 720p</p>
             <input
               ref={fileInputRef}
               type="file"

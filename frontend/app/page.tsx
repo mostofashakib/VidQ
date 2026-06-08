@@ -54,6 +54,8 @@ interface DownloadJob {
   abortController?: AbortController;
   phase?: string;               // pipeline phase from backend
   recordingStartedAt?: number;  // ms timestamp when heavy_pass_recording began
+  downloadProgress?: number;    // 0-99 when ffmpeg download is running
+  recordingDuration?: number;   // progress target; detected video duration or recording cap
   errorDetail?: string;         // raw error string when status === "failed"
 }
 
@@ -77,6 +79,24 @@ function RecordingTimer({ startedAt }: { startedAt: number }) {
   return <span>{m}:{s.toString().padStart(2, "0")}</span>;
 }
 
+function RecordingProgress({ startedAt, durationSeconds }: { startedAt: number; durationSeconds: number }) {
+  const [pct, setPct] = useState(() =>
+    Math.min(99, Math.floor((Date.now() - startedAt) / (durationSeconds * 1000) * 100))
+  );
+  useEffect(() => {
+    const id = setInterval(() => {
+      setPct(Math.min(99, Math.floor((Date.now() - startedAt) / (durationSeconds * 1000) * 100)));
+    }, 1000);
+    return () => clearInterval(id);
+  }, [startedAt, durationSeconds]);
+  return (
+    <div
+      className="h-full bg-red-500 rounded-full transition-all duration-1000"
+      style={{ width: `${pct}%` }}
+    />
+  );
+}
+
 const PAGE_SIZE = 20;
 
 const STATUS_STYLES: Record<DownloadJob["status"], string> = {
@@ -88,6 +108,10 @@ const STATUS_STYLES: Record<DownloadJob["status"], string> = {
   failed:     "bg-red-500/20 text-red-400",
   cancelled:  "bg-gray-500/20 text-gray-400",
 };
+
+function canRenderThumbnail(thumbnail?: string): thumbnail is string {
+  return Boolean(thumbnail && thumbnail.startsWith("/") && !thumbnail.startsWith("//"));
+}
 
 export default function HomePage() {
   const { token, logout, loading, authEnabled } = useAuth();
@@ -120,7 +144,7 @@ export default function HomePage() {
         setVideos((prev) => {
           if (reset) return newVideos;
           const existingIds = new Set(prev.map((v) => v.id));
-          return [...prev, ...newVideos.filter((v) => !existingIds.has(v.id))];
+          return [...prev, ...newVideos.filter((v: Video) => !existingIds.has(v.id))];
         });
         setHasMore(newVideos.length === PAGE_SIZE);
       } catch {
@@ -189,6 +213,10 @@ export default function HomePage() {
                 data.recording_started_at != null
                   ? data.recording_started_at * 1000
                   : job.recordingStartedAt;
+              const downloadProgress =
+                typeof data.download_progress === "number" ? data.download_progress : job.downloadProgress;
+              const recordingDuration =
+                typeof data.recording_duration === "number" ? data.recording_duration : job.recordingDuration;
               const msg =
                 data.status === "processing"
                   ? phaseMessage(phase)
@@ -196,7 +224,7 @@ export default function HomePage() {
               setDownloads((prev) =>
                 prev.map((d) =>
                   d.localId === job.localId
-                    ? { ...d, status: data.status, message: msg, queuePosition: data.queue_position, phase, recordingStartedAt }
+                    ? { ...d, status: data.status, message: msg, queuePosition: data.queue_position, phase, recordingStartedAt, downloadProgress, recordingDuration }
                     : d
                 )
               );
@@ -545,14 +573,26 @@ export default function HomePage() {
                     )}
                     {/* Progress bar — shown for all in-progress states */}
                     {dl.status !== "done" && dl.status !== "failed" && dl.status !== "cancelled" && (
-                      <div className="w-full h-0.5 rounded-full overflow-hidden mt-2 bg-white/5">
-                        <div
-                          className={`h-full rounded-full animate-pulse ${
-                            dl.phase === "heavy_pass_recording"
-                              ? "bg-linear-to-r from-red-500/0 via-red-500/60 to-red-500/0"
-                              : "bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0"
-                          }`}
-                        />
+                      <div className="w-full h-1 rounded-full overflow-hidden mt-2 bg-white/5">
+                        {dl.phase === "fast_pass" && dl.downloadProgress != null && dl.downloadProgress > 0 ? (
+                          // Real ffmpeg download percentage
+                          <div
+                            className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+                            style={{ width: `${dl.downloadProgress}%` }}
+                          />
+                        ) : dl.phase === "heavy_pass_recording" && dl.recordingStartedAt && dl.recordingDuration ? (
+                          // Time-based recording progress
+                          <RecordingProgress startedAt={dl.recordingStartedAt} durationSeconds={dl.recordingDuration} />
+                        ) : (
+                          // Indeterminate for queued / waiting / unknown states
+                          <div
+                            className={`h-full rounded-full animate-pulse ${
+                              dl.phase === "heavy_pass_recording"
+                                ? "w-full bg-red-500/60"
+                                : "bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0"
+                            }`}
+                          />
+                        )}
                       </div>
                     )}
                   </div>
@@ -660,7 +700,7 @@ export default function HomePage() {
               key={`${video.id}-${video.url}`}
               className="glass-panel overflow-hidden flex flex-col min-h-90 min-w-[320px] rounded-3xl border border-white/10 hover:border-indigo-500/30 shadow-xl hover:shadow-indigo-500/20 transform transition-all hover:-translate-y-2 duration-500 group bg-transparent"
             >
-              {video.thumbnail && (
+              {canRenderThumbnail(video.thumbnail) && (
                 <div className="w-full aspect-video relative overflow-hidden bg-black/40">
                   <Image
                     src={video.thumbnail}

@@ -28,6 +28,20 @@ class Settings:
         # Base URL for generating self-referencing URLs (e.g. temp_storage links)
         self.base_url: str = os.getenv("BASE_URL", "http://localhost:8000")
 
+        # Browser settings — BROWSER_HEADLESS=false to see the browser window (useful for debugging)
+        self.browser_headless: bool = os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1", "yes")
+        # Persistent browser profile: cookies/localStorage saved here and reloaded each session
+        # so the browser looks like a returning human visitor rather than a fresh bot.
+        default_profile = str(Path(__file__).parent / "browser_profile")
+        self.browser_profile_dir: str = os.getenv("BROWSER_PROFILE_DIR", default_profile)
+
+        # Proxy pool for Cloudflare evasion. Comma-separated list of proxy URLs.
+        # Format: http://user:pass@host:port  or  socks5://host:port
+        # Leave empty to run without a proxy. On CF detection the pipeline rotates
+        # to a fresh proxy + clears cookies so the site sees a new IP each attempt.
+        raw_proxies = os.getenv("PROXY_URLS", "")
+        self.proxy_urls: list[str] = [p.strip() for p in raw_proxies.split(",") if p.strip()]
+
         if not self.database_url:
             raise ValueError("Missing required environment variable: DATABASE_URL")
 settings = Settings()

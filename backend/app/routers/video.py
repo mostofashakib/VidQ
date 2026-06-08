@@ -9,7 +9,7 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from app.services.llm_manager import FallbackLLMManager
-from app.services.scraper import run_extraction, USER_AGENTS, clean_html
+from app.services.scraper import USER_AGENTS, clean_html
 from app.services.prompts import Prompts
 import random
 from app.config import get_settings, Settings
@@ -239,44 +239,30 @@ async def call_llm_with_html_and_screenshot(llm_manager: FallbackLLMManager, htm
         raise HTTPException(status_code=500, detail=f"LLM extraction failed: {e}")
 
 @router.post("/extract-video")
-async def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_token)):
+def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_token)):
+    """
+    Enqueue a video extraction/download job and return immediately.
+    The frontend polls GET /queue/{job_id} for real-time status (phase, progress %, etc.)
+    and the worker adds the video to the DB when done.
+    """
     url = data.get("url")
+    category = data.get("category", "uncategorized")
     logger.info(f"Received video extraction request for URL: {url}")
     if not url:
         raise HTTPException(status_code=400, detail="Missing url")
     if not is_safe_url(url):
         raise HTTPException(status_code=400, detail="Forbidden URL strictly isolated.")
-    
-    llm_manager = _get_llm_manager()
-    user_agent = random.choice(USER_AGENTS)
-    
-    try:
-        html, screenshot_b64, network_video_urls, thumbnail_url, temp_video_url = await run_extraction(
-            url=url,
-            user_agent=user_agent,
-            llm_manager=llm_manager
-        )
-    except Exception as e:
-        logger.error(f"Playwright scraping failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    if not screenshot_b64:
-        # Embed fast-path: metadata already extractable from HTML, no LLM needed
-        embed_soup = BeautifulSoup(html, "html.parser") if html else None
-        title = None
-        if embed_soup:
-            og_title = embed_soup.find("meta", property="og:title", content=True)
-            title = og_title["content"] if og_title else (
-                embed_soup.title.text.strip() if embed_soup.title else None
-            )
-        result = {"title": title or url, "thumbnail": thumbnail_url, "video_url": temp_video_url or ""}
-    else:
-        result = await call_llm_with_html_and_screenshot(llm_manager, html, screenshot_b64, network_video_urls, thumbnail_url)
-        result["thumbnail"] = result.get("thumbnail") or thumbnail_url
-        if temp_video_url:
-            result["video_url"] = temp_video_url
 
-    return result
+    queue = _get_queue()
+    job = queue.enqueue(url=url, category=category, token=token)
+    position = queue.position(job.job_id)
+
+    return {
+        "job_id": job.job_id,
+        "status": job.status,
+        "message": "Video queued for processing.",
+        "queue_position": position,
+    }
 
 
 @router.post("/queue", status_code=200)
@@ -320,6 +306,8 @@ def get_queue_status(job_id: str, token: str = Depends(verify_token)):
     elif job.status == "processing":
         response["phase"] = job.phase
         response["recording_started_at"] = job.recording_started_at
+        response["download_progress"] = job.download_progress
+        response["recording_duration"] = job.recording_duration
     elif job.status == "done":
         response["result"] = job.result
     elif job.status == "failed":

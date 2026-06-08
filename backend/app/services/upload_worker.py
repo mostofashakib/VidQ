@@ -133,23 +133,56 @@ def _probe_duration(path: str) -> Optional[float]:
 
 
 def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[float] = None) -> Optional[str]:
-    """Scale to 720p via cancellable Popen. Returns final path, or None on cancel/failure."""
+    """
+    Normalize uploaded videos.
+
+    - WebM uploads are always transcoded to MP4 for browser/download consistency.
+    - Non-720p videos keep the existing 720p scaling behavior.
+    Returns final path, or None on cancel/failure.
+    """
     dims = probe_video_dimensions(file_path)
-    if dims is None or dims[1] == 720:
+    base, ext = os.path.splitext(file_path)
+    ext_lower = ext.lower()
+    is_webm = ext_lower == ".webm"
+    needs_scale = dims is not None and dims[1] != 720
+
+    if not is_webm and not needs_scale:
         return file_path
 
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    base, ext = os.path.splitext(file_path)
-    out_path = f"{base}_720p{ext}"
+    suffix = "_720p" if needs_scale else "_mp4"
+    out_ext = ".mp4" if is_webm else ext
+    out_path = f"{base}{suffix}{out_ext}"
     cmd = [
         ffmpeg_exe, "-y", "-i", file_path,
-        "-vf", "scale=-2:720:flags=lanczos",
-        "-c:v", "libx264", "-crf", "18", "-preset", "slow", "-c:a", "copy",
+    ]
+    if needs_scale:
+        cmd.extend(["-vf", "scale=-2:720:flags=lanczos"])
+    cmd.extend([
+        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
+        "-c:a", "aac" if is_webm else "copy",
+        "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats",
         out_path,
-    ]
+    ])
 
-    logger.info(f"[{job.job_id}] Scaling {os.path.basename(file_path)} to 720p")
+    actions = []
+    if needs_scale:
+        actions.append("scaling to 720p")
+    if is_webm:
+        actions.append("converting WebM to MP4")
+    action_label = " and ".join(actions) or "processing"
+    failure_label = (
+        "Could not convert WebM to MP4"
+        if is_webm
+        else "Video scaling failed"
+    )
+    complete_label = "Converted" if is_webm else "Scaled"
+
+    logger.info(
+        f"[{job.job_id}] {action_label.capitalize()}: "
+        f"{os.path.basename(file_path)} → {os.path.basename(out_path)}"
+    )
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -213,7 +246,7 @@ def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[fl
         logger.error(f"[{job.job_id}] ffmpeg failed: {stderr_text[-200:]}")
         with _lock:
             job.status = "failed"
-            job.error = "Video scaling failed"
+            job.error = failure_label
         try:
             os.remove(file_path)
         except OSError:
@@ -226,7 +259,7 @@ def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[fl
         pass
     with _lock:
         job.scale_progress = 100
-    logger.info(f"[{job.job_id}] Scaled → {os.path.basename(out_path)}")
+    logger.info(f"[{job.job_id}] {complete_label} → {os.path.basename(out_path)}")
     return out_path
 
 
