@@ -509,7 +509,11 @@ async def _download_video_direct(
     return None
 
 
-def _validate_video_file(path: str, label: str = "video") -> bool:
+def _validate_video_file(
+    path: str,
+    label: str = "video",
+    require_duration: bool = True,
+) -> bool:
     """
     Return True if `path` is a valid media file with a real video stream.
 
@@ -517,13 +521,19 @@ def _validate_video_file(path: str, label: str = "video") -> bool:
     file — to verify three conditions:
       1. File exists and is at least 50 KB (rules out empty/HTML error saves).
       2. A Video: stream line is present with non-zero dimensions.
-      3. Duration is at least 1 second.
+      3. Duration is at least 1 second when required.
+
+    MediaRecorder WebM blobs often omit container duration metadata even when
+    they contain valid video frames. For those pre-conversion inputs, callers
+    can set require_duration=False and rely on stream presence + ffmpeg
+    conversion as the real validation step.
     """
     if not os.path.exists(path):
         logger.warning(f"Validation: {label} file not found: {path}")
         return False
     size = os.path.getsize(path)
-    if size < 50_000:
+    min_size = 1_000 if not require_duration else 50_000
+    if size < min_size:
         logger.warning(
             f"Validation: {label} {os.path.basename(path)} is only {size} bytes — "
             "likely corrupt or empty"
@@ -543,10 +553,16 @@ def _validate_video_file(path: str, label: str = "video") -> bool:
             return False
         dur_match = re.search(r"Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)", stderr)
         if not dur_match:
-            logger.warning(
-                f"Validation: could not parse duration in {label} {os.path.basename(path)}"
+            if require_duration:
+                logger.warning(
+                    f"Validation: could not parse duration in {label} {os.path.basename(path)}"
+                )
+                return False
+            logger.info(
+                f"Validation: no duration metadata in {label} {os.path.basename(path)}; "
+                "accepting because video stream is present."
             )
-            return False
+            return True
         h, m, s = int(dur_match.group(1)), int(dur_match.group(2)), float(dur_match.group(3))
         duration = h * 3600 + m * 60 + s
         if duration < 1.0:
@@ -591,7 +607,11 @@ def _convert_to_mp4(webm_path: str) -> str | None:
     if not os.path.exists(webm_path):
         logger.warning(f"WebM conversion skipped: file not found: {webm_path}")
         return None
-    if not _validate_video_file(webm_path, label="WebM recording"):
+    if not _validate_video_file(
+        webm_path,
+        label="WebM recording",
+        require_duration=False,
+    ):
         logger.error(
             f"MediaRecorder WebM is invalid before conversion: "
             f"{os.path.basename(webm_path)}"

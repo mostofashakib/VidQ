@@ -797,8 +797,12 @@ async def run_extraction(
                 )
                 await target_frame.evaluate(f'''async () => {{
                     window.recorderChunks = [];
+                    window.mediaRecorderError = null;
+                    window.mediaRecorderStats = {{ started: false, mimeType: null, trackCount: 0, videoTrackCount: 0 }};
                     const video = document.querySelector({repr(main_selector)});
-                    if (video) {{
+                    if (!video) {{
+                        window.mediaRecorderError = "video-element-not-found";
+                    }} else {{
                         try {{
                             if (video.paused) {{
                                 await video.play().catch(() => {{}});
@@ -810,12 +814,37 @@ async def run_extraction(
                                 await video.webkitRequestFullscreen().catch(() => {{}});
                             }}
                             const stream = video.captureStream ? video.captureStream() : video.mozCaptureStream();
-                            window.mediaRecorder = new MediaRecorder(stream, {{ mimeType: "video/webm" }});
+                            const tracks = stream ? stream.getTracks() : [];
+                            const videoTracks = stream ? stream.getVideoTracks() : [];
+                            window.mediaRecorderStats.trackCount = tracks.length;
+                            window.mediaRecorderStats.videoTrackCount = videoTracks.length;
+                            if (!stream || !videoTracks.length) {{
+                                throw new Error("captureStream returned no video tracks");
+                            }}
+                            const mimeTypes = [
+                                "video/webm;codecs=vp8,opus",
+                                "video/webm;codecs=vp8",
+                                "video/webm;codecs=vp9",
+                                "video/webm",
+                            ];
+                            const mimeType = mimeTypes.find(type =>
+                                !window.MediaRecorder ||
+                                !MediaRecorder.isTypeSupported ||
+                                MediaRecorder.isTypeSupported(type)
+                            );
+                            const options = mimeType ? {{ mimeType }} : undefined;
+                            window.mediaRecorderStats.mimeType = mimeType || "browser-default";
+                            window.mediaRecorder = new MediaRecorder(stream, options);
                             window.mediaRecorder.ondataavailable = e => {{
                                 if (e.data && e.data.size > 0) window.recorderChunks.push(e.data);
                             }};
+                            window.mediaRecorder.onerror = e => {{
+                                window.mediaRecorderError = e && e.error ? e.error.message : "mediarecorder-error";
+                            }};
                             window.mediaRecorder.start(1000);
+                            window.mediaRecorderStats.started = true;
                         }} catch (err) {{
+                            window.mediaRecorderError = err && err.message ? err.message : String(err);
                             console.error("Capture stream blocked", err);
                         }}
                     }}
@@ -1026,11 +1055,14 @@ async def run_extraction(
                     raise asyncio.CancelledError("Job cancelled during recording")
 
                 if was_stuck:
-                    # Cross-origin/DRM/static content — do not fail the whole job; continue without a recording.
                     logger.warning(
-                        "MediaRecorder aborted — recording was stuck or blank; continuing without captured video."
+                        "MediaRecorder aborted — recording was stuck or blank; failing download."
                     )
-                    temp_video_url = temp_video_url or ""
+                    await heavy_context.close()
+                    await browser.close()
+                    raise RuntimeError(
+                        "Video failed to download: MediaRecorder output was stuck or blank."
+                    )
                 else:
                     logger.debug("Stopping MediaRecorder…")
                     try:
@@ -1046,7 +1078,10 @@ async def run_extraction(
                                 };
 
                                 if (!window.mediaRecorder) {
-                                    downloadText("failed.txt", "missing-media-recorder");
+                                    downloadText(
+                                        "failed.txt",
+                                        `missing-media-recorder:${window.mediaRecorderError || "unknown"}`
+                                    );
                                     return;
                                 }
 
@@ -1073,8 +1108,13 @@ async def run_extraction(
                                     chunk => chunk && chunk.size > 0
                                 );
                                 const totalSize = window.recorderChunks.reduce((sum, chunk) => sum + chunk.size, 0);
-                                if (totalSize < 50000) {
-                                    downloadText("failed.txt", `empty-media-recorder:${totalSize}`);
+                                if (totalSize <= 0) {
+                                    const stats = JSON.stringify(window.mediaRecorderStats || {});
+                                    downloadText(
+                                        "failed.txt",
+                                        `empty-media-recorder:${totalSize}:` +
+                                        `${window.mediaRecorderError || "no-recorder-error"}:${stats}`
+                                    );
                                     return;
                                 }
 
@@ -1104,12 +1144,26 @@ async def run_extraction(
                             temp_video_url = f"{_settings.base_url}/temp_storage/{final_filename}"
                             logger.debug(f"Final recording URL: {temp_video_url}")
                         else:
+                            failure_path = os.path.join(storage, f"{uuid.uuid4().hex}_{download.suggested_filename}")
+                            failure_detail = download.suggested_filename
+                            try:
+                                await download.save_as(failure_path)
+                                with open(failure_path, "r", encoding="utf-8", errors="replace") as failure_file:
+                                    failure_detail = failure_file.read(1000).strip() or failure_detail
+                            except Exception as read_err:
+                                failure_detail = f"{failure_detail}; could not read failure detail: {read_err}"
+                            finally:
+                                try:
+                                    if os.path.exists(failure_path):
+                                        os.remove(failure_path)
+                                except Exception:
+                                    pass
                             logger.error(
                                 f"MediaRecorder download failed: "
-                                f"{download.suggested_filename}"
+                                f"{failure_detail}"
                             )
                             raise RuntimeError(
-                                "MediaRecorder output was empty or unavailable; recording failed."
+                                f"MediaRecorder output was empty or unavailable: {failure_detail}"
                             )
                     except Exception as e:
                         logger.error(f"MediaRecorder Heavy Pass failed: {e}")

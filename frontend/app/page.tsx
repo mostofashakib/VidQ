@@ -113,6 +113,29 @@ function canRenderThumbnail(thumbnail?: string): thumbnail is string {
   return Boolean(thumbnail && thumbnail.startsWith("/") && !thumbnail.startsWith("//"));
 }
 
+function queueResultVideo(result: unknown): Video | undefined {
+  if (!result || typeof result !== "object" || !("video" in result)) return undefined;
+  const video = (result as { video?: Partial<Video> }).video;
+  if (
+    !video ||
+    typeof video.id !== "number" ||
+    typeof video.url !== "string" ||
+    typeof video.category !== "string" ||
+    typeof video.created_at !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    id: video.id,
+    url: video.url,
+    category: video.category,
+    title: video.title,
+    created_at: video.created_at,
+    duration: video.duration,
+    thumbnail: video.thumbnail,
+  };
+}
+
 export default function HomePage() {
   const { token, logout, loading, authEnabled } = useAuth();
   const router = useRouter();
@@ -171,7 +194,7 @@ export default function HomePage() {
   useEffect(() => {
     if (!token || !hasActiveQueueJobs) return;
 
-    const interval = setInterval(async () => {
+    const pollActiveJobs = async () => {
       const active = downloadsRef.current.filter(
         (d) => d.jobId && (d.status === "queued" || d.status === "processing")
       );
@@ -200,9 +223,18 @@ export default function HomePage() {
                 )
               );
               if (isDone) {
-                setVideos([]);
-                setHasMore(true);
-                fetchMoreVideos(true);
+                const completedVideo = queueResultVideo(data.result);
+                if (completedVideo) {
+                  setVideos((prev) => {
+                    const existingIndex = prev.findIndex((video) => video.id === completedVideo.id);
+                    if (existingIndex >= 0) {
+                      return prev.map((video, index) => index === existingIndex ? completedVideo : video);
+                    }
+                    return [completedVideo, ...prev];
+                  });
+                } else {
+                  fetchMoreVideos(true);
+                }
                 setTimeout(() => {
                   setDownloads((prev) => prev.filter((d) => d.localId !== job.localId));
                 }, 5000);
@@ -234,7 +266,10 @@ export default function HomePage() {
           }
         })
       );
-    }, 3000);
+    };
+
+    void pollActiveJobs();
+    const interval = setInterval(pollActiveJobs, 1000);
 
     return () => clearInterval(interval);
   }, [token, hasActiveQueueJobs, fetchMoreVideos]);

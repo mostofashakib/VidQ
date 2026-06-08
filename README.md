@@ -13,20 +13,26 @@ If the URL points directly to a video file or a minimal HTML wrapper around one,
 
 ### Stage 1 — Fast Pass (Network Sniff + Agentic Interact)
 1. Opens the page and intercepts both **requests** (by file extension in the URL path) and **responses** (by `Content-Type` header). This catches HLS manifests like `playlist.m3u8?token=abc...` whose full URL doesn't end in `.m3u8`.
-2. Detects whether the video **auto-started** (no click needed) and skips the interaction loop if so.
-3. If playback hasn't started, runs a **3-layer agentic loop** to start it:
-   - **Layer 1** — Pure JS heuristics dismiss cookie banners, skip-ad buttons, countdowns, and age-gates. Calls `video.play()` directly.
-   - **Layer 2** — Takes a screenshot + page HTML (including content from child iframes) and asks an LLM vision model which element to click next.
-   - **Layer 3** — After each click, force-play and heuristic selectors re-run across all frames to confirm playback started.
-4. Identifies the **main video** (largest on-screen area) across the main frame and all child iframes, then downloads it via `ffmpeg`. Falls back to **yt-dlp** for tokenized HLS/DASH streams that `ffmpeg` can't reassemble.
+2. Uses persisted browser state (`storage_state.json`, ignored by git) so repeat visits keep cookies, localStorage, and consent state.
+3. Detects whether the video **auto-started** (no click needed) and skips the interaction loop if so.
+4. If playback hasn't started, runs a layered **agentic interaction loop** to start it:
+   - **MediaSession pre-kick** — tries `video.play()` and fullscreen through browser media APIs.
+   - **Accessibility + JS heuristics** — dismisses cookie banners, skip-ad buttons, countdowns, age-gates, and play overlays.
+   - **LLM-guided selector/pixel click** — uses screenshot + ARIA tree + cleaned HTML when heuristics are not enough.
+   - **Popup retry handling** — re-clicks play targets up to 10 times when ad popups or overlays interrupt playback.
+   - **Strategy cache** — once a strategy starts playback, later retries replay that strategy first instead of walking the whole stack.
+   - **Refresh recovery** — if fullscreen/play actions refresh the page after media starts, VidQ retries playback setup within the same attempt.
+5. Identifies the **main video** (largest on-screen area) across the main frame and all child iframes, then downloads it via `ffmpeg`. Falls back to **yt-dlp** for tokenized HLS/DASH streams that `ffmpeg` can't reassemble.
 
 ### Stage 2 — Heavy Pass (MediaRecorder Fallback)
 If Stage 1 can't produce a downloadable file (DRM-adjacent content, blob URLs, or encrypted segments), VidQ:
 1. Reloads the page in a fresh context.
 2. Locates which frame (main or iframe) actually holds the `<video>` element.
 3. Injects a `MediaRecorder` into that frame's execution context — this is required because `captureStream()` must run inside the same frame as the video, not the parent page.
-4. Records in real time (up to the video's own reported duration, capped at 3 hours).
-5. Converts the WebM capture to MP4 automatically.
+4. Confirms playback before injecting the recorder, then records in real time up to the detected video duration when available (capped at 3 hours).
+5. Detects looping players and stops once recorded time reaches the video duration instead of recording forever.
+6. Detects stuck/static captures by checking frame changes every 30 seconds.
+7. Converts the WebM capture to MP4 automatically. If the recording is blank, static, or unavailable, the job fails and the frontend shows the failure instead of saving a bad video.
 
 Videos are stored locally — no expiring CDN links.
 
@@ -37,8 +43,10 @@ Videos are stored locally — no expiring CDN links.
 ### Agentic Navigation
 - Works on any website without per-site configuration
 - Auto-play detection skips the interaction loop when the video starts immediately
-- LLM vision model guides click decisions when JS heuristics aren't enough
+- MediaSession, accessibility, CSS, direct-video, LLM selector, LLM pixel, and heuristic pixel strategies are all supported
+- LLM vision model guides click decisions when JS heuristics aren't enough, but metadata extraction is best-effort so a completed recording can still be saved if all LLM providers fail
 - Interaction loop searches the main frame **and all child iframes** for play buttons and video elements
+- Re-clicks play buttons through popup/ad interruptions and logs each action for debugging
 - Supports **OpenAI (GPT-4o)**, **Anthropic (Claude Haiku)**, and **Ollama** — tries them in order and remembers the last working provider
 
 ### Streaming Platform Support
@@ -56,21 +64,30 @@ Videos are stored locally — no expiring CDN links.
 ### Quality Processing
 - All videos are scaled to **720p** using Lanczos + libx264 CRF 18 (upscales if below, downscales if above)
 - MediaRecorder captures are converted from WebM to MP4 automatically
+- Browser-recorded WebM files without duration metadata are accepted before conversion; final MP4 validation remains strict
 
 ### File Upload
 - Upload local video files directly — processed through the same quality pipeline
+- `.webm` uploads are converted to MP4 automatically
 - Per-upload job tracking with progress and cancellation support
+- Conversion/scaling failures surface as frontend errors
 
-### Job Queue
-- Add as many URLs as you want — processed by a 5-worker thread pool with overflow queuing
-- Live status updates: `queued → fast_pass → heavy_pass_waiting → heavy_pass_recording → done`
-- Recording timer shown during `heavy_pass_recording` so you know how long capture has been running
-- **Cancel any job at any stage** — queued jobs are removed immediately; in-progress jobs stop within ~300ms
+### Download Jobs
+- Up to **5 URL downloads run at the same time**. Each active download gets its own isolated background thread and Playwright browser/context as needed.
+- Downloads beyond the cap stay queued until an active job finishes, then start automatically.
+- Active threads and browser instances are torn down after each job completes, fails, or is cancelled.
+- Live status updates: `queued → fast_pass → heavy_pass_waiting → heavy_pass_recording → done` or `failed`
+- Fast-pass ffmpeg downloads show real progress when duration is known.
+- Heavy-pass recording progress uses detected video duration when available instead of always showing the 3-hour cap.
+- Completed videos are inserted into the frontend grid immediately from the queue result, without waiting for a full list reload.
+- **Cancel any job at any stage** — queued jobs are removed immediately; in-progress jobs receive a cancellation signal and stop at the next cancellation check.
 
 ### Video Library
 - Saved videos stream directly from local storage — watch in-browser or download with one click
 - Tag videos with a category at add-time and filter by category in the grid
 - Infinite scroll with deduplication (same URL or title won't be saved twice)
+- Remote thumbnails that are not configured for Next Image are skipped instead of breaking the UI
+- Uploads have a separate library view and can be downloaded or deleted independently
 
 ### Security
 - URL validation blocks SSRF attacks (private IPs, loopback addresses, non-HTTP schemes)
@@ -95,8 +112,8 @@ backend/    FastAPI
       media.py        ffmpeg/yt-dlp download, quality scaling, ad URL filtering
       html.py         HTML cleaning for LLM context
     llm_manager.py    Provider abstraction + fallback chain (OpenAI → Anthropic → Ollama)
-    queue.py          5-worker thread pool with per-job cancellation and phase tracking
-    upload_worker.py  Upload processing worker
+    queue.py          5-concurrent download runner with per-job threads, cancellation, phase tracking, and overflow queuing
+    upload_worker.py  Upload processing workers with 720p scaling and WebM-to-MP4 conversion
     video_utils.py    Quality scaling via ffmpeg
   db.py     SQLite via SQLAlchemy
 ```
@@ -131,6 +148,9 @@ LLM_PROVIDER=                            # leave blank for auto-fallback, or set
 AUTH_PASSWORD=yourpassword               # leave blank to disable auth
 CORS_ORIGINS=http://localhost:3000
 TEMP_STORAGE_DIR=temp_storage
+BROWSER_HEADLESS=true                    # optional
+BROWSER_PROFILE_DIR=browser_profile      # optional; stores storage_state.json
+PROXY_URLS=                              # optional comma-separated proxy list for Cloudflare fallback
 ```
 
 **3. Start**
@@ -148,9 +168,10 @@ Open [http://localhost:3000](http://localhost:3000).
 2. Enter a category name.
 3. Click **Add Video**.
 4. Watch the job move through `queued → fast_pass → heavy_pass_waiting → heavy_pass_recording → done` in the Downloads panel.
-5. Once done, the video appears in the grid — click ▶ to play in-browser, or the download icon to save to disk.
+5. Once done, the video appears in the grid immediately — click ▶ to play in-browser, or the download icon to save to disk.
+6. If playback cannot be confirmed or the MediaRecorder capture is blank/static, the job fails and the frontend shows the error instead of saving a bad file.
 
-To add a local file instead, use the **Upload Video** option in the nav.
+To add a local file instead, use the **Upload Video** option in the nav. Uploaded WebM files are converted to MP4 automatically.
 
 ---
 
