@@ -11,7 +11,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
-import type { CombineJobData, TranslateJobData, TrimJobData } from "./api";
+import type { CombineJobData, EnhanceJobData, TranslateJobData, TrimJobData } from "./api";
 
 // ── Shared job types ───────────────────────────────────────────────────────────
 
@@ -65,6 +65,14 @@ export interface TrimJobItem {
   data: TrimJobData;
 }
 
+export interface EnhanceJobItem {
+  localId: string;
+  filename: string;
+  uploadProgress: number;
+  jobId: string;
+  data: EnhanceJobData;
+}
+
 // ── Context ────────────────────────────────────────────────────────────────────
 
 interface JobsContextValue {
@@ -88,6 +96,10 @@ interface JobsContextValue {
   trimJobs: TrimJobItem[];
   setTrimJobs: Dispatch<SetStateAction<TrimJobItem[]>>;
   trimPollRefs: MutableRefObject<Map<string, ReturnType<typeof setInterval>>>;
+  // Enhance
+  enhanceJobs: EnhanceJobItem[];
+  setEnhanceJobs: Dispatch<SetStateAction<EnhanceJobItem[]>>;
+  enhancePollRefs: MutableRefObject<Map<string, ReturnType<typeof setInterval>>>;
 }
 
 const JobsContext = createContext<JobsContextValue | null>(null);
@@ -113,12 +125,14 @@ export function JobsProvider({ children }: { children: ReactNode }) {
   const [combineJobs, setCombineJobs] = useState<CombineJobItem[]>([]);
   const [translateJobs, setTranslateJobs] = useState<TranslateJobItem[]>([]);
   const [trimJobs, setTrimJobs] = useState<TrimJobItem[]>([]);
+  const [enhanceJobs, setEnhanceJobs] = useState<EnhanceJobItem[]>([]);
 
   const uploadPollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const uploadAbortRefs = useRef<Map<string, () => void>>(new Map());
   const combinePollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const translatePollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const trimPollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+  const enhancePollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
 
   // Track whether the initial localStorage load has completed so we don't
   // overwrite persisted data with an empty array on the very first render.
@@ -181,6 +195,17 @@ export function JobsProvider({ children }: { children: ReactNode }) {
       }
     } catch {}
 
+    try {
+      const raw = localStorage.getItem("vidq_enhance");
+      if (raw) {
+        const parsed = JSON.parse(raw) as EnhanceJobItem[];
+        const active = parsed.filter(
+          (j) => j.jobId && !TERMINAL.includes(j.data.status)
+        );
+        if (active.length) setEnhanceJobs(active);
+      }
+    } catch {}
+
     // Allow save effects to run from here on.
     persistReady.current = true;
   }, []);
@@ -226,6 +251,14 @@ export function JobsProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("vidq_trim", JSON.stringify(toSave));
   }, [trimJobs]);
 
+  useEffect(() => {
+    if (!persistReady.current) return;
+    const toSave = enhanceJobs.filter(
+      (j) => j.jobId && !TERMINAL.includes(j.data.status)
+    );
+    localStorage.setItem("vidq_enhance", JSON.stringify(toSave));
+  }, [enhanceJobs]);
+
   return (
     <JobsContext.Provider
       value={{
@@ -238,6 +271,8 @@ export function JobsProvider({ children }: { children: ReactNode }) {
         translatePollRefs,
         trimJobs, setTrimJobs,
         trimPollRefs,
+        enhanceJobs, setEnhanceJobs,
+        enhancePollRefs,
       }}
     >
       {children}
