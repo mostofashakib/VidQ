@@ -151,3 +151,96 @@ export async function listUploadedVideos(token: string): Promise<
   });
   return res.data;
 }
+
+// ── Combine ────────────────────────────────────────────────────────────────
+
+export interface CombineJobData {
+  job_id: string;
+  status: string;
+  phase: string;
+  overall_progress: number;
+  clip_index: number;
+  total_clips: number;
+  result_url?: string;
+  error?: string;
+}
+
+export async function startCombineJob(
+  token: string,
+  files: File[],
+  onUploadProgress?: (percent: number) => void,
+  signal?: AbortSignal,
+): Promise<CombineJobData> {
+  const form = new FormData();
+  files.forEach((f) => form.append("files", f));
+  const res = await axios.post(`${API_URL}/combine-video`, form, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+    onUploadProgress: (e) => {
+      if (onUploadProgress && e.total) {
+        onUploadProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    },
+  });
+  return res.data;
+}
+
+export async function getCombineJob(token: string, jobId: string): Promise<CombineJobData> {
+  const res = await axios.get(`${API_URL}/combine-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function cancelCombineJob(token: string, jobId: string): Promise<void> {
+  await axios.delete(`${API_URL}/combine-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+
+// ── Translate ──────────────────────────────────────────────────────────────
+
+export interface TranslateJobData {
+  job_id: string;
+  filename: string;
+  status: string;
+  phase: string;
+  overall_progress: number;
+  chunk_index: number;
+  total_chunks: number;
+  result_url?: string;
+  error?: string;
+}
+
+export async function startTranslateJob(
+  token: string,
+  file: File,
+  onUploadProgress?: (percent: number) => void,
+  signal?: AbortSignal,
+): Promise<TranslateJobData> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await axios.post(`${API_URL}/translate-video`, form, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+    onUploadProgress: (e) => {
+      if (onUploadProgress && e.total) {
+        onUploadProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    },
+  });
+  return res.data;
+}
+
+export async function getTranslateJob(token: string, jobId: string): Promise<TranslateJobData> {
+  const res = await axios.get(`${API_URL}/translate-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function cancelTranslateJob(token: string, jobId: string): Promise<void> {
+  await axios.delete(`${API_URL}/translate-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}

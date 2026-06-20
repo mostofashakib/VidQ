@@ -15,7 +15,7 @@ import {
   Dialog, DialogContent, DialogHeader, DialogFooter, DialogTitle,
 } from "@/components/ui/dialog";
 import { Trash, Download, Check, X, Loader2, Upload, Ban, Clock, Trash2 } from "lucide-react";
-import Link from "next/link";
+import Navbar from "@/components/Navbar";
 
 interface UploadedVideo {
   id: number;
@@ -48,7 +48,7 @@ function processingMessage(filename: string, pct: number): string {
 }
 
 export default function UploadPage() {
-  const { token, loading, authEnabled, logout } = useAuth();
+  const { token, loading } = useAuth();
   const router = useRouter();
 
   const [videos, setVideos] = useState<UploadedVideo[]>([]);
@@ -283,29 +283,7 @@ export default function UploadPage() {
 
   return (
     <div className="min-h-screen text-white pb-20">
-      {/* Header */}
-      <div className="flex justify-between items-center px-8 py-5 glass-panel sticky top-0 z-50 rounded-b-2xl mx-4 mb-10 shadow-xl shadow-indigo-500/10">
-        <div className="flex items-center gap-4">
-          <Link href="/">
-            <span className="text-2xl font-bold bg-clip-text text-transparent bg-linear-to-r from-indigo-400 to-purple-400 cursor-pointer">
-              VidQ
-            </span>
-          </Link>
-          <span className="text-gray-500 text-sm hidden sm:inline">/ Upload</span>
-        </div>
-        <div className="flex items-center gap-3">
-          <Link href="/">
-            <Button variant="outline" className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200 text-sm">
-              ← Library
-            </Button>
-          </Link>
-          {authEnabled && (
-            <Button variant="outline" onClick={logout} className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200">
-              Logout
-            </Button>
-          )}
-        </div>
-      </div>
+      <Navbar />
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
         {/* Drop zone */}

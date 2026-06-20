@@ -57,6 +57,10 @@ class LLMProvider(abc.ABC):
         """Vision call — prompt + screenshot. Used for metadata extraction."""
         pass
 
+    async def call_translate_text(self, prompt: str) -> str:
+        """Plain-text call for subtitle translation — returns raw string, not JSON."""
+        raise NotImplementedError
+
     # Convenience alias kept for backwards compat
     async def extract_metadata(self, prompt: str, image_b64: str) -> dict:
         return await self.call_vision(prompt, image_b64)
@@ -120,6 +124,21 @@ class OllamaProvider(LLMProvider):
             logger.error(f"Ollama JSON parse failed. Raw: {content[:500]}")
             raise e
 
+    async def call_translate_text(self, prompt: str) -> str:
+        import re as _re
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "stream": False,
+            "options": {"temperature": 0.1},
+        }
+        logger.info(f"Ollama call_translate_text → model={self.model_name}")
+        data = await self._post(payload)
+        content = data["message"]["content"].strip()
+        # Strip qwen3 chain-of-thought blocks
+        content = _re.sub(r'<think>.*?</think>', '', content, flags=_re.DOTALL).strip()
+        return content
+
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
         payload = {
             "model": self.model_name,
@@ -153,6 +172,15 @@ class OpenAIProvider(LLMProvider):
             temperature=0.2,
         )
         return _parse_json(response.choices[0].message.content.strip())
+
+    async def call_translate_text(self, prompt: str) -> str:
+        response = await self.client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
+            temperature=0.1,
+        )
+        return response.choices[0].message.content.strip()
 
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
         response = await self.client.chat.completions.create(
@@ -203,6 +231,14 @@ class OpenRouterProvider(LLMProvider):
         )
         return _parse_json(content)
 
+    async def call_translate_text(self, prompt: str) -> str:
+        return await self._create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096,
+            temperature=0.1,
+        )
+
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
         content = await self._create(
             model=self.model_name,
@@ -232,6 +268,14 @@ class AnthropicProvider(LLMProvider):
             messages=[{"role": "user", "content": prompt}],
         )
         return _parse_json(response.content[0].text.strip())
+
+    async def call_translate_text(self, prompt: str) -> str:
+        response = await self.client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return response.content[0].text.strip()
 
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
         response = await self.client.messages.create(
@@ -325,3 +369,19 @@ class FallbackLLMManager:
     async def execute(self, prompt: str, image_b64: str) -> dict:
         """Vision call through the fallback chain (backwards compat entry point)."""
         return await self._run("call_vision", prompt, image_b64)
+
+    async def execute_translate(self, prompt: str) -> str:
+        """Plain-text translation call through the fallback chain. Returns raw string."""
+        last_error = None
+        for original_idx, provider in self._ordered_providers():
+            provider_label = self._provider_label(provider)
+            try:
+                logger.info(f"[translate] Using {provider_label}")
+                result = await provider.call_translate_text(prompt)
+                if self._working_provider_index != original_idx:
+                    self._working_provider_index = original_idx
+                return result
+            except Exception as e:
+                logger.warning(f"[translate] {provider_label} failed: {e}")
+                last_error = e
+        raise Exception(f"All LLM providers failed for translation. Last error: {last_error}")

@@ -5,6 +5,8 @@ from app.logging_config import configure_logging
 from app.routers.auth import router as auth_router
 from app.routers.video import router as video_router
 from app.routers.upload import router as upload_router
+from app.routers.combine import router as combine_router
+from app.routers.translate import router as translate_router
 from app.config import get_settings
 
 configure_logging()
@@ -32,3 +34,5 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(video_router)
 app.include_router(upload_router)
+app.include_router(combine_router)
+app.include_router(translate_router)

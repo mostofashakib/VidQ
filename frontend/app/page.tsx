@@ -2,7 +2,6 @@
 
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import { useAuth } from "./auth-context";
 import {
   addVideo,
@@ -32,6 +31,7 @@ import {
 } from "@/components/ui/card";
 import Image from "next/image";
 import { Trash, Download, Check, X, Loader2, Trash2 } from "lucide-react";
+import Navbar from "@/components/Navbar";
 
 interface Video {
   id: number;
@@ -137,7 +137,7 @@ function queueResultVideo(result: unknown): Video | undefined {
 }
 
 export default function HomePage() {
-  const { token, logout, loading, authEnabled } = useAuth();
+  const { token, loading } = useAuth();
   const router = useRouter();
   const [videos, setVideos] = useState<Video[]>([]);
   const [url, setUrl] = useState("");
@@ -471,34 +471,7 @@ export default function HomePage() {
 
   return (
     <div className="min-h-screen text-white pb-20">
-      {/* Header */}
-      <div className="flex justify-between items-center px-8 py-5 glass-panel sticky top-0 z-50 rounded-b-2xl mx-4 mb-10 shadow-xl shadow-indigo-500/10">
-        <h1
-          className="text-2xl font-bold bg-clip-text text-transparent bg-linear-to-r from-indigo-400 to-purple-400 cursor-pointer"
-          onClick={() => window.location.reload()}
-        >
-          VidQ
-        </h1>
-        <div className="flex items-center gap-3">
-          <Link href="/upload">
-            <Button
-              variant="outline"
-              className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200 text-sm"
-            >
-              Upload Video
-            </Button>
-          </Link>
-          {authEnabled && (
-            <Button
-              variant="outline"
-              onClick={logout}
-              className="border-white/10 bg-transparent hover:bg-white/10 hover:text-white transition-all rounded-xl text-gray-200"
-            >
-              Logout
-            </Button>
-          )}
-        </div>
-      </div>
+      <Navbar />
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
         {/* Add Video Form */}

@@ -72,6 +72,22 @@ Videos are stored locally — no expiring CDN links.
 - Per-upload job tracking with progress and cancellation support
 - Conversion/scaling failures surface as frontend errors
 
+### Combine Videos
+- Drag and drop 2–20 video files on the **Combine** page to merge them into a single video
+- Clips are joined with smooth **crossfade transitions** (ffmpeg `xfade` filter, 0.5 s overlap)
+- Each clip is normalized to 720p before merging; the final output is a 720p MP4
+- Real-time progress bar showing normalize phase (clip N/N) and merge phase (%)
+- Output is immediately downloadable — not saved to the library
+
+### Translate & Subtitle Videos
+- Drop a video on the **Translate** page to get an English-subtitled version
+- **Whisper** (`whisper-1`) generates a timestamped transcript; chunks too large for a single LLM call are split and processed in parallel
+- A local **Ollama** LLM (default: `qwen3.5:latest`) translates each subtitle segment; falls back to OpenAI if Ollama is unavailable
+- The translation prompt explicitly instructs the model to translate every segment individually — no summarizing or condensing
+- Subtitles are burned into the video YouTube-style (bottom-center, white text with black outline) via ffmpeg
+- Four-phase progress bar: **Audio → Whisper → LLM (chunk N/N) → Burn**
+- Output is immediately downloadable — not saved to the library
+
 ### Download Jobs
 - Up to **5 URL downloads run at the same time**. Each active download gets its own isolated background thread and Playwright browser/context as needed.
 - Downloads beyond the cap stay queued until an active job finishes, then start automatically.
@@ -100,20 +116,29 @@ Videos are stored locally — no expiring CDN links.
 
 ```
 frontend/   Next.js 15 (App Router) — video grid, download queue panel, in-browser player
+  src/components/
+    Navbar.tsx        Shared sticky nav (Library, Upload, Combine, Translate)
+  app/
+    combine/          Combine page — multi-file drag-and-drop → xfade merge
+    translate/        Translate page — single file drop → Whisper + LLM → burned subtitles
 backend/    FastAPI
   routers/
     auth.py           Password login, Bearer token validation
     video.py          Add video, list, delete, queue status, file serving
     upload.py         Direct file upload with per-job progress tracking
+    combine.py        Multi-clip combine endpoint with polling
+    translate.py      Video translate endpoint with polling
   services/
     scraper/
       pipeline.py     Three-stage pipeline: embed fast-path → fast pass → MediaRecorder fallback
       playback.py     Agentic interact loop, JS heuristics, force-play, frame-aware helpers
       media.py        ffmpeg/yt-dlp download, quality scaling, ad URL filtering
       html.py         HTML cleaning for LLM context
-    llm_manager.py    Provider abstraction + fallback chain (OpenAI → Anthropic → Ollama)
+    llm_manager.py    Provider abstraction + fallback chain (OpenAI → Anthropic → Ollama); includes plain-text translate call
     queue.py          5-concurrent download runner with per-job threads, cancellation, phase tracking, and overflow queuing
     upload_worker.py  Upload processing workers with 720p scaling and WebM-to-MP4 conversion
+    combine_worker.py xfade clip merging with per-clip normalize phase
+    translate_worker.py Whisper transcription → chunked LLM translation → ffmpeg subtitle burn
     video_utils.py    Quality scaling via ffmpeg
   db.py     SQLite via SQLAlchemy
 ```
@@ -171,7 +196,9 @@ Open [http://localhost:3000](http://localhost:3000).
 5. Once done, the video appears in the grid immediately — click ▶ to play in-browser, or the download icon to save to disk.
 6. If playback cannot be confirmed or the MediaRecorder capture is blank/static, the job fails and the frontend shows the error instead of saving a bad file.
 
-To add a local file instead, use the **Upload Video** option in the nav. Uploaded WebM files are converted to MP4 automatically.
+To add a local file instead, use the **Upload** link in the nav. Uploaded WebM files are converted to MP4 automatically.
+
+To merge multiple clips, use the **Combine** link in the nav. To generate English subtitles for a video, use the **Translate** link.
 
 ---
 
