@@ -11,6 +11,7 @@ const NAV_LINKS = [
   { href: "/combine", label: "Combine" },
   { href: "/translate", label: "Translate" },
   { href: "/trim", label: "Trim" },
+  { href: "/enhance", label: "Enhance" },
 ];
 
 export default function Navbar() {
