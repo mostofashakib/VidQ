@@ -11,7 +11,7 @@ import {
   type ReactNode,
   type SetStateAction,
 } from "react";
-import type { CombineJobData, TranslateJobData } from "./api";
+import type { CombineJobData, TranslateJobData, TrimJobData } from "./api";
 
 // ── Shared job types ───────────────────────────────────────────────────────────
 
@@ -57,6 +57,14 @@ export interface TranslateJobItem {
   data: TranslateJobData;
 }
 
+export interface TrimJobItem {
+  localId: string;
+  filename: string;
+  uploadProgress: number;
+  jobId: string;
+  data: TrimJobData;
+}
+
 // ── Context ────────────────────────────────────────────────────────────────────
 
 interface JobsContextValue {
@@ -76,6 +84,10 @@ interface JobsContextValue {
   translateJobs: TranslateJobItem[];
   setTranslateJobs: Dispatch<SetStateAction<TranslateJobItem[]>>;
   translatePollRefs: MutableRefObject<Map<string, ReturnType<typeof setInterval>>>;
+  // Trim
+  trimJobs: TrimJobItem[];
+  setTrimJobs: Dispatch<SetStateAction<TrimJobItem[]>>;
+  trimPollRefs: MutableRefObject<Map<string, ReturnType<typeof setInterval>>>;
 }
 
 const JobsContext = createContext<JobsContextValue | null>(null);
@@ -100,11 +112,13 @@ export function JobsProvider({ children }: { children: ReactNode }) {
   const [uploadJobs, setUploadJobs] = useState<UploadJob[]>([]);
   const [combineJobs, setCombineJobs] = useState<CombineJobItem[]>([]);
   const [translateJobs, setTranslateJobs] = useState<TranslateJobItem[]>([]);
+  const [trimJobs, setTrimJobs] = useState<TrimJobItem[]>([]);
 
   const uploadPollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const uploadAbortRefs = useRef<Map<string, () => void>>(new Map());
   const combinePollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
   const translatePollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+  const trimPollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
 
   // Track whether the initial localStorage load has completed so we don't
   // overwrite persisted data with an empty array on the very first render.
@@ -156,6 +170,17 @@ export function JobsProvider({ children }: { children: ReactNode }) {
       }
     } catch {}
 
+    try {
+      const raw = localStorage.getItem("vidq_trim");
+      if (raw) {
+        const parsed = JSON.parse(raw) as TrimJobItem[];
+        const active = parsed.filter(
+          (j) => j.jobId && !TERMINAL.includes(j.data.status)
+        );
+        if (active.length) setTrimJobs(active);
+      }
+    } catch {}
+
     // Allow save effects to run from here on.
     persistReady.current = true;
   }, []);
@@ -193,6 +218,14 @@ export function JobsProvider({ children }: { children: ReactNode }) {
     localStorage.setItem("vidq_translate", JSON.stringify(toSave));
   }, [translateJobs]);
 
+  useEffect(() => {
+    if (!persistReady.current) return;
+    const toSave = trimJobs.filter(
+      (j) => j.jobId && !TERMINAL.includes(j.data.status)
+    );
+    localStorage.setItem("vidq_trim", JSON.stringify(toSave));
+  }, [trimJobs]);
+
   return (
     <JobsContext.Provider
       value={{
@@ -203,6 +236,8 @@ export function JobsProvider({ children }: { children: ReactNode }) {
         combinePollRefs,
         translateJobs, setTranslateJobs,
         translatePollRefs,
+        trimJobs, setTrimJobs,
+        trimPollRefs,
       }}
     >
       {children}
