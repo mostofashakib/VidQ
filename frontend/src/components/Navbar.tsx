@@ -10,6 +10,7 @@ const NAV_LINKS = [
   { href: "/upload", label: "Convert" },
   { href: "/combine", label: "Combine" },
   { href: "/translate", label: "Translate" },
+  { href: "/trim", label: "Trim" },
 ];
 
 export default function Navbar() {
