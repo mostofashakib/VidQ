@@ -1,6 +1,6 @@
 # VidQ
 
-**A self-hosted video toolkit.** Download videos from any URL, convert and scale local files, combine multiple clips, and burn English subtitles into any video — all from a clean web interface.
+**A self-hosted video toolkit.** Download videos from any URL, convert and scale local files, combine multiple clips, burn English subtitles, trim to a clip, and AI-restore old footage to HD quality — all from a clean web interface.
 
 ---
 
@@ -12,6 +12,8 @@
 | **Convert** | Upload a local file — scales to 720p, converts WebM to MP4 |
 | **Combine** | Drop 2–20 clips — merges them into one 720p MP4 with crossfade transitions |
 | **Translate** | Drop any video — transcribes it with Whisper, translates with an LLM, burns English subtitles |
+| **Trim** | Upload a video — set in/out points on a timeline, export the clipped segment |
+| **Enhance** | Upload old or low-quality footage — AI-restores noise, grain, blur, and compression artifacts to clean HD output (minimum 720p) |
 
 Every page has a live job queue: submit as many jobs as you want, watch them move through queued → processing → done, cancel any job mid-flight, and download completed files immediately.
 
@@ -49,6 +51,7 @@ Open [http://localhost:3000](http://localhost:3000).
 | Node.js 18+ | The startup script prefers Node 20 via nvm if available |
 | [uv](https://github.com/astral-sh/uv) | Fast Python package manager — installed automatically if missing |
 | ffmpeg | Bundled via `imageio-ffmpeg`; no system install needed |
+| [realesrgan-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN) | Required for the **Enhance** feature: `brew install realesrgan-ncnn-vulkan`. Uses Vulkan/Metal — no CUDA needed. |
 | At least one LLM provider | OpenAI, Anthropic, OpenRouter, or [Ollama](https://ollama.com) running locally |
 
 For the **Translate** feature specifically:
@@ -188,6 +191,21 @@ Uploaded clips are normalized to 720p individually, then joined with ffmpeg's `x
 
 Up to **3 translate jobs** run in parallel; additional jobs queue automatically.
 
+### Trim Pipeline
+
+The uploaded video is trimmed to the specified start/end times using ffmpeg's stream-copy mode (no re-encode). The frontend shows a dual-handle timeline editor for setting in/out points before submitting.
+
+### Enhance Pipeline
+
+1. **Split** — ffmpeg splits the video into 60-second segments. Only one segment's frames are on disk at a time, capping peak storage to ~2–4 GB regardless of video length.
+2. **Per-chunk AI upscale** — for each segment:
+   - ffmpeg extracts frames as JPEG (`-qscale:v 2`)
+   - `realesrgan-ncnn-vulkan` runs the `realesrgan-x4plus` model at 4× scale with tiled inference (`-t 128`) to remove noise, grain, blur, and compression artifacts
+   - ffmpeg reassembles the enhanced frames at the target resolution (H.264 CRF 18, preset slow)
+3. **Assemble** — all enhanced segments are concatenated and the original audio is muxed back
+
+Output is at least 720p; videos already above 720p keep their original height. The frontend shows the current chunk number and overall progress during the hour(s)-long run. If `realesrgan-ncnn-vulkan` is not installed the job fails immediately with a clear install instruction.
+
 ---
 
 ## Architecture
@@ -199,8 +217,10 @@ frontend/                     Next.js 15 (App Router)
     upload/page.tsx           Convert page — file drop zone, job queue, video list
     combine/page.tsx          Combine page — multi-clip drop zone, job queue
     translate/page.tsx        Translate page — single-file drop zone, job queue
+    trim/page.tsx             Trim page — dual-handle timeline editor, job queue
+    enhance/page.tsx          Enhance page — file drop zone, phase-labelled progress, job queue
   src/components/
-    Navbar.tsx                Sticky nav: Download · Convert · Combine · Translate
+    Navbar.tsx                Sticky nav: Download · Convert · Combine · Translate · Trim · Enhance
 
 backend/                      FastAPI
   app/
@@ -212,6 +232,8 @@ backend/                      FastAPI
       upload.py               Convert/upload endpoint with progress tracking
       combine.py              Combine endpoint with polling
       translate.py            Translate endpoint with polling
+      trim.py                 Trim endpoint with polling
+      enhance.py              Enhance endpoint with polling
     services/
       transcription.py        TranscriptionAdapter ABC — WhisperOpenAIAdapter | WhisperLocalAdapter
       llm_manager.py          LLMProvider ABC + OllamaProvider | OpenAIProvider | AnthropicProvider |
@@ -220,6 +242,8 @@ backend/                      FastAPI
       upload_worker.py        720p scaling + WebM→MP4 conversion workers
       combine_worker.py       Per-clip normalize + xfade merge workers
       translate_worker.py     Audio extract → transcribe → translate → burn workers
+      trim_worker.py          Stream-copy trim workers
+      enhance_worker.py       Chunked Real-ESRGAN pipeline: split → frame extract → AI upscale → reassemble
       scraper/
         pipeline.py           Three-stage pipeline: direct → browser+agent → MediaRecorder
         playback.py           Agentic interaction loop, strategy cache, frame-aware helpers
