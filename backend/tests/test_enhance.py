@@ -33,7 +33,7 @@ def _make_smart_popen():
                 pass
 
         # realesrgan: copy frames from -i dir to -o dir
-        if "realesrgan-ncnn-vulkan" in cmd_list:
+        if any(str(part).endswith("realesrgan-ncnn-vulkan") for part in cmd_list):
             i_idx = cmd_list.index("-i")
             o_idx = cmd_list.index("-o")
             in_dir = cmd_list[i_idx + 1]
@@ -117,32 +117,32 @@ def test_enhance_status_returns_phase(client):
 
 def test_enhance_missing_binary_marks_failed(client):
     """If realesrgan-ncnn-vulkan is not on PATH, job fails with a clear error."""
-    with patch("app.services.enhance_worker.shutil.which", return_value=None):
-        with patch("app.services.enhance_worker._probe_video", return_value=(30.0, 5.0, 640, 480)):
-            r = client.post(
-                "/enhance-video",
-                files=[("file", ("video.mp4", io.BytesIO(_fake_mp4()), "video/mp4"))],
-                headers=AUTH,
-            )
-            assert r.status_code == 200
-            job_id = r.json()["job_id"]
+    with patch("app.services.enhance_worker._resolve_real_esrgan_bin", return_value=None):
+        r = client.post(
+            "/enhance-video",
+            files=[("file", ("video.mp4", io.BytesIO(_fake_mp4()), "video/mp4"))],
+            headers=AUTH,
+        )
+        assert r.status_code == 200
+        job_id = r.json()["job_id"]
 
-            deadline = time.time() + 10
-            result = {}
-            while time.time() < deadline:
-                r2 = client.get(f"/enhance-jobs/{job_id}", headers=AUTH)
-                result = r2.json()
-                if result["status"] in ("done", "failed"):
-                    break
-                time.sleep(0.1)
+        deadline = time.time() + 10
+        result = {}
+        while time.time() < deadline:
+            r2 = client.get(f"/enhance-jobs/{job_id}", headers=AUTH)
+            result = r2.json()
+            if result["status"] in ("done", "failed"):
+                break
+            time.sleep(0.1)
 
     assert result["status"] == "failed"
     assert "realesrgan-ncnn-vulkan" in (result.get("error") or "")
+    assert "brew install" not in (result.get("error") or "")
 
 
 def test_enhance_job_completes(client):
     """Full pipeline with mocked subprocess produces done status and result_url."""
-    with patch("app.services.enhance_worker.shutil.which",
+    with patch("app.services.enhance_worker._resolve_real_esrgan_bin",
                return_value="/usr/local/bin/realesrgan-ncnn-vulkan"):
         with patch("app.services.enhance_worker._probe_video",
                    return_value=(30.0, 5.0, 640, 480)):
@@ -185,7 +185,7 @@ def test_enhance_subprocess_failure_marks_failed(client):
         def kill(self):
             pass
 
-    with patch("app.services.enhance_worker.shutil.which",
+    with patch("app.services.enhance_worker._resolve_real_esrgan_bin",
                return_value="/usr/local/bin/realesrgan-ncnn-vulkan"):
         with patch("app.services.enhance_worker._probe_video",
                    return_value=(30.0, 5.0, 640, 480)):

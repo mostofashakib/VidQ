@@ -4,6 +4,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "./auth-context";
 import { useJobs, type DownloadJob } from "./jobs-context";
+import { downloadBlob, videoDownloadName } from "./job-utils";
 import {
   addVideo,
   listVideos,
@@ -84,6 +85,7 @@ function RecordingProgress({ startedAt, durationSeconds }: { startedAt: number; 
 }
 
 const PAGE_SIZE = 20;
+const QUEUE_TERMINAL_STATUSES = new Set(["done", "failed", "cancelled"]);
 
 const STATUS_STYLES: Record<DownloadJob["status"], string> = {
   extracting: "bg-yellow-500/20 text-yellow-400",
@@ -174,9 +176,6 @@ export default function HomePage() {
     (d) => d.jobId && (d.status === "queued" || d.status === "processing")
   );
 
-  // Treat "cancelled" returned by polling as a terminal state
-  const TERMINAL = new Set(["done", "failed", "cancelled"]);
-
   useEffect(() => {
     if (!token || !hasActiveQueueJobs) return;
 
@@ -191,7 +190,7 @@ export default function HomePage() {
           try {
             const data = await getQueueStatus(token, job.jobId!);
 
-            if (TERMINAL.has(data.status)) {
+            if (QUEUE_TERMINAL_STATUSES.has(data.status)) {
               const isDone = data.status === "done";
               setDownloads((prev) =>
                 prev.map((d) =>
@@ -258,7 +257,7 @@ export default function HomePage() {
     const interval = setInterval(pollActiveJobs, 1000);
 
     return () => clearInterval(interval);
-  }, [token, hasActiveQueueJobs, fetchMoreVideos]);
+  }, [token, hasActiveQueueJobs, fetchMoreVideos, setDownloads]);
 
   useEffect(() => {
     if (!token) return;
@@ -277,12 +276,12 @@ export default function HomePage() {
       },
       { threshold: 1 }
     );
-    if (loaderRef.current) observer.observe(loaderRef.current);
+    const loaderElement = loaderRef.current;
+    if (loaderElement) observer.observe(loaderElement);
     return () => {
-      if (loaderRef.current) observer.unobserve(loaderRef.current);
+      if (loaderElement) observer.unobserve(loaderElement);
     };
-    // eslint-disable-next-line
-  }, [loaderRef.current, hasMore, loading, fetching]);
+  }, [hasMore, loading, fetching, fetchMoreVideos]);
 
   async function handleAddVideo(e: { preventDefault(): void }) {
     e.preventDefault();
@@ -394,17 +393,7 @@ export default function HomePage() {
     for (const video of videos) {
       try {
         const blob = await downloadVideo(token!, video.id);
-        const blobUrl = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
-        a.download = video.title
-          ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${ext}`
-          : `video-${video.id}.${ext}`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(blobUrl);
+        downloadBlob(blob, videoDownloadName(video, "video"));
         // Brief pause so the browser can initiate each download
         await new Promise((r) => setTimeout(r, 400));
       } catch {
@@ -744,17 +733,7 @@ export default function HomePage() {
                     e.stopPropagation();
                     try {
                       const blob = await downloadVideo(token!, video.id);
-                      const blobUrl = window.URL.createObjectURL(blob);
-                      const a = document.createElement("a");
-                      a.href = blobUrl;
-                      const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
-                      a.download = video.title
-                        ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}.${ext}`
-                        : `video-${video.id}.${ext}`;
-                      document.body.appendChild(a);
-                      a.click();
-                      document.body.removeChild(a);
-                      window.URL.revokeObjectURL(blobUrl);
+                      downloadBlob(blob, videoDownloadName(video, "video"));
                     } catch {
                       window.open(video.url, "_blank");
                     }

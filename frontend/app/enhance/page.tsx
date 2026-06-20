@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
 import { useJobs, type EnhanceJobItem } from "../jobs-context";
+import { createLocalId, triggerFileDownload, useJobPolling } from "../job-utils";
 import { startEnhanceJob, getEnhanceJob, cancelEnhanceJob, type EnhanceJobData } from "../api";
 import { Button } from "@/components/ui/button";
 import { Loader2, X, Check, Download, Sparkles, Clock, Ban, Trash2 } from "lucide-react";
@@ -52,22 +53,14 @@ export default function EnhancePage() {
     if (!loading && !token) router.replace("/login");
   }, [token, loading, router]);
 
-  // Recovery polling: re-attach intervals for non-terminal jobs restored from localStorage
-  useEffect(() => {
-    if (!token) return;
-    jobs.forEach((job) => {
-      if (
-        job.jobId &&
-        !pollRefs.current.has(job.localId) &&
-        job.data.status !== "done" &&
-        job.data.status !== "failed" &&
-        job.data.status !== "cancelled"
-      ) {
-        startPolling(job.localId, job.jobId);
-      }
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, jobs]);
+  const { updateJob, startPolling, removeJob, cancelLocalJob } = useJobPolling({
+    token,
+    jobs,
+    setJobs,
+    pollRefs,
+    getJob: getEnhanceJob,
+    intervalMs: 3000,
+  });
 
   function handleFile(f: File) {
     if (!f.type.startsWith("video/")) {
@@ -85,35 +78,11 @@ export default function EnhancePage() {
     if (f) handleFile(f);
   }
 
-  function updateJob(localId: string, patch: Partial<EnhanceJobItem>) {
-    setJobs((prev) => prev.map((j) => (j.localId === localId ? { ...j, ...patch } : j)));
-  }
-
-  function startPolling(localId: string, jobId: string) {
-    const id = setInterval(async () => {
-      if (!token) return;
-      try {
-        const data = await getEnhanceJob(token, jobId);
-        updateJob(localId, { data });
-        if (data.status === "done" || data.status === "failed" || data.status === "cancelled") {
-          clearInterval(id);
-          pollRefs.current.delete(localId);
-          if (data.status === "cancelled") {
-            setJobs((prev) => prev.filter((j) => j.localId !== localId));
-          }
-        }
-      } catch {
-        // ignore transient poll errors
-      }
-    }, 3000);
-    pollRefs.current.set(localId, id);
-  }
-
   async function handleEnhance() {
     if (!token || !file) return;
     setError("");
     const capturedFile = file;
-    const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const localId = createLocalId();
     const initialData: EnhanceJobData = {
       job_id: "",
       status: "queued",
@@ -142,23 +111,16 @@ export default function EnhancePage() {
   }
 
   function handleCancel(localId: string) {
-    const interval = pollRefs.current.get(localId);
-    if (interval) { clearInterval(interval); pollRefs.current.delete(localId); }
-    const job = jobs.find((j) => j.localId === localId);
-    if (job?.jobId && token) cancelEnhanceJob(token, job.jobId).catch(() => {});
-    setJobs((prev) => prev.filter((j) => j.localId !== localId));
+    cancelLocalJob(localId, cancelEnhanceJob);
   }
 
   function handleDelete(localId: string) {
-    setJobs((prev) => prev.filter((j) => j.localId !== localId));
+    removeJob(localId);
   }
 
   function handleDownload(item: EnhanceJobItem) {
     if (!item.data.result_url) return;
-    const a = document.createElement("a");
-    a.href = item.data.result_url;
-    a.download = `enhanced_${item.filename}`;
-    a.click();
+    triggerFileDownload(item.data.result_url, `enhanced_${item.filename}`);
   }
 
   if (loading) {

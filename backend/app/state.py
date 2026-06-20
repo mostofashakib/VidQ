@@ -27,8 +27,11 @@ if _settings.openrouter_api_key:
 # LLM_PROVIDER="ollama"/"openai"/"anthropic"/"openrouter" → lock to that provider
 llm_manager = FallbackLLMManager(_providers, default=_settings.llm_provider or None)
 
-# Translate uses the same local LLM instance as download
-translate_llm_manager = llm_manager
+# Translate can use a separate provider lock while sharing the configured provider pool.
+translate_llm_manager = FallbackLLMManager(
+    _providers,
+    default=_settings.translate_llm_provider or None,
+)
 
 
 def _build_transcription_adapter() -> TranscriptionAdapter:

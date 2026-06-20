@@ -27,13 +27,6 @@ export async function listVideos(token: string, category?: string, skip?: number
   return res.data;
 }
 
-export async function listCategories(token: string) {
-  const res = await axios.get(`${API_URL}/videos/categories`, {
-    headers: { Authorization: `Bearer ${token}` },
-  });
-  return res.data;
-}
-
 export async function deleteVideo(token: string, id: number) {
   await axios.delete(`${API_URL}/videos/${id}`, {
     headers: { Authorization: `Bearer ${token}` },
@@ -45,15 +38,6 @@ export async function extractVideo(token: string, url: string, signal?: AbortSig
     `${API_URL}/extract-video`,
     { url },
     { headers: { Authorization: `Bearer ${token}` }, signal }
-  );
-  return res.data;
-}
-
-export async function enqueueVideo(token: string, url: string, category: string) {
-  const res = await axios.post(
-    `${API_URL}/queue`,
-    { url, category },
-    { headers: { Authorization: `Bearer ${token}` } }
   );
   return res.data;
 }

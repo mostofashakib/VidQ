@@ -1,6 +1,4 @@
 import os
-import shutil
-import uuid
 import logging
 from typing import List, Optional
 
@@ -12,6 +10,7 @@ from app.config import get_settings
 from app.db import get_db, Video
 from app.models import VideoOut
 from app.routers.auth import verify_token
+from app.routers.upload_utils import save_upload_file
 from app.services.upload_worker import cancel_job, get_job, start_upload_job
 
 logger = logging.getLogger("UploadRouter")
@@ -33,17 +32,7 @@ async def upload_video(
     file: UploadFile = File(...),
     token: str = Depends(verify_token),
 ):
-    settings = get_settings()
-    os.makedirs(settings.temp_storage_dir, exist_ok=True)
-
-    original_name = file.filename or "video.mp4"
-    ext = os.path.splitext(original_name)[1] or ".mp4"
-    filename = f"{uuid.uuid4().hex}{ext}"
-    file_path = os.path.join(settings.temp_storage_dir, filename)
-
-    with open(file_path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-
+    file_path, original_name = save_upload_file(file)
     job_id = start_upload_job(file_path, original_name)
     logger.info(f"Upload queued: job_id={job_id} file={original_name}")
     return UploadJobOut(job_id=job_id, filename=original_name, status="queued")

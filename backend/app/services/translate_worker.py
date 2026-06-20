@@ -10,6 +10,17 @@ from typing import Optional
 import imageio_ffmpeg
 
 from app.config import get_settings
+from app.services.ffmpeg_utils import output_file_is_valid, probe_duration, run_progress_process
+from app.services.worker_runtime import (
+    WorkerPoolState,
+    cancel_registered_job,
+    cleanup_paths,
+    enqueue_registered_job,
+    ensure_worker_pool,
+    get_registered_job,
+    new_job_id,
+    process_queued_job,
+)
 
 logger = logging.getLogger("TranslateWorker")
 
@@ -19,8 +30,7 @@ _jobs: dict[str, "TranslateJob"] = {}
 _lock = threading.Lock()
 _task_queue: queue.Queue = queue.Queue()
 
-_pool_started = False
-_pool_lock = threading.Lock()
+_pool_state = WorkerPoolState()
 
 # Approximate chars per token; used for chunking
 _CHARS_PER_TOKEN = 4
@@ -42,41 +52,29 @@ class TranslateJob:
 
 
 def _ensure_pool() -> None:
-    global _pool_started
-    with _pool_lock:
-        if _pool_started:
-            return
-        for i in range(MAX_WORKERS):
-            t = threading.Thread(target=_worker_loop, name=f"translate-worker-{i}", daemon=True)
-            t.start()
-        _pool_started = True
-        logger.info(f"Translate worker pool started ({MAX_WORKERS} workers)")
+    ensure_worker_pool(
+        _pool_state,
+        max_workers=MAX_WORKERS,
+        target=_worker_loop,
+        name_prefix="translate-worker",
+        logger=logger,
+        label="Translate",
+    )
 
 
 def _worker_loop() -> None:
-    from app.services.global_semaphore import global_job_semaphore
     while True:
         job_id, file_path, original_name = _task_queue.get()
         try:
-            job = _jobs.get(job_id)
-            if not job or job.status == "cancelled":
-                try:
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-                except OSError:
-                    pass
-                logger.info(f"[{job_id}] Skipped (cancelled before pickup)")
-                continue
-
-            # Block here (job stays "queued") until a global slot is available.
-            global_job_semaphore.acquire()
-            try:
-                with _lock:
-                    job.status = "processing"
-                logger.info(f"[{job_id}] Worker picked up {original_name}")
-                _process_job(job_id, file_path, original_name)
-            finally:
-                global_job_semaphore.release()
+            process_queued_job(
+                job_id=job_id,
+                jobs=_jobs,
+                lock=_lock,
+                logger=logger,
+                cleanup_cancelled=lambda job: cleanup_paths([file_path]),
+                picked_message=lambda job: f"[{job.job_id}] Worker picked up {original_name}",
+                process=lambda job: _process_job(job.job_id, file_path, original_name),
+            )
         except Exception as e:
             logger.error(f"Translate worker loop error for {job_id}: {e}", exc_info=True)
         finally:
@@ -84,47 +82,24 @@ def _worker_loop() -> None:
 
 
 def get_job(job_id: str) -> Optional[TranslateJob]:
-    with _lock:
-        return _jobs.get(job_id)
+    return get_registered_job(_jobs, _lock, job_id)
 
 
 def cancel_job(job_id: str) -> bool:
-    with _lock:
-        job = _jobs.get(job_id)
-        if not job or job.status in ("done", "failed", "cancelled"):
-            return False
-        job.status = "cancelled"
-        if job._proc:
-            try:
-                job._proc.kill()
-            except Exception:
-                pass
-    return True
+    return cancel_registered_job(_jobs, _lock, job_id)
 
 
 def start_translate_job(file_path: str, original_name: str) -> str:
-    import uuid
     _ensure_pool()
-    job_id = uuid.uuid4().hex
+    job_id = new_job_id()
     job = TranslateJob(job_id=job_id, filename=original_name)
-    with _lock:
-        _jobs[job_id] = job
-    _task_queue.put((job_id, file_path, original_name))
+    enqueue_registered_job(_jobs, _lock, _task_queue, job, (job_id, file_path, original_name))
     logger.info(f"[{job_id}] Queued: {original_name}")
     return job_id
 
 
 def _probe_duration(path: str) -> Optional[float]:
-    try:
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        result = subprocess.run([ffmpeg_exe, "-i", path], capture_output=True, text=True)
-        match = re.search(r"Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
-        if match:
-            h, m, s = int(match.group(1)), int(match.group(2)), float(match.group(3))
-            return h * 3600 + m * 60 + s
-    except Exception:
-        pass
-    return None
+    return probe_duration(path)
 
 
 def _extract_audio(job: TranslateJob, video_path: str, audio_path: str) -> bool:
@@ -265,62 +240,26 @@ def _burn_subtitles(
 
     logger.info(f"[{job.job_id}] Burning subtitles → {os.path.basename(out_path)}")
 
-    stderr_lines: list[str] = []
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
+    def update_progress(current_s: float) -> None:
+        if not total_duration or total_duration <= 0:
+            return
+        with _lock:
+            job.overall_progress = min(99, int(80 + current_s / total_duration * 19))
+
+    result = run_progress_process(
+        cmd=cmd,
+        job=job,
+        lock=_lock,
+        popen=subprocess.Popen,
+        on_progress=update_progress,
     )
-    with _lock:
-        job._proc = proc
 
-    def _drain_stderr() -> None:
-        try:
-            for line in proc.stderr:
-                stderr_lines.append(line)
-        except Exception:
-            pass
-
-    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
-    stderr_thread.start()
-
-    try:
-        for line in proc.stdout:
-            line = line.strip()
-            if line.startswith("out_time=") and total_duration and total_duration > 0:
-                time_str = line[len("out_time="):]
-                try:
-                    parts = time_str.split(":")
-                    current_s = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
-                    pct = min(99, int(80 + current_s / total_duration * 19))
-                    with _lock:
-                        job.overall_progress = pct
-                except Exception:
-                    pass
-    except Exception:
-        pass
-
-    proc.wait()
-    stderr_thread.join(timeout=2)
-
-    with _lock:
-        job._proc = None
-        cancelled = job.status == "cancelled"
-
-    if cancelled:
-        try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-        except OSError:
-            pass
+    if result.cancelled:
+        cleanup_paths([out_path])
         return False
 
-    if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
-        logger.error(f"[{job.job_id}] Subtitle burn failed: {''.join(stderr_lines)[-400:]}")
+    if result.returncode != 0 or not output_file_is_valid(out_path):
+        logger.error(f"[{job.job_id}] Subtitle burn failed: {result.stderr[-400:]}")
         return False
 
     return True
@@ -447,9 +386,4 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
                 job.status = "failed"
                 job.error = str(e)
     finally:
-        for path in [audio_path, srt_path, file_path]:
-            try:
-                if os.path.exists(path):
-                    os.remove(path)
-            except OSError:
-                pass
+        cleanup_paths([audio_path, srt_path, file_path])

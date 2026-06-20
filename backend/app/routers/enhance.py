@@ -1,14 +1,11 @@
-import os
-import shutil
-import uuid
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.config import get_settings
 from app.routers.auth import verify_token
+from app.routers.upload_utils import save_upload_file
 from app.services.enhance_worker import cancel_job, get_job, start_enhance_job
 
 logger = logging.getLogger("EnhanceRouter")
@@ -30,23 +27,7 @@ async def start_enhance(
     file: UploadFile = File(...),
     token: str = Depends(verify_token),
 ):
-    settings = get_settings()
-    os.makedirs(settings.temp_storage_dir, exist_ok=True)
-
-    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-    filename = f"enhance_in_{uuid.uuid4().hex}{ext}"
-    file_path = os.path.join(settings.temp_storage_dir, filename)
-
-    try:
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-    except Exception as e:
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=500, detail=f"File upload failed: {e}")
-
+    file_path, _ = save_upload_file(file, prefix="enhance_in_")
     job_id = start_enhance_job(file_path)
     logger.info(f"Enhance queued: job_id={job_id}")
     return EnhanceJobOut(job_id=job_id, status="queued")

@@ -6,12 +6,23 @@ import shutil
 import subprocess
 import threading
 import logging
-import uuid
 from typing import Optional
+from pathlib import Path
 
 import imageio_ffmpeg
 
 from app.config import get_settings
+from app.services.ffmpeg_utils import run_progress_process
+from app.services.worker_runtime import (
+    WorkerPoolState,
+    cancel_registered_job,
+    cleanup_paths,
+    enqueue_registered_job,
+    ensure_worker_pool,
+    get_registered_job,
+    new_job_id,
+    process_queued_job,
+)
 
 logger = logging.getLogger("EnhanceWorker")
 
@@ -21,8 +32,7 @@ CHUNK_DURATION = 60
 _jobs: dict[str, "EnhanceJob"] = {}
 _lock = threading.Lock()
 _task_queue: queue.Queue = queue.Queue()
-_pool_started = False
-_pool_lock = threading.Lock()
+_pool_state = WorkerPoolState()
 
 
 class EnhanceJob:
@@ -41,39 +51,58 @@ class _CancelledError(Exception):
     pass
 
 
+def _real_esrgan_install_message() -> str:
+    return (
+        "realesrgan-ncnn-vulkan not found. "
+        "Run ./setup.sh, or set REAL_ESRGAN_BIN "
+        "to the full path of the realesrgan-ncnn-vulkan executable."
+    )
+
+
+def _resolve_real_esrgan_bin(configured_path: str = "") -> Optional[str]:
+    if configured_path:
+        configured = Path(configured_path).expanduser()
+        if configured.is_file() and os.access(configured, os.X_OK):
+            return str(configured)
+
+    found = shutil.which("realesrgan-ncnn-vulkan")
+    if found:
+        return found
+
+    for candidate in (
+        "/opt/homebrew/bin/realesrgan-ncnn-vulkan",
+        "/usr/local/bin/realesrgan-ncnn-vulkan",
+    ):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    return None
+
+
 def _ensure_pool() -> None:
-    global _pool_started
-    with _pool_lock:
-        if _pool_started:
-            return
-        for i in range(MAX_WORKERS):
-            t = threading.Thread(target=_worker_loop, name=f"enhance-worker-{i}", daemon=True)
-            t.start()
-        _pool_started = True
-        logger.info(f"Enhance worker pool started ({MAX_WORKERS} workers)")
+    ensure_worker_pool(
+        _pool_state,
+        max_workers=MAX_WORKERS,
+        target=_worker_loop,
+        name_prefix="enhance-worker",
+        logger=logger,
+        label="Enhance",
+    )
 
 
 def _worker_loop() -> None:
-    from app.services.global_semaphore import global_job_semaphore
     while True:
         job_id = _task_queue.get()
         try:
-            job = _jobs.get(job_id)
-            if not job or job.status == "cancelled":
-                if job:
-                    try:
-                        os.remove(job.input_path)
-                    except OSError:
-                        pass
-                logger.info(f"[{job_id}] Skipped (cancelled before pickup)")
-                continue
-            global_job_semaphore.acquire()
-            try:
-                with _lock:
-                    job.status = "processing"
-                _process_job(job_id)
-            finally:
-                global_job_semaphore.release()
+            process_queued_job(
+                job_id=job_id,
+                jobs=_jobs,
+                lock=_lock,
+                logger=logger,
+                cleanup_cancelled=lambda job: cleanup_paths([job.input_path]) if job else None,
+                picked_message=lambda job: f"[{job.job_id}] Worker picked up enhance job",
+                process=lambda job: _process_job(job.job_id),
+            )
         except Exception as e:
             logger.error(f"Enhance worker loop error for {job_id}: {e}", exc_info=True)
         finally:
@@ -81,31 +110,18 @@ def _worker_loop() -> None:
 
 
 def get_job(job_id: str) -> Optional[EnhanceJob]:
-    with _lock:
-        return _jobs.get(job_id)
+    return get_registered_job(_jobs, _lock, job_id)
 
 
 def cancel_job(job_id: str) -> bool:
-    with _lock:
-        job = _jobs.get(job_id)
-        if not job or job.status in ("done", "failed", "cancelled"):
-            return False
-        job.status = "cancelled"
-        if job._proc:
-            try:
-                job._proc.kill()
-            except Exception:
-                pass
-    return True
+    return cancel_registered_job(_jobs, _lock, job_id)
 
 
 def start_enhance_job(input_path: str) -> str:
     _ensure_pool()
-    job_id = uuid.uuid4().hex
+    job_id = new_job_id()
     job = EnhanceJob(job_id=job_id, input_path=input_path)
-    with _lock:
-        _jobs[job_id] = job
-    _task_queue.put(job_id)
+    enqueue_registered_job(_jobs, _lock, _task_queue, job)
     logger.info(f"[{job_id}] Queued enhance job")
     return job_id
 
@@ -139,46 +155,18 @@ def _probe_video(input_path: str) -> tuple[float, float, int, int]:
 def _run_subprocess(job_id: str, cmd: list[str]) -> None:
     """Run cmd via Popen, store handle in job._proc. Raises _CancelledError or RuntimeError."""
     job = _jobs[job_id]
-    stderr_lines: list[str] = []
-
-    proc = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+    result = run_progress_process(
+        cmd=cmd,
+        job=job,
+        lock=_lock,
+        popen=subprocess.Popen,
     )
-    with _lock:
-        job._proc = proc
 
-    def _drain() -> None:
-        try:
-            for line in proc.stderr:
-                stderr_lines.append(line)
-        except Exception:
-            pass
-
-    t = threading.Thread(target=_drain, daemon=True)
-    t.start()
-    try:
-        for _ in proc.stdout:
-            pass
-    except Exception:
-        pass
-
-    proc.wait()
-    t.join(timeout=2)
-
-    with _lock:
-        job._proc = None
-        cancelled = job.status == "cancelled"
-
-    if cancelled:
+    if result.cancelled:
         raise _CancelledError()
-    if proc.returncode != 0:
+    if result.returncode != 0:
         raise RuntimeError(
-            f"Subprocess failed (rc={proc.returncode}): {''.join(stderr_lines[-5:])[-300:]}"
+            f"Subprocess failed (rc={result.returncode}): {result.stderr[-300:]}"
         )
 
 
@@ -194,13 +182,11 @@ def _process_job(job_id: str) -> None:
 
     try:
         # 1. Binary check
-        if not shutil.which("realesrgan-ncnn-vulkan"):
+        real_esrgan_bin = _resolve_real_esrgan_bin(settings.real_esrgan_bin)
+        if not real_esrgan_bin:
             with _lock:
                 job.status = "failed"
-                job.error = (
-                    "realesrgan-ncnn-vulkan not found. "
-                    "Install with: brew install realesrgan-ncnn-vulkan"
-                )
+                job.error = _real_esrgan_install_message()
             return
 
         # 2. Probe video metadata
@@ -276,7 +262,7 @@ def _process_job(job_id: str) -> None:
 
                 # b. AI upscale 4× with realesrgan-x4plus
                 _run_subprocess(job_id, [
-                    "realesrgan-ncnn-vulkan",
+                    real_esrgan_bin,
                     "-i", frames_dir,
                     "-o", enhanced_dir,
                     "-n", "realesrgan-x4plus",
@@ -344,11 +330,7 @@ def _process_job(job_id: str) -> None:
 
     except _CancelledError:
         logger.info(f"[{job_id}] Cancelled")
-        try:
-            if os.path.exists(out_path):
-                os.remove(out_path)
-        except OSError:
-            pass
+        cleanup_paths([out_path])
 
     except Exception as e:
         logger.error(f"[{job_id}] Process error: {e}", exc_info=True)
@@ -359,8 +341,4 @@ def _process_job(job_id: str) -> None:
 
     finally:
         shutil.rmtree(tmp_base, ignore_errors=True)
-        try:
-            if os.path.exists(job.input_path):
-                os.remove(job.input_path)
-        except OSError:
-            pass
+        cleanup_paths([job.input_path])

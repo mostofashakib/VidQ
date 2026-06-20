@@ -1,14 +1,11 @@
-import os
-import shutil
-import uuid
 import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.config import get_settings
 from app.routers.auth import verify_token
+from app.routers.upload_utils import save_upload_file
 from app.services.trim_worker import cancel_job, get_job, start_trim_job
 
 logger = logging.getLogger("TrimRouter")
@@ -34,23 +31,7 @@ async def start_trim(
     if start_time < 0 or end_time <= start_time:
         raise HTTPException(status_code=400, detail="start_time must be >= 0 and < end_time")
 
-    settings = get_settings()
-    os.makedirs(settings.temp_storage_dir, exist_ok=True)
-
-    ext = os.path.splitext(file.filename or "video.mp4")[1] or ".mp4"
-    filename = f"trim_in_{uuid.uuid4().hex}{ext}"
-    file_path = os.path.join(settings.temp_storage_dir, filename)
-
-    try:
-        with open(file_path, "wb") as f:
-            shutil.copyfileobj(file.file, f)
-    except Exception as e:
-        try:
-            os.remove(file_path)
-        except OSError:
-            pass
-        raise HTTPException(status_code=500, detail=f"File upload failed: {e}")
-
+    file_path, _ = save_upload_file(file, prefix="trim_in_")
     job_id = start_trim_job(file_path, start_time, end_time)
     logger.info(f"Trim queued: job_id={job_id} start={start_time} end={end_time}")
     return TrimJobOut(job_id=job_id, status="queued")

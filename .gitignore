@@ -6,6 +6,7 @@ temp_storage/
 videos.db
 .env
 backend/.venv/
+.uv-cache/
 **/__pycache__/
 .next/
 frontend/.next/

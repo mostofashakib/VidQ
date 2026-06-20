@@ -1,14 +1,11 @@
-import os
-import shutil
-import uuid
 import logging
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
-from app.config import get_settings
 from app.routers.auth import verify_token
+from app.routers.upload_utils import save_upload_files
 from app.services.combine_worker import cancel_job, get_job, start_combine_job
 
 logger = logging.getLogger("CombineRouter")
@@ -37,30 +34,7 @@ async def combine_video(
     if len(files) > 20:
         raise HTTPException(status_code=400, detail="Maximum 20 files allowed")
 
-    settings = get_settings()
-    os.makedirs(settings.temp_storage_dir, exist_ok=True)
-
-    saved_paths: list[str] = []
-    original_names: list[str] = []
-
-    try:
-        for file in files:
-            original_name = file.filename or "video.mp4"
-            ext = os.path.splitext(original_name)[1] or ".mp4"
-            filename = f"combine_in_{uuid.uuid4().hex}{ext}"
-            file_path = os.path.join(settings.temp_storage_dir, filename)
-            with open(file_path, "wb") as f:
-                shutil.copyfileobj(file.file, f)
-            saved_paths.append(file_path)
-            original_names.append(original_name)
-    except Exception as e:
-        for p in saved_paths:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        raise HTTPException(status_code=500, detail=f"File upload failed: {e}")
-
+    saved_paths, original_names = save_upload_files(files, prefix="combine_in_")
     job_id = start_combine_job(saved_paths, original_names)
     logger.info(f"Combine queued: job_id={job_id} clips={len(files)}")
     return CombineJobOut(

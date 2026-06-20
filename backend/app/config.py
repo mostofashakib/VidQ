@@ -18,6 +18,7 @@ class Settings:
         self.auth_enabled: bool = os.getenv("AUTH_ENABLED", "False").lower() in ("true", "1", "yes")
         # LLM provider selection: "ollama" | "openai" | "anthropic" | "openrouter" | "" (auto-fallback chain)
         self.llm_provider: str = os.getenv("LLM_PROVIDER", "ollama").lower().strip()
+        self.translate_llm_provider: str = os.getenv("TRANSLATE_LLM_PROVIDER", self.llm_provider).lower().strip()
         self.ollama_host: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
         self.ollama_model: str = os.getenv("OLLAMA_MODEL", "gemma4:26b")
 
@@ -33,6 +34,11 @@ class Settings:
         # Determine the temp storage directory path
         default_storage = str(Path(__file__).parent.parent / "temp_storage")
         self.temp_storage_dir: str = os.getenv("TEMP_STORAGE_DIR", default_storage)
+
+        # Real-ESRGAN ncnn executable used by the Enhance feature.
+        # Set this when the binary is installed outside PATH, for example:
+        # REAL_ESRGAN_BIN=/opt/homebrew/bin/realesrgan-ncnn-vulkan
+        self.real_esrgan_bin: str = os.getenv("REAL_ESRGAN_BIN", "").strip()
 
         # Base URL for generating self-referencing URLs (e.g. temp_storage links)
         self.base_url: str = os.getenv("BASE_URL", "http://localhost:8000")

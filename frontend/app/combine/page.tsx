@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
 import { useJobs, type CombineJobItem } from "../jobs-context";
+import { createLocalId, triggerFileDownload, useJobPolling } from "../job-utils";
 import {
   startCombineJob,
   getCombineJob,
@@ -51,22 +52,13 @@ export default function CombinePage() {
     if (!loading && !token) router.replace("/login");
   }, [token, loading, router]);
 
-  // Recovery polling: re-attach intervals for any jobs restored from localStorage.
-  useEffect(() => {
-    if (!token) return;
-    jobs.forEach((job) => {
-      if (
-        job.jobId &&
-        !pollRefs.current.has(job.localId) &&
-        job.data.status !== "done" &&
-        job.data.status !== "failed" &&
-        job.data.status !== "cancelled"
-      ) {
-        startPolling(job.localId, job.jobId);
-      }
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, jobs]);
+  const { updateJob, startPolling, removeJob, cancelLocalJob } = useJobPolling({
+    token,
+    jobs,
+    setJobs,
+    pollRefs,
+    getJob: getCombineJob,
+  });
 
   function handleFiles(incoming: FileList | null) {
     if (!incoming) return;
@@ -90,36 +82,12 @@ export default function CombinePage() {
     });
   }
 
-  function updateJob(localId: string, patch: Partial<CombineJobItem>) {
-    setJobs((prev) => prev.map((j) => j.localId === localId ? { ...j, ...patch } : j));
-  }
-
-  function startPolling(localId: string, jobId: string) {
-    const id = setInterval(async () => {
-      if (!token) return;
-      try {
-        const data = await getCombineJob(token, jobId);
-        updateJob(localId, { data });
-        if (data.status === "done" || data.status === "failed" || data.status === "cancelled") {
-          clearInterval(id);
-          pollRefs.current.delete(localId);
-          if (data.status === "cancelled") {
-            setJobs((prev) => prev.filter((j) => j.localId !== localId));
-          }
-        }
-      } catch {
-        // ignore transient poll errors
-      }
-    }, 2000);
-    pollRefs.current.set(localId, id);
-  }
-
   async function handleCombine() {
     if (!token || files.length < 2) return;
     setError("");
 
     const capturedFiles = [...files];
-    const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const localId = createLocalId();
     const label = `${capturedFiles.length} clips`;
 
     const initialData: CombineJobData = {
@@ -149,23 +117,16 @@ export default function CombinePage() {
   }
 
   function handleCancel(localId: string) {
-    const interval = pollRefs.current.get(localId);
-    if (interval) { clearInterval(interval); pollRefs.current.delete(localId); }
-    const job = jobs.find((j) => j.localId === localId);
-    if (job?.jobId && token) cancelCombineJob(token, job.jobId).catch(() => {});
-    setJobs((prev) => prev.filter((j) => j.localId !== localId));
+    cancelLocalJob(localId, cancelCombineJob);
   }
 
   function handleDownload(item: CombineJobItem) {
     if (!item.data.result_url) return;
-    const a = document.createElement("a");
-    a.href = item.data.result_url;
-    a.download = "combined_video.mp4";
-    a.click();
+    triggerFileDownload(item.data.result_url, "combined_video.mp4");
   }
 
   function handleDelete(localId: string) {
-    setJobs((prev) => prev.filter((j) => j.localId !== localId));
+    removeJob(localId);
   }
 
   if (loading) {

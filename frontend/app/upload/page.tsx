@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
 import { useJobs, type UploadJob } from "../jobs-context";
+import { downloadBlob, videoDownloadName } from "../job-utils";
 import {
   uploadVideo, getUploadJob, cancelUploadJob,
   listUploadedVideos, deleteVideo, deleteAllUploadVideos, downloadVideo,
@@ -244,17 +245,7 @@ export default function UploadPage() {
     for (const video of videos) {
       try {
         const blob = await downloadVideo(token!, video.id);
-        const blobUrl = window.URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = blobUrl;
-        const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
-        a.download = video.title
-          ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_720p.${ext}`
-          : `upload-${video.id}.${ext}`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        window.URL.revokeObjectURL(blobUrl);
+        downloadBlob(blob, videoDownloadName(video, "upload", "_720p"));
         await new Promise((r) => setTimeout(r, 400));
       } catch {
         // skip and continue
@@ -490,17 +481,7 @@ export default function UploadPage() {
                     e.stopPropagation();
                     try {
                       const blob = await downloadVideo(token!, video.id);
-                      const blobUrl = window.URL.createObjectURL(blob);
-                      const a = document.createElement("a");
-                      a.href = blobUrl;
-                      const ext = video.url.split(".").pop()?.split("?")[0] || "mp4";
-                      a.download = video.title
-                        ? `${video.title.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_720p.${ext}`
-                        : `upload-${video.id}.${ext}`;
-                      document.body.appendChild(a);
-                      a.click();
-                      document.body.removeChild(a);
-                      window.URL.revokeObjectURL(blobUrl);
+                      downloadBlob(blob, videoDownloadName(video, "upload", "_720p"));
                     } catch {
                       window.open(video.url, "_blank");
                     }
