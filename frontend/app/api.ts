@@ -244,3 +244,48 @@ export async function cancelTranslateJob(token: string, jobId: string): Promise<
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+// ── Trim ───────────────────────────────────────────────────────────────────
+
+export interface TrimJobData {
+  job_id: string;
+  status: string;
+  progress: number;
+  result_url?: string;
+  error?: string;
+}
+
+export async function startTrimJob(
+  token: string,
+  file: File,
+  startTime: number,
+  endTime: number,
+  onUploadProgress?: (percent: number) => void,
+): Promise<TrimJobData> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("start_time", String(startTime));
+  form.append("end_time", String(endTime));
+  const res = await axios.post(`${API_URL}/trim-video`, form, {
+    headers: { Authorization: `Bearer ${token}` },
+    onUploadProgress: (e) => {
+      if (onUploadProgress && e.total) {
+        onUploadProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    },
+  });
+  return res.data;
+}
+
+export async function getTrimJob(token: string, jobId: string): Promise<TrimJobData> {
+  const res = await axios.get(`${API_URL}/trim-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function cancelTrimJob(token: string, jobId: string): Promise<void> {
+  await axios.delete(`${API_URL}/trim-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
