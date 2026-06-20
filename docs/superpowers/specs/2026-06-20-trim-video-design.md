@@ -42,7 +42,7 @@ A new Trim page that lets users upload a video, select start and end times using
 
   00:00:04          00:01:32
 
-                  [ Trim ]
+          [ Preview ]  [ Trim ]
 ```
 
 - **Video player:** `<video>` with `src={objectUrl}` and native controls; `onLoadedMetadata` captures duration
@@ -54,6 +54,7 @@ A new Trim page that lets users upload a video, select start and end times using
   - Time input edit → updates slider handle
   - Set Start/End button → updates both slider and input
   - Start handle is always ≤ End handle
+- **Preview button:** Seeks video to `startTime`, plays, and automatically pauses when `currentTime >= endTime` (via `timeupdate` listener). Button label toggles to "Stop" while previewing; clicking Stop or reaching end time pauses playback.
 
 **Library** (below editor, always visible in phase 2):
 - Same polling/display pattern as other features
@@ -134,5 +135,4 @@ User drops file
 
 - Frame-accurate trim (requires re-encode; keyframe snap is acceptable)
 - Multiple trim segments in one pass
-- Preview of just the selected range before trimming
 - Waveform/thumbnail timeline
