@@ -289,3 +289,45 @@ export async function cancelTrimJob(token: string, jobId: string): Promise<void>
     headers: { Authorization: `Bearer ${token}` },
   });
 }
+
+// ── Enhance ────────────────────────────────────────────────────────────────
+
+export interface EnhanceJobData {
+  job_id: string;
+  status: string;
+  phase: string;
+  progress: number;
+  result_url?: string;
+  error?: string;
+}
+
+export async function startEnhanceJob(
+  token: string,
+  file: File,
+  onUploadProgress?: (percent: number) => void,
+): Promise<EnhanceJobData> {
+  const form = new FormData();
+  form.append("file", file);
+  const res = await axios.post(`${API_URL}/enhance-video`, form, {
+    headers: { Authorization: `Bearer ${token}` },
+    onUploadProgress: (e) => {
+      if (onUploadProgress && e.total) {
+        onUploadProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    },
+  });
+  return res.data;
+}
+
+export async function getEnhanceJob(token: string, jobId: string): Promise<EnhanceJobData> {
+  const res = await axios.get(`${API_URL}/enhance-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function cancelEnhanceJob(token: string, jobId: string): Promise<void> {
+  await axios.delete(`${API_URL}/enhance-jobs/${jobId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
