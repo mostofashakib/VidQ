@@ -1,13 +1,16 @@
 """
 Process-lifetime application state.
 
-Keeping the LLM manager as a true singleton ensures the provider memory
-(_working_provider_index) persists across all requests instead of being
+Keeping managers as true singletons ensures provider memory
+(_working_provider_index) persists across requests instead of being
 recreated on every Depends() call.
 """
 from app.config import get_settings
 from app.services.llm_manager import (
     OllamaProvider, OpenAIProvider, AnthropicProvider, OpenRouterProvider, FallbackLLMManager
+)
+from app.services.transcription import (
+    TranscriptionAdapter, FasterWhisperAdapter, WhisperOpenAIAdapter
 )
 
 _settings = get_settings()
@@ -23,3 +26,18 @@ if _settings.openrouter_api_key:
 # LLM_PROVIDER="" → auto-fallback chain across all configured providers
 # LLM_PROVIDER="ollama"/"openai"/"anthropic"/"openrouter" → lock to that provider
 llm_manager = FallbackLLMManager(_providers, default=_settings.llm_provider or None)
+
+# Translate uses the same local LLM instance as download
+translate_llm_manager = llm_manager
+
+
+def _build_transcription_adapter() -> TranscriptionAdapter:
+    provider = _settings.transcription_provider.lower()
+    if provider == "openai_whisper":
+        return WhisperOpenAIAdapter(api_key=_settings.openai_api_key, model=_settings.transcription_model)
+    return FasterWhisperAdapter(model=_settings.transcription_model, model_dir=_settings.whisper_model_dir)
+
+
+# Transcription adapter for the Translate feature
+# Controlled by TRANSCRIPTION_PROVIDER (faster_whisper | openai_whisper)
+transcription_adapter: TranscriptionAdapter = _build_transcription_adapter()

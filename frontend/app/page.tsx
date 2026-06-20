@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "./auth-context";
+import { useJobs, type DownloadJob } from "./jobs-context";
 import {
   addVideo,
   listVideos,
@@ -43,21 +44,6 @@ interface Video {
   thumbnail?: string;
 }
 
-interface DownloadJob {
-  localId: string;
-  url: string;
-  title?: string;
-  status: "extracting" | "adding" | "queued" | "processing" | "done" | "failed" | "cancelled";
-  message: string;
-  jobId?: string;
-  queuePosition?: number;
-  abortController?: AbortController;
-  phase?: string;               // pipeline phase from backend
-  recordingStartedAt?: number;  // ms timestamp when heavy_pass_recording began
-  downloadProgress?: number;    // 0-99 when ffmpeg download is running
-  recordingDuration?: number;   // progress target; detected video duration or recording cap
-  errorDetail?: string;         // raw error string when status === "failed"
-}
 
 function phaseMessage(phase?: string): string {
   switch (phase) {
@@ -149,7 +135,7 @@ export default function HomePage() {
   const [downloadingAll, setDownloadingAll] = useState(false);
   const loaderRef = useRef<HTMLDivElement | null>(null);
   const [fetching, setFetching] = useState(false);
-  const [downloads, setDownloads] = useState<DownloadJob[]>([]);
+  const { downloads, setDownloads } = useJobs();
   const downloadsRef = useRef<DownloadJob[]>([]);
 
   // Keep ref in sync so polling interval always sees latest state

@@ -50,6 +50,7 @@ def _ensure_pool() -> None:
 
 
 def _worker_loop() -> None:
+    from app.services.global_semaphore import global_job_semaphore
     while True:
         job_id, file_paths, filenames = _task_queue.get()
         try:
@@ -63,10 +64,16 @@ def _worker_loop() -> None:
                         pass
                 logger.info(f"[{job_id}] Skipped (cancelled before pickup)")
                 continue
-            with _lock:
-                job.status = "processing"
-            logger.info(f"[{job_id}] Worker picked up {len(file_paths)} clips")
-            _process_job(job_id, file_paths, filenames)
+
+            # Block here (job stays "queued") until a global slot is available.
+            global_job_semaphore.acquire()
+            try:
+                with _lock:
+                    job.status = "processing"
+                logger.info(f"[{job_id}] Worker picked up {len(file_paths)} clips")
+                _process_job(job_id, file_paths, filenames)
+            finally:
+                global_job_semaphore.release()
         except Exception as e:
             logger.error(f"Combine worker loop error for {job_id}: {e}", exc_info=True)
         finally:

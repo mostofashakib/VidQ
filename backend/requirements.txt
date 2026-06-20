@@ -10,3 +10,4 @@ httpx
 imageio
 imageio-ffmpeg
 yt-dlp
+faster-whisper

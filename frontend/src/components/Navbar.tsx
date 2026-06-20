@@ -6,8 +6,8 @@ import { useAuth } from "../../app/auth-context";
 import { Button } from "@/components/ui/button";
 
 const NAV_LINKS = [
-  { href: "/", label: "Library" },
-  { href: "/upload", label: "Upload" },
+  { href: "/", label: "Download" },
+  { href: "/upload", label: "Convert" },
   { href: "/combine", label: "Combine" },
   { href: "/translate", label: "Translate" },
 ];

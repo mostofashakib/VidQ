@@ -164,9 +164,13 @@ class VideoQueue:
             thread.start()
 
     def _thread_entry(self, job: RecordingJob, thread_index: int) -> None:
+        from app.services.global_semaphore import global_job_semaphore
+        # Block here (job stays "queued") until a global slot is available.
+        global_job_semaphore.acquire()
         try:
             self._process(job, thread_index=thread_index)
         finally:
+            global_job_semaphore.release()
             with self._lock:
                 self._active_count = max(0, self._active_count - 1)
                 logger.info(

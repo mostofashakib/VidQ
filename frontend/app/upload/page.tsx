@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
+import { useJobs, type UploadJob } from "../jobs-context";
 import {
   uploadVideo, getUploadJob, cancelUploadJob,
   listUploadedVideos, deleteVideo, deleteAllUploadVideos, downloadVideo,
@@ -27,16 +28,6 @@ interface UploadedVideo {
   created_at: string;
 }
 
-interface UploadJob {
-  localId: string;
-  filename: string;
-  /** uploading = HTTP transfer; queued = waiting for a worker slot; processing = ffmpeg running */
-  status: "uploading" | "queued" | "processing" | "done" | "failed" | "cancelled";
-  message: string;
-  progress: number;
-  scaleProgress?: number;
-  jobId?: string;
-}
 
 function isWebmFilename(filename: string): boolean {
   return filename.toLowerCase().endsWith(".webm");
@@ -52,7 +43,6 @@ export default function UploadPage() {
   const router = useRouter();
 
   const [videos, setVideos] = useState<UploadedVideo[]>([]);
-  const [jobs, setJobs] = useState<UploadJob[]>([]);
   const [error, setError] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
   const [showDialog, setShowDialog] = useState(false);
@@ -61,10 +51,7 @@ export default function UploadPage() {
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Maps localId → abort function for the current phase
-  const abortRefs = useRef<Map<string, () => void>>(new Map());
-  // Maps localId → polling interval id
-  const pollRefs = useRef<Map<string, ReturnType<typeof setInterval>>>(new Map());
+  const { uploadJobs: jobs, setUploadJobs: setJobs, uploadPollRefs: pollRefs, uploadAbortRefs: abortRefs } = useJobs();
 
   useEffect(() => {
     if (!loading && !token) router.replace("/login");
@@ -77,12 +64,23 @@ export default function UploadPage() {
       .catch(() => setError("Failed to load uploaded videos"));
   }, [token]);
 
-  // Clean up polling intervals on unmount
+  // Recovery polling: re-attach intervals for jobs restored from localStorage.
   useEffect(() => {
-    return () => {
-      pollRefs.current.forEach((id) => clearInterval(id));
-    };
-  }, []);
+    if (!token) return;
+    jobs.forEach((job) => {
+      if (
+        job.jobId &&
+        !pollRefs.current.has(job.localId) &&
+        job.status !== "done" &&
+        job.status !== "failed" &&
+        job.status !== "cancelled"
+      ) {
+        startPolling(job.localId, job.jobId);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, jobs]);
+
 
   function formatDuration(seconds?: number) {
     if (!seconds || isNaN(seconds)) return "Unknown";
@@ -287,7 +285,8 @@ export default function UploadPage() {
 
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
         {/* Drop zone */}
-        <div className="glass-panel p-6 md:p-8 rounded-4xl mb-8 shadow-2xl shadow-purple-500/5">
+        <div className="max-w-3xl mx-auto mb-8">
+        <div className="glass-panel p-6 md:p-8 rounded-4xl shadow-2xl shadow-purple-500/5">
           <div
             onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
             onDragLeave={() => setDragging(false)}
@@ -313,6 +312,7 @@ export default function UploadPage() {
               onChange={onInputChange}
             />
           </div>
+        </div>
         </div>
 
         {error && <div className="text-red-400 mb-4">{error}</div>}

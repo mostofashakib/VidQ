@@ -54,6 +54,7 @@ def _ensure_pool() -> None:
 
 
 def _worker_loop() -> None:
+    from app.services.global_semaphore import global_job_semaphore
     while True:
         job_id, file_path, original_name = _task_queue.get()
         try:
@@ -66,10 +67,16 @@ def _worker_loop() -> None:
                     pass
                 logger.info(f"[{job_id}] Skipped (cancelled before pickup)")
                 continue
-            with _lock:
-                job.status = "processing"
-            logger.info(f"[{job_id}] Worker picked up {original_name}")
-            _process_job(job_id, file_path, original_name)
+
+            # Block here (job stays "queued") until a global slot is available.
+            global_job_semaphore.acquire()
+            try:
+                with _lock:
+                    job.status = "processing"
+                logger.info(f"[{job_id}] Worker picked up {original_name}")
+                _process_job(job_id, file_path, original_name)
+            finally:
+                global_job_semaphore.release()
         except Exception as e:
             logger.error(f"Translate worker loop error for {job_id}: {e}", exc_info=True)
         finally:
@@ -320,7 +327,7 @@ def _burn_subtitles(
 
 
 def _process_job(job_id: str, file_path: str, original_name: str) -> None:
-    from app.state import llm_manager
+    from app.state import transcription_adapter, translate_llm_manager
 
     job = _jobs[job_id]
     settings = get_settings()
@@ -349,27 +356,16 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
         with _lock:
             job.overall_progress = 5
 
-        # Phase 2: Whisper transcription
+        # Phase 2: Transcription (adapter-driven: openai_whisper | local_whisper)
         with _lock:
             job.phase = "transcribing"
             job.overall_progress = 10
 
-        logger.info(f"[{job_id}] Transcribing with Whisper...")
+        logger.info(f"[{job_id}] Transcribing via {transcription_adapter.__class__.__name__}")
         try:
-            from openai import OpenAI
-            client = OpenAI(api_key=settings.openai_api_key)
-            with open(audio_path, "rb") as audio_file:
-                transcript = client.audio.transcriptions.create(
-                    file=audio_file,
-                    model="whisper-1",
-                    response_format="verbose_json",
-                )
-            segments = [
-                {"start": seg.start, "end": seg.end, "text": seg.text}
-                for seg in transcript.segments
-            ]
+            segments = transcription_adapter.transcribe(audio_path)
         except Exception as e:
-            logger.error(f"[{job_id}] Whisper failed: {e}")
+            logger.error(f"[{job_id}] Transcription failed: {e}")
             with _lock:
                 job.status = "failed"
                 job.error = f"Transcription failed: {e}"
@@ -403,7 +399,7 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
 
             prompt = _build_translation_prompt(chunk, i + 1, total_chunks)
             try:
-                result = asyncio.run(llm_manager.execute_translate(prompt))
+                result = asyncio.run(translate_llm_manager.execute_translate(prompt))
                 translated_chunks.append(result)
             except Exception as e:
                 logger.error(f"[{job_id}] Translation chunk {i+1} failed: {e}")

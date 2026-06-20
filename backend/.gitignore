@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+temp_storage/
+videos.db
+models/

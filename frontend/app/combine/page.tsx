@@ -1,19 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
-import { startCombineJob, getCombineJob, cancelCombineJob, CombineJobData } from "../api";
+import { useJobs, type CombineJobItem } from "../jobs-context";
+import {
+  startCombineJob,
+  getCombineJob,
+  cancelCombineJob,
+  CombineJobData,
+} from "../api";
 import { Button } from "@/components/ui/button";
-import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
-import { Loader2, Upload, X, Check, Download, Film } from "lucide-react";
+import { Loader2, X, Check, Download, Film, Clock, Ban, ChevronUp, ChevronDown, Trash2 } from "lucide-react";
 import Navbar from "@/components/Navbar";
 
-interface JobState {
-  jobId: string;
-  data: CombineJobData;
-  uploadProgress: number;
-}
 
 function phaseLabel(phase: string, data: CombineJobData): string {
   switch (phase) {
@@ -26,105 +26,147 @@ function phaseLabel(phase: string, data: CombineJobData): string {
   }
 }
 
+function statusMessage(item: CombineJobItem): string {
+  if (item.jobId === "") {
+    return item.uploadProgress < 100 ? `Uploading… ${item.uploadProgress}%` : "Waiting for server…";
+  }
+  const { data } = item;
+  if (data.status === "queued") return "Waiting for worker…";
+  if (data.status === "processing") return phaseLabel(data.phase, data);
+  if (data.status === "done") return "Done!";
+  if (data.status === "failed") return data.error || "Failed";
+  return "Processing…";
+}
+
 export default function CombinePage() {
-  const { token, loading, authEnabled } = useAuth();
+  const { token, loading } = useAuth();
   const router = useRouter();
 
   const [files, setFiles] = useState<File[]>([]);
   const [dragging, setDragging] = useState(false);
-  const [job, setJob] = useState<JobState | null>(null);
   const [error, setError] = useState("");
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const { combineJobs: jobs, setCombineJobs: setJobs, combinePollRefs: pollRefs } = useJobs();
 
   useEffect(() => {
     if (!loading && !token) router.replace("/login");
   }, [token, loading, router]);
 
+  // Recovery polling: re-attach intervals for any jobs restored from localStorage.
   useEffect(() => {
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, []);
+    if (!token) return;
+    jobs.forEach((job) => {
+      if (
+        job.jobId &&
+        !pollRefs.current.has(job.localId) &&
+        job.data.status !== "done" &&
+        job.data.status !== "failed" &&
+        job.data.status !== "cancelled"
+      ) {
+        startPolling(job.localId, job.jobId);
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, jobs]);
 
-  const handleFiles = useCallback((incoming: FileList | null) => {
+  function handleFiles(incoming: FileList | null) {
     if (!incoming) return;
     const videoFiles = Array.from(incoming).filter((f) => f.type.startsWith("video/"));
-    if (videoFiles.length === 0) {
-      setError("Please select video files only.");
-      return;
-    }
+    if (videoFiles.length === 0) { setError("Please drop video files only."); return; }
     setError("");
     setFiles((prev) => [...prev, ...videoFiles]);
-  }, []);
+  }
 
   function removeFile(index: number) {
     setFiles((prev) => prev.filter((_, i) => i !== index));
   }
 
-  function startPolling(jobId: string) {
-    if (pollRef.current) clearInterval(pollRef.current);
-    pollRef.current = setInterval(async () => {
+  function moveFile(index: number, direction: -1 | 1) {
+    setFiles((prev) => {
+      const next = [...prev];
+      const target = index + direction;
+      if (target < 0 || target >= next.length) return prev;
+      [next[index], next[target]] = [next[target], next[index]];
+      return next;
+    });
+  }
+
+  function updateJob(localId: string, patch: Partial<CombineJobItem>) {
+    setJobs((prev) => prev.map((j) => j.localId === localId ? { ...j, ...patch } : j));
+  }
+
+  function startPolling(localId: string, jobId: string) {
+    const id = setInterval(async () => {
       if (!token) return;
       try {
         const data = await getCombineJob(token, jobId);
-        setJob((prev) => prev ? { ...prev, data } : null);
+        updateJob(localId, { data });
         if (data.status === "done" || data.status === "failed" || data.status === "cancelled") {
-          clearInterval(pollRef.current!);
-          pollRef.current = null;
+          clearInterval(id);
+          pollRefs.current.delete(localId);
+          if (data.status === "cancelled") {
+            setJobs((prev) => prev.filter((j) => j.localId !== localId));
+          }
         }
       } catch {
-        // ignore transient errors
+        // ignore transient poll errors
       }
     }, 2000);
+    pollRefs.current.set(localId, id);
   }
 
   async function handleCombine() {
     if (!token || files.length < 2) return;
     setError("");
-    setJob(null);
+
+    const capturedFiles = [...files];
+    const localId = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const label = `${capturedFiles.length} clips`;
+
+    const initialData: CombineJobData = {
+      job_id: "",
+      status: "queued",
+      phase: "uploading",
+      overall_progress: 0,
+      clip_index: 0,
+      total_clips: capturedFiles.length,
+    };
+
+    setJobs((prev) => [...prev, { localId, label, uploadProgress: 0, jobId: "", data: initialData }]);
+    setFiles([]);
 
     try {
       const data = await startCombineJob(
         token,
-        files,
-        (pct) => setJob((prev) => prev ? { ...prev, uploadProgress: pct } : {
-          jobId: "",
-          data: { job_id: "", status: "uploading", phase: "uploading", overall_progress: 0, clip_index: 0, total_clips: files.length },
-          uploadProgress: pct,
-        }),
+        capturedFiles,
+        (pct) => updateJob(localId, { uploadProgress: pct }),
       );
-      setJob({ jobId: data.job_id, data, uploadProgress: 100 });
-      startPolling(data.job_id);
+      updateJob(localId, { jobId: data.job_id, data, uploadProgress: 100 });
+      startPolling(localId, data.job_id);
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "Combine failed";
-      setError(msg);
+      updateJob(localId, { data: { ...initialData, status: "failed", error: msg } });
     }
   }
 
-  async function handleCancel() {
-    if (!token || !job) return;
-    try {
-      await cancelCombineJob(token, job.jobId);
-      if (pollRef.current) clearInterval(pollRef.current);
-      setJob(null);
-      setFiles([]);
-    } catch {
-      // ignore
-    }
+  function handleCancel(localId: string) {
+    const interval = pollRefs.current.get(localId);
+    if (interval) { clearInterval(interval); pollRefs.current.delete(localId); }
+    const job = jobs.find((j) => j.localId === localId);
+    if (job?.jobId && token) cancelCombineJob(token, job.jobId).catch(() => {});
+    setJobs((prev) => prev.filter((j) => j.localId !== localId));
   }
 
-  function handleDownload() {
-    if (!job?.data.result_url) return;
+  function handleDownload(item: CombineJobItem) {
+    if (!item.data.result_url) return;
     const a = document.createElement("a");
-    a.href = job.data.result_url;
+    a.href = item.data.result_url;
     a.download = "combined_video.mp4";
     a.click();
   }
 
-  const isDone = job?.data.status === "done";
-  const isFailed = job?.data.status === "failed";
-  const isProcessing = job && !isDone && !isFailed && job.data.status !== "cancelled";
+  function handleDelete(localId: string) {
+    setJobs((prev) => prev.filter((j) => j.localId !== localId));
+  }
 
   if (loading) {
     return (
@@ -139,167 +181,207 @@ export default function CombinePage() {
       <Navbar />
 
       <div className="max-w-3xl mx-auto px-4 sm:px-6">
-        <Card className="glass-panel rounded-4xl border-white/10 shadow-2xl shadow-purple-500/5 mb-8">
-          <CardHeader>
-            <CardTitle className="text-white flex items-center gap-2">
-              <Film className="w-5 h-5 text-indigo-400" />
-              Combine Videos
-            </CardTitle>
-            <p className="text-gray-400 text-sm">
-              Drop 2 or more video files. They&apos;ll be merged in order with smooth crossfade transitions and exported as a single 720p MP4.
+        {/* Drop zone — drag only, matches Convert style */}
+        <div className="glass-panel p-6 md:p-8 rounded-4xl mb-6 shadow-2xl shadow-purple-500/5">
+          <div
+            onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(e) => { e.preventDefault(); setDragging(false); handleFiles(e.dataTransfer.files); }}
+            className={`border-2 border-dashed rounded-3xl flex flex-col items-center justify-center gap-3 py-16 transition-all duration-300 ${
+              dragging
+                ? "border-indigo-400 bg-indigo-500/10"
+                : "border-white/10 hover:border-indigo-500/50 hover:bg-white/5"
+            }`}
+          >
+            <div className="w-14 h-14 rounded-full bg-indigo-500/15 flex items-center justify-center">
+              <Film className="w-6 h-6 text-indigo-400" />
+            </div>
+            <p className="text-white font-medium">Drop 2 or more video clips here</p>
+            <p className="text-gray-400 text-sm">Clips merge into a single 720p MP4 with crossfade transitions</p>
+          </div>
+        </div>
+
+        {/* Pending file list + combine button */}
+        {files.length > 0 && (
+          <div className="glass-panel p-4 rounded-3xl mb-6 space-y-3">
+            <p className="text-sm text-gray-400 px-1">
+              {files.length} file{files.length !== 1 ? "s" : ""} selected — drag to reorder or use arrows
             </p>
-          </CardHeader>
-          <CardContent className="space-y-6">
-            {/* Drop zone */}
-            {!isProcessing && !isDone && (
-              <div
-                onDragOver={(e) => { e.preventDefault(); setDragging(true); }}
-                onDragLeave={() => setDragging(false)}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  setDragging(false);
-                  handleFiles(e.dataTransfer.files);
-                }}
-                onClick={() => fileInputRef.current?.click()}
-                className={`border-2 border-dashed rounded-2xl p-10 text-center cursor-pointer transition-all ${
-                  dragging
-                    ? "border-indigo-400 bg-indigo-500/10"
-                    : "border-white/20 hover:border-indigo-400/50 hover:bg-white/5"
-                }`}
-              >
-                <Upload className="mx-auto mb-3 w-8 h-8 text-indigo-400 opacity-70" />
-                <p className="text-gray-300 text-sm">
-                  Drag &amp; drop video files here, or <span className="text-indigo-400 underline">browse</span>
-                </p>
-                <p className="text-gray-500 text-xs mt-1">Select multiple files at once</p>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="video/*"
-                  multiple
-                  className="hidden"
-                  onChange={(e) => handleFiles(e.target.files)}
-                />
-              </div>
-            )}
-
-            {/* File list */}
-            {files.length > 0 && !isProcessing && !isDone && (
-              <div className="space-y-2">
-                <p className="text-sm text-gray-400">{files.length} file{files.length > 1 ? "s" : ""} selected</p>
-                {files.map((f, i) => (
-                  <div
-                    key={i}
-                    className="glass-panel px-4 py-3 rounded-xl flex items-center justify-between gap-3"
+            {files.map((f, i) => (
+              <div key={i} className="flex items-center gap-2 px-1">
+                <span className="text-xs text-gray-600 w-5 text-right shrink-0">{i + 1}</span>
+                <div className="flex flex-col shrink-0">
+                  <button
+                    onClick={() => moveFile(i, -1)}
+                    disabled={i === 0}
+                    className="text-gray-600 hover:text-indigo-400 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
                   >
-                    <div className="flex items-center gap-3 min-w-0">
-                      <Film className="w-4 h-4 text-indigo-400 shrink-0" />
-                      <span className="text-sm text-gray-200 truncate">{f.name}</span>
-                      <span className="text-xs text-gray-500 shrink-0">
-                        {(f.size / 1024 / 1024).toFixed(1)} MB
-                      </span>
-                    </div>
-                    <button
-                      onClick={() => removeFile(i)}
-                      className="text-gray-500 hover:text-red-400 transition-colors shrink-0"
-                    >
-                      <X className="w-4 h-4" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {error && (
-              <p className="text-red-400 text-sm">{error}</p>
-            )}
-
-            {/* Processing progress */}
-            {isProcessing && job && (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between text-sm">
-                  <span className="text-gray-300">
-                    {job.data.status === "uploading" || job.uploadProgress < 100
-                      ? `Uploading… ${job.uploadProgress}%`
-                      : job.data.status === "queued"
-                      ? "Queued, waiting for worker…"
-                      : phaseLabel(job.data.phase, job.data)}
+                    <ChevronUp className="w-3 h-3" />
+                  </button>
+                  <button
+                    onClick={() => moveFile(i, 1)}
+                    disabled={i === files.length - 1}
+                    className="text-gray-600 hover:text-indigo-400 disabled:opacity-20 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <ChevronDown className="w-3 h-3" />
+                  </button>
+                </div>
+                <div className="flex items-center gap-3 min-w-0 flex-1">
+                  <Film className="w-4 h-4 text-indigo-400 shrink-0" />
+                  <span className="text-sm text-gray-200 truncate">{f.name}</span>
+                  <span className="text-xs text-gray-500 shrink-0">
+                    {(f.size / 1024 / 1024).toFixed(1)} MB
                   </span>
-                  <span className="text-gray-500">{job.data.overall_progress}%</span>
                 </div>
-                <div className="h-2 bg-white/10 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-linear-to-r from-indigo-500 to-purple-500 rounded-full transition-all duration-500"
-                    style={{ width: `${job.uploadProgress < 100 ? job.uploadProgress : job.data.overall_progress}%` }}
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCancel}
-                  className="border-white/10 bg-transparent hover:bg-red-500/10 hover:text-red-400 hover:border-red-500/30 text-gray-400 rounded-xl"
+                <button
+                  onClick={() => removeFile(i)}
+                  className="text-gray-500 hover:text-red-400 transition-colors shrink-0"
                 >
-                  <X className="w-3 h-3 mr-1" /> Cancel
-                </Button>
+                  <X className="w-4 h-4" />
+                </button>
               </div>
+            ))}
+            {files.length === 1 && (
+              <p className="text-center text-gray-500 text-sm py-1">Add at least one more video to combine.</p>
             )}
-
-            {/* Done */}
-            {isDone && (
-              <div className="space-y-4">
-                <div className="flex items-center gap-2 text-green-400">
-                  <Check className="w-5 h-5" />
-                  <span className="text-sm font-medium">Combine complete!</span>
-                </div>
+            {files.length >= 2 && (
+              <>
                 <Button
-                  onClick={handleDownload}
-                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl"
+                  onClick={handleCombine}
+                  className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl mt-2"
                 >
-                  <Download className="w-4 h-4 mr-2" /> Download Combined Video
+                  <Film className="w-4 h-4 mr-2" />
+                  Combine {files.length} Videos
                 </Button>
-                <Button
-                  variant="outline"
-                  onClick={() => { setJob(null); setFiles([]); }}
-                  className="w-full border-white/10 bg-transparent hover:bg-white/5 text-gray-300 rounded-xl"
-                >
-                  Combine more videos
-                </Button>
-              </div>
-            )}
-
-            {/* Failed */}
-            {isFailed && (
-              <div className="space-y-3">
-                <p className="text-red-400 text-sm">
-                  Combine failed: {job?.data.error || "Unknown error"}
+                <p className="text-center text-gray-600 text-xs pt-1">
+                  After submitting, drop more clips above to start another job
                 </p>
-                <Button
-                  variant="outline"
-                  onClick={() => { setJob(null); setFiles([]); setError(""); }}
-                  className="border-white/10 bg-transparent hover:bg-white/5 text-gray-300 rounded-xl"
+              </>
+            )}
+          </div>
+        )}
+
+        {error && <p className="text-red-400 text-sm mb-4">{error}</p>}
+
+        {/* Job queue list */}
+        {jobs.length > 0 && (
+          <div className="space-y-2.5">
+            {jobs.map((item) => {
+              const visualStatus = item.jobId === "" ? "uploading" : item.data.status;
+              const isDone = visualStatus === "done";
+              const isFailed = visualStatus === "failed";
+              const isQueued = visualStatus === "queued";
+              const isActive = !isDone && !isFailed && visualStatus !== "cancelled";
+
+              return (
+                <div
+                  key={item.localId}
+                  className={`glass-panel px-5 py-4 rounded-2xl border flex items-center gap-4 transition-all ${
+                    isDone
+                      ? "border-green-500/25"
+                      : isFailed
+                      ? "border-red-500/25"
+                      : "border-indigo-500/20"
+                  }`}
                 >
-                  Try again
-                </Button>
-              </div>
-            )}
+                  <div className="shrink-0">
+                    {isDone ? (
+                      <div className="w-8 h-8 rounded-full bg-green-500/15 flex items-center justify-center">
+                        <Check className="w-4 h-4 text-green-400" />
+                      </div>
+                    ) : isFailed ? (
+                      <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
+                        <X className="w-4 h-4 text-red-400" />
+                      </div>
+                    ) : isQueued ? (
+                      <div className="w-8 h-8 rounded-full bg-yellow-500/15 flex items-center justify-center">
+                        <Clock className="w-4 h-4 text-yellow-400" />
+                      </div>
+                    ) : (
+                      <div className="w-8 h-8 rounded-full bg-indigo-500/15 flex items-center justify-center">
+                        <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
+                      </div>
+                    )}
+                  </div>
 
-            {/* Combine button */}
-            {!isProcessing && !isDone && files.length >= 2 && (
-              <Button
-                onClick={handleCombine}
-                disabled={files.length < 2}
-                className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl disabled:opacity-40"
-              >
-                <Film className="w-4 h-4 mr-2" />
-                Combine {files.length} Videos
-              </Button>
-            )}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-medium text-white truncate">{item.label}</p>
+                    <p
+                      className={`text-xs mt-0.5 ${
+                        isDone
+                          ? "text-green-400"
+                          : isFailed
+                          ? "text-red-400"
+                          : isQueued
+                          ? "text-yellow-400"
+                          : "text-indigo-400"
+                      }`}
+                    >
+                      {statusMessage(item)}
+                    </p>
+                    {isActive && (
+                      <div className="mt-2 h-1 bg-white/5 rounded-full overflow-hidden">
+                        {item.jobId === "" ? (
+                          <div
+                            className="h-full bg-indigo-500 rounded-full transition-all duration-300"
+                            style={{ width: `${item.uploadProgress}%` }}
+                          />
+                        ) : item.data.overall_progress > 0 ? (
+                          <div
+                            className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+                            style={{ width: `${item.data.overall_progress}%` }}
+                          />
+                        ) : isQueued ? (
+                          <div className="h-full rounded-full animate-pulse w-full bg-yellow-500/60" />
+                        ) : (
+                          <div className="h-full w-full bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0 animate-pulse rounded-full" />
+                        )}
+                      </div>
+                    )}
+                  </div>
 
-            {!isProcessing && !isDone && files.length === 1 && (
-              <p className="text-center text-gray-500 text-sm">Add at least one more video to combine.</p>
-            )}
-          </CardContent>
-        </Card>
+                  <div className="flex items-center gap-2 shrink-0">
+                    {isDone && (
+                      <button
+                        title="Download"
+                        onClick={() => handleDownload(item)}
+                        className="h-8 w-8 flex items-center justify-center rounded-full bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500 hover:text-white border border-indigo-500/20 transition-all"
+                      >
+                        <Download className="w-4 h-4" />
+                      </button>
+                    )}
+                    {isDone && (
+                      <button
+                        title="Delete"
+                        onClick={() => handleDelete(item.localId)}
+                        className="h-8 w-8 flex items-center justify-center rounded-full bg-red-500/10 text-red-400 hover:bg-red-500 hover:text-white border border-red-500/20 transition-all"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                      </button>
+                    )}
+                    {isActive && (
+                      <button
+                        title="Cancel"
+                        onClick={() => handleCancel(item.localId)}
+                        className="text-gray-500 hover:text-red-400 transition-colors"
+                      >
+                        <Ban className="w-4 h-4" />
+                      </button>
+                    )}
+                    {isFailed && (
+                      <button
+                        onClick={() => handleDelete(item.localId)}
+                        className="text-gray-500 hover:text-white transition-colors"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
     </div>
   );

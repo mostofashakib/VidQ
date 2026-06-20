@@ -20,7 +20,16 @@ class Settings:
         self.llm_provider: str = os.getenv("LLM_PROVIDER", "ollama").lower().strip()
         self.ollama_host: str = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434")
         self.ollama_model: str = os.getenv("OLLAMA_MODEL", "gemma4:26b")
-        
+
+        # Transcription adapter for the Translate feature
+        # Options: faster_whisper (default, local) | openai_whisper
+        self.transcription_provider: str = os.getenv("TRANSCRIPTION_PROVIDER", "faster_whisper")
+        self.transcription_model: str = os.getenv("TRANSCRIPTION_MODEL", "large-v3-turbo")
+        # Local directory where faster-whisper stores downloaded model weights.
+        # Model is downloaded once on first use; every subsequent restart loads from disk.
+        default_model_dir = str(Path(__file__).parent.parent / "models" / "whisper")
+        self.whisper_model_dir: str = os.getenv("WHISPER_MODEL_DIR", default_model_dir)
+
         # Determine the temp storage directory path
         default_storage = str(Path(__file__).parent.parent / "temp_storage")
         self.temp_storage_dir: str = os.getenv("TEMP_STORAGE_DIR", default_storage)
