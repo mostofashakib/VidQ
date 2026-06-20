@@ -8,6 +8,7 @@ from app.routers.upload import router as upload_router
 from app.routers.combine import router as combine_router
 from app.routers.translate import router as translate_router
 from app.routers.trim import router as trim_router
+from app.routers.enhance import router as enhance_router
 from app.config import get_settings
 
 configure_logging()
@@ -38,3 +39,4 @@ app.include_router(upload_router)
 app.include_router(combine_router)
 app.include_router(translate_router)
 app.include_router(trim_router)
+app.include_router(enhance_router)
