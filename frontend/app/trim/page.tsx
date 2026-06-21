@@ -11,6 +11,7 @@ import {
   Loader2, X, Check, Download, Scissors, Clock, Ban, Trash2, Play, Pause,
 } from "lucide-react";
 import Navbar from "@/components/Navbar";
+import ResultVideoPlayer from "@/components/ResultVideoPlayer";
 
 function formatTime(seconds: number): string {
   const h = Math.floor(seconds / 3600);
@@ -217,7 +218,8 @@ export default function TrimPage() {
 
   function handleDownload(item: TrimJobItem) {
     if (!item.data.result_url) return;
-    triggerFileDownload(item.data.result_url, `trimmed_${item.filename}`);
+    void triggerFileDownload(item.data.result_url, `trimmed_${item.filename}`)
+      .catch(() => setError("Failed to download trimmed video."));
   }
 
   function handleDelete(localId: string) {
@@ -476,6 +478,9 @@ export default function TrimPage() {
                           <div className="h-full w-full bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0 animate-pulse rounded-full" />
                         )}
                       </div>
+                    )}
+                    {isDone && item.data.result_url && (
+                      <ResultVideoPlayer src={item.data.result_url} title={item.filename} />
                     )}
                   </div>
 

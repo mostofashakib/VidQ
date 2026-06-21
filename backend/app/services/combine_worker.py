@@ -9,7 +9,6 @@ import imageio_ffmpeg
 
 from app.config import get_settings
 from app.services.ffmpeg_utils import output_file_is_valid, probe_duration, run_progress_process
-from app.services.video_utils import ensure_min_quality, probe_video_dimensions
 from app.services.worker_runtime import (
     WorkerPoolState,
     cancel_registered_job,
@@ -97,14 +96,49 @@ def _probe_duration(path: str) -> Optional[float]:
     return probe_duration(path)
 
 
+def _combine_fade_duration(durations: list[float], preferred: float = 0.5) -> float:
+    positive_durations = [duration for duration in durations if duration > 0]
+    if not positive_durations:
+        return preferred
+    shortest = min(positive_durations)
+    return max(0.05, min(preferred, shortest / 3))
+
+
+def _scale_to_720p_filter(input_label: str, output_label: str) -> str:
+    return (
+        f"{input_label}"
+        "scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,"
+        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
+        "setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,fps=30"
+        f"{output_label}"
+    )
+
+
 def _build_xfade_filter(durations: list[float], fade_duration: float = 0.5) -> tuple[str, str]:
     """Return (video_filter, audio_filter) strings for N clips with xfade transitions."""
     n = len(durations)
-    if n == 1:
-        return "[0:v]null[vout]", "[0:a]anull[aout]"
+    normalized_video_parts = [
+        _scale_to_720p_filter(f"[{i}:v]", f"[v{i}]")
+        for i in range(n)
+    ]
+    normalized_audio_parts = [
+        (
+            f"[{i}:a]"
+            "aformat=sample_rates=48000:channel_layouts=stereo,"
+            "asetpts=PTS-STARTPTS"
+            f"[a{i}]"
+        )
+        for i in range(n)
+    ]
 
-    video_parts = []
-    audio_parts = []
+    if n == 1:
+        return (
+            ";".join([*normalized_video_parts, "[v0]null[vout]"]),
+            ";".join([*normalized_audio_parts, "[a0]anull[aout]"]),
+        )
+
+    video_parts = [*normalized_video_parts]
+    audio_parts = [*normalized_audio_parts]
     cumulative = 0.0
 
     for i in range(n - 1):
@@ -112,11 +146,11 @@ def _build_xfade_filter(durations: list[float], fade_duration: float = 0.5) -> t
         cumulative += durations[i]
 
         if i == 0:
-            v_in = "[0:v][1:v]"
-            a_in = "[0:a][1:a]"
+            v_in = "[v0][v1]"
+            a_in = "[a0][a1]"
         else:
-            v_in = f"[vx{i}][{i+1}:v]"
-            a_in = f"[ax{i}][{i+1}:a]"
+            v_in = f"[vx{i}][v{i+1}]"
+            a_in = f"[ax{i}][a{i+1}]"
 
         v_out = "[vout]" if i == n - 2 else f"[vx{i+1}]"
         a_out = "[aout]" if i == n - 2 else f"[ax{i+1}]"
@@ -135,15 +169,13 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
     job = _jobs[job_id]
     settings = get_settings()
     total = len(file_paths)
-    temp_files_to_clean: list[str] = []
 
     try:
-        # Phase 1: Normalize all clips to 720p
+        # Phase 1: Register clips and keep source files for a single high-quality ffmpeg pass.
         with _lock:
             job.phase = "normalizing"
             job.overall_progress = 0
 
-        normalized: list[str] = []
         for i, path in enumerate(file_paths):
             if job.status == "cancelled":
                 return
@@ -151,15 +183,7 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
             with _lock:
                 job.clip_index = i + 1
 
-            logger.info(f"[{job_id}] Normalizing clip {i+1}/{total}: {filenames[i]}")
-            dims = probe_video_dimensions(path)
-            if dims and dims[1] != 720:
-                normed = ensure_min_quality(path)
-                if normed != path:
-                    temp_files_to_clean.append(normed)
-                normalized.append(normed)
-            else:
-                normalized.append(path)
+            logger.info(f"[{job_id}] Preparing clip {i+1}/{total}: {filenames[i]}")
 
             with _lock:
                 job.overall_progress = int((i + 1) / total * 40)  # 0-40%
@@ -173,9 +197,10 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
             job.overall_progress = 40
 
         durations: list[float] = []
-        for path in normalized:
+        for path in file_paths:
             d = _probe_duration(path)
             durations.append(d or 5.0)
+        fade_duration = _combine_fade_duration(durations)
 
         out_filename = f"combined_{job_id}.mp4"
         out_path = os.path.join(settings.temp_storage_dir, out_filename)
@@ -183,32 +208,35 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
         # Phase 3: Build and run ffmpeg xfade concat
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         cmd = [ffmpeg_exe, "-y"]
-        for path in normalized:
+        for path in file_paths:
             cmd.extend(["-i", path])
 
-        total_duration = sum(durations) - (len(durations) - 1) * 0.5
+        total_duration = sum(durations) - (len(durations) - 1) * fade_duration
 
-        if len(normalized) == 1:
-            # Single clip: just copy/re-encode to output
+        if len(file_paths) == 1:
             cmd.extend([
-                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-                "-c:a", "aac", "-movflags", "+faststart",
+                "-filter_complex", _scale_to_720p_filter("[0:v]", "[vout]"),
+                "-map", "[vout]", "-map", "0:a?",
+                "-c:v", "libx264", "-crf", "14", "-preset", "slow",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
                 "-progress", "pipe:1", "-nostats",
                 out_path,
             ])
         else:
-            v_filter, a_filter = _build_xfade_filter(durations)
+            v_filter, a_filter = _build_xfade_filter(durations, fade_duration=fade_duration)
             filter_complex = f"{v_filter};{a_filter}"
             cmd.extend([
                 "-filter_complex", filter_complex,
                 "-map", "[vout]", "-map", "[aout]",
-                "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-                "-c:a", "aac", "-movflags", "+faststart",
+                "-c:v", "libx264", "-crf", "14", "-preset", "slow",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
                 "-progress", "pipe:1", "-nostats",
                 out_path,
             ])
 
-        logger.info(f"[{job_id}] Running ffmpeg concat ({len(normalized)} clips)")
+        logger.info(f"[{job_id}] Running ffmpeg concat ({len(file_paths)} clips) at 1280x720")
 
         def update_progress(current_s: float) -> None:
             if total_duration <= 0:
@@ -249,6 +277,4 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
                 job.status = "failed"
                 job.error = str(e)
     finally:
-        # Clean up temp normalized copies (originals are kept for potential re-use)
         cleanup_paths(file_paths)
-        cleanup_paths(temp_files_to_clean)

@@ -14,6 +14,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Loader2, X, Check, Download, Captions, Clock, Ban, Trash2 } from "lucide-react";
 import Navbar from "@/components/Navbar";
+import ResultVideoPlayer from "@/components/ResultVideoPlayer";
 
 
 function phaseLabel(data: TranslateJobData): string {
@@ -126,7 +127,8 @@ export default function TranslatePage() {
 
   function handleDownload(item: TranslateJobItem) {
     if (!item.data.result_url) return;
-    triggerFileDownload(item.data.result_url, "subtitled_video.mp4");
+    void triggerFileDownload(item.data.result_url, "subtitled_video.mp4")
+      .catch(() => setError("Failed to download translated video."));
   }
 
   function handleDelete(localId: string) {
@@ -305,6 +307,9 @@ export default function TranslatePage() {
                           ))}
                         </div>
                       </>
+                    )}
+                    {isDone && item.data.result_url && (
+                      <ResultVideoPlayer src={item.data.result_url} title={item.filename} />
                     )}
                   </div>
 

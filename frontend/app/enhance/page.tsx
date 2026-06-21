@@ -9,6 +9,7 @@ import { startEnhanceJob, getEnhanceJob, cancelEnhanceJob, type EnhanceJobData }
 import { Button } from "@/components/ui/button";
 import { Loader2, X, Check, Download, Sparkles, Clock, Ban, Trash2 } from "lucide-react";
 import Navbar from "@/components/Navbar";
+import ResultVideoPlayer from "@/components/ResultVideoPlayer";
 
 function statusMessage(item: EnhanceJobItem): string {
   if (item.jobId === "") {
@@ -120,7 +121,8 @@ export default function EnhancePage() {
 
   function handleDownload(item: EnhanceJobItem) {
     if (!item.data.result_url) return;
-    triggerFileDownload(item.data.result_url, `enhanced_${item.filename}`);
+    void triggerFileDownload(item.data.result_url, `enhanced_${item.filename}`)
+      .catch(() => setError("Failed to download enhanced video."));
   }
 
   if (loading) {
@@ -275,6 +277,9 @@ export default function EnhancePage() {
                           <div className="h-full w-full bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0 animate-pulse rounded-full" />
                         )}
                       </div>
+                    )}
+                    {isDone && item.data.result_url && (
+                      <ResultVideoPlayer src={item.data.result_url} title={item.filename} />
                     )}
                   </div>
 

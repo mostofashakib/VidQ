@@ -12,13 +12,6 @@ export function isTerminalStatus(status: string): boolean {
   return TERMINAL_STATUSES.includes(status);
 }
 
-export function triggerFileDownload(url: string, filename: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = filename;
-  anchor.click();
-}
-
 export function downloadBlob(blob: Blob, filename: string): void {
   const blobUrl = window.URL.createObjectURL(blob);
   const anchor = document.createElement("a");
@@ -28,6 +21,13 @@ export function downloadBlob(blob: Blob, filename: string): void {
   anchor.click();
   document.body.removeChild(anchor);
   window.URL.revokeObjectURL(blobUrl);
+}
+
+export async function triggerFileDownload(url: string, filename: string): Promise<void> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Download failed: ${response.status}`);
+  const blob = await response.blob();
+  downloadBlob(blob, filename);
 }
 
 export function videoDownloadName(

@@ -14,6 +14,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Loader2, X, Check, Download, Film, Clock, Ban, ChevronUp, ChevronDown, Trash2 } from "lucide-react";
 import Navbar from "@/components/Navbar";
+import ResultVideoPlayer from "@/components/ResultVideoPlayer";
 
 
 function phaseLabel(phase: string, data: CombineJobData): string {
@@ -122,7 +123,8 @@ export default function CombinePage() {
 
   function handleDownload(item: CombineJobItem) {
     if (!item.data.result_url) return;
-    triggerFileDownload(item.data.result_url, "combined_video.mp4");
+    void triggerFileDownload(item.data.result_url, "combined_video.mp4")
+      .catch(() => setError("Failed to download combined video."));
   }
 
   function handleDelete(localId: string) {
@@ -298,6 +300,9 @@ export default function CombinePage() {
                           <div className="h-full w-full bg-linear-to-r from-indigo-500/0 via-indigo-500/60 to-indigo-500/0 animate-pulse rounded-full" />
                         )}
                       </div>
+                    )}
+                    {isDone && item.data.result_url && (
+                      <ResultVideoPlayer src={item.data.result_url} title={item.label} />
                     )}
                   </div>
 
