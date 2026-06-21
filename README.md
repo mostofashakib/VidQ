@@ -125,6 +125,14 @@ Use hosted LLMs:
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 OPENROUTER_API_KEY=
+OPENROUTER_MODEL=google/gemma-4-31b-it:free
+```
+
+Override the model used by each provider (defaults shown):
+
+```env
+OPENAI_MODEL=gpt-4o
+CLAUDE_MODEL=claude-haiku-4-5-20251001
 ```
 
 Optional password gate:
@@ -133,6 +141,15 @@ Optional password gate:
 AUTH_ENABLED=true
 APP_PASSWORD=change-me
 ```
+
+Download browser options:
+
+```env
+PROXY_URLS=http://user:pass@host:port,socks5://host2:port2
+BROWSER_HEADLESS=false
+```
+
+`PROXY_URLS` is a comma-separated proxy pool; the pipeline rotates to a fresh proxy when Cloudflare blocks a request. Set `BROWSER_HEADLESS=false` to watch the browser during download for debugging.
 
 Enhance backend override:
 
@@ -261,7 +278,7 @@ Media tools, browser automation, LLM providers, and local storage
 
 ## How It Is Built
 
-- **Download** starts with direct extraction, then falls back to Playwright browser automation and MediaRecorder-style capture when needed.
+- **Download** runs parallel direct extraction (yt-dlp, curl, ffmpeg candidates in parallel), then launches Chromium with stealth injection and Cloudflare bypass when direct extraction fails, falling back to MediaRecorder capture for blob-only streams.
 - **Convert** saves uploads, normalizes video to 720p MP4, and exposes the finished file in the uploaded video library.
 - **Combine** accepts ordered clips, runs one high-quality ffmpeg pass, outputs 720p MP4, and preserves aspect ratio with padding.
 - **Translate** extracts audio, transcribes locally with `faster-whisper` or OpenAI Whisper, translates text, creates subtitles, and burns them into the video.
@@ -273,9 +290,11 @@ Media tools, browser automation, LLM providers, and local storage
 
 Download uses a staged pipeline:
 
-1. Try direct video extraction with `yt-dlp`, `curl`, and `ffmpeg`.
-2. Launch Chromium, inspect network traffic, and use heuristics plus an LLM-guided click loop to start playback.
-3. Fall back to MediaRecorder for blob and DRM-adjacent streams when direct download fails.
+1. Run `yt-dlp`, `curl`, and `ffmpeg` direct extraction candidates in parallel — the first successful result wins.
+2. If direct extraction fails, launch Chromium with stealth injection; detect Cloudflare challenges and bypass them, rotating through the `PROXY_URLS` pool on repeated blocks; use heuristics and an LLM-guided click loop to start playback and intercept the stream URL from network traffic.
+3. Fall back to MediaRecorder capture for blob streams and DRM-adjacent content when no direct URL can be intercepted.
+
+A persistent browser profile (`BROWSER_PROFILE_DIR`) is reloaded each session so the browser appears as a returning visitor rather than a fresh bot.
 
 Enhance uses a parallel chunked Real-ESRGAN pipeline:
 
