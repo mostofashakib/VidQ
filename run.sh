@@ -3,8 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Ensure binaries installed by project helper scripts are visible to the backend.
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+# Ensure project and helper binaries are visible to the backend.
+export PATH="${ROOT_DIR}/backend/.venv/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 echo "Starting VidQ..."
 

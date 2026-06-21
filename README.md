@@ -23,13 +23,22 @@ cd VidQ
 
 The setup script installs:
 
+- system tools it can install automatically (`curl`, `unzip`, Node.js/npm)
 - `uv` if it is missing
 - backend Python packages from `backend/requirements.txt`
 - backend test packages from `backend/requirements-dev.txt`
 - Playwright Chromium
+- Playwright Linux system libraries when running on Linux
 - frontend packages from `frontend/package-lock.json`
 - Real-ESRGAN ncnn and Python backends for the Enhance feature
+- Real-ESRGAN model weights for the Python fallback backend
 - `backend/.env` from `backend/.env.example` if it does not exist
+
+Skip system package installation and fail with instructions instead:
+
+```bash
+SKIP_SYSTEM_DEPS=1 ./setup.sh
+```
 
 Skip the ncnn Enhance dependency during setup:
 
@@ -47,6 +56,18 @@ Skip the browser download in constrained environments:
 
 ```bash
 SKIP_PLAYWRIGHT=1 ./setup.sh
+```
+
+Skip Playwright Linux system packages:
+
+```bash
+SKIP_PLAYWRIGHT_SYSTEM_DEPS=1 ./setup.sh
+```
+
+Reinstall managed dependencies:
+
+```bash
+FORCE_INSTALL=1 ./setup.sh
 ```
 
 ## Quick Start
@@ -189,49 +210,6 @@ uv run playwright install chromium
 
 This is required for the Download page's browser automation.
 
-## Troubleshooting
-
-### `realesrgan-ncnn-vulkan not found`
-
-Run:
-
-```bash
-./setup.sh
-```
-
-Then restart:
-
-```bash
-./run.sh
-```
-
-### Enhance fails with `SIGSEGV`
-
-`realesrgan-ncnn-vulkan` can crash on some macOS Vulkan/MoltenVK setups. VidQ first tries ncnn. If ncnn crashes, VidQ automatically retries the same frames through the Python Real-ESRGAN backend. If both backends fail, the Enhance job fails instead of returning a fake non-AI upscale.
-
-### `Missing required environment variable: DATABASE_URL`
-
-Create the env file:
-
-```bash
-cp backend/.env.example backend/.env
-```
-
-### Node version issues
-
-Use Node 20 if your local Node version causes Next.js problems:
-
-```bash
-nvm install 20
-nvm use 20
-```
-
-### Reinstall everything
-
-```bash
-FORCE_INSTALL=1 ./setup.sh
-```
-
 ## Commands
 
 ```bash
@@ -256,6 +234,40 @@ backend/                     FastAPI app
 
 setup.sh                     One-command project setup, including macOS Real-ESRGAN install
 ```
+
+## Architecture
+
+VidQ is a local full-stack video workstation:
+
+```text
+Browser UI
+  ↓
+Next.js app routes
+  ↓
+FastAPI routers
+  ↓
+Background worker queues
+  ↓
+Media tools, browser automation, LLM providers, and local storage
+```
+
+- **Frontend** - Next.js App Router pages in `frontend/app` handle upload forms, progress polling, cancellation, result playback, and downloads.
+- **API layer** - FastAPI routers in `backend/app/routers` validate requests, save uploads, create jobs, and expose job status endpoints.
+- **Workers** - Service workers in `backend/app/services` run long video tasks outside request handlers so the UI stays responsive.
+- **Queue runtime** - Shared worker helpers centralize job state, cancellation, cleanup, and global concurrency limits.
+- **Media layer** - `imageio-ffmpeg`, `yt-dlp`, and Playwright handle downloading, probing, converting, trimming, combining, subtitles, and final MP4 output.
+- **AI layer** - Download can use LLM-guided browser navigation; Translate uses Whisper plus an LLM provider; Enhance uses Real-ESRGAN.
+- **Storage** - SQLite stores saved video metadata, while generated files live under `backend/temp_storage` and are served back through FastAPI.
+
+## How It Is Built
+
+- **Download** starts with direct extraction, then falls back to Playwright browser automation and MediaRecorder-style capture when needed.
+- **Convert** saves uploads, normalizes video to 720p MP4, and exposes the finished file in the uploaded video library.
+- **Combine** accepts ordered clips, runs one high-quality ffmpeg pass, outputs 720p MP4, and preserves aspect ratio with padding.
+- **Translate** extracts audio, transcribes locally with `faster-whisper` or OpenAI Whisper, translates text, creates subtitles, and burns them into the video.
+- **Trim** lets the UI choose start/end timestamps, then ffmpeg exports only that segment.
+- **Enhance** splits long videos into chunks, runs Real-ESRGAN upscaling with ncnn/Python fallback, then reassembles video and audio.
+- **Setup** installs Python, Node, browser, frontend, backend, and Enhance dependencies so a new clone can run with `./run.sh`.
 
 ## How It Works
 

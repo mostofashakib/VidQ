@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="${ROOT_DIR}/backend"
 FRONTEND_DIR="${ROOT_DIR}/frontend"
 
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH="${BACKEND_DIR}/.venv/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${ROOT_DIR}/.uv-cache}"
 
 log() {
@@ -20,6 +20,90 @@ ensure_command() {
         echo "$install_hint" >&2
         exit 1
     fi
+}
+
+install_system_package() {
+    local command_name="$1"
+    local package_name="$2"
+    local install_hint="$3"
+
+    if command -v "$command_name" >/dev/null 2>&1; then
+        return
+    fi
+
+    if [ "${SKIP_SYSTEM_DEPS:-0}" = "1" ]; then
+        echo "Missing required command: $command_name" >&2
+        echo "$install_hint" >&2
+        exit 1
+    fi
+
+    if command -v brew >/dev/null 2>&1; then
+        log "Installing ${package_name} with Homebrew"
+        brew install "$package_name"
+    elif command -v apt-get >/dev/null 2>&1; then
+        log "Installing ${package_name} with apt"
+        sudo apt-get update
+        sudo apt-get install -y "$package_name"
+    elif command -v dnf >/dev/null 2>&1; then
+        log "Installing ${package_name} with dnf"
+        sudo dnf install -y "$package_name"
+    elif command -v yum >/dev/null 2>&1; then
+        log "Installing ${package_name} with yum"
+        sudo yum install -y "$package_name"
+    else
+        echo "Missing required command: $command_name" >&2
+        echo "$install_hint" >&2
+        exit 1
+    fi
+}
+
+install_node_runtime() {
+    if command -v node >/dev/null 2>&1; then
+        return
+    fi
+
+    if [ "${SKIP_SYSTEM_DEPS:-0}" = "1" ]; then
+        echo "Missing required command: node" >&2
+        echo "Install Node.js 18+ from https://nodejs.org/." >&2
+        exit 1
+    fi
+
+    if command -v brew >/dev/null 2>&1; then
+        log "Installing Node.js with Homebrew"
+        brew install node
+    elif command -v apt-get >/dev/null 2>&1; then
+        log "Installing Node.js and npm with apt"
+        sudo apt-get update
+        sudo apt-get install -y nodejs npm
+    elif command -v dnf >/dev/null 2>&1; then
+        log "Installing Node.js and npm with dnf"
+        sudo dnf install -y nodejs npm
+    elif command -v yum >/dev/null 2>&1; then
+        log "Installing Node.js and npm with yum"
+        sudo yum install -y nodejs npm
+    else
+        echo "Missing required command: node" >&2
+        echo "Install Node.js 18+ from https://nodejs.org/." >&2
+        exit 1
+    fi
+}
+
+version_major() {
+    local version="$1"
+    echo "$version" | sed -E 's/^v?([0-9]+).*/\1/'
+}
+
+python_version_ok() {
+    python3 - <<'PY'
+import sys
+raise SystemExit(0 if sys.version_info >= (3, 10) else 1)
+PY
+}
+
+node_version_ok() {
+    local major
+    major="$(version_major "$(node --version)")"
+    [ "$major" -ge 18 ]
 }
 
 update_env_value() {
@@ -145,20 +229,28 @@ PY
 }
 
 log "Checking required runtimes"
-ensure_command python3 "Install Python 3.10+ from https://www.python.org/downloads/."
+install_system_package curl curl "Install curl, then rerun ./setup.sh."
+install_system_package unzip unzip "Install unzip, then rerun ./setup.sh."
+
+if ! command -v python3 >/dev/null 2>&1; then
+    install_system_package python3 python3 "Install Python 3.10+ from https://www.python.org/downloads/."
+fi
+if ! python_version_ok; then
+    echo "Python 3.10+ is required. Found: $(python3 --version)" >&2
+    echo "Install Python 3.10+ and rerun ./setup.sh." >&2
+    exit 1
+fi
 
 if ! command -v node >/dev/null 2>&1; then
-    if command -v brew >/dev/null 2>&1; then
-        log "Installing Node.js with Homebrew"
-        brew install node
-    else
-        echo "Missing required command: node" >&2
-        echo "Install Node.js 18+ from https://nodejs.org/." >&2
-        exit 1
-    fi
+    install_node_runtime
 fi
 
 ensure_command npm "Install npm with Node.js 18+ from https://nodejs.org/."
+if ! node_version_ok; then
+    echo "Node.js 18+ is required. Found: $(node --version)" >&2
+    echo "Install Node.js 18+ and rerun ./setup.sh." >&2
+    exit 1
+fi
 
 if ! command -v uv >/dev/null 2>&1; then
     log "Installing uv"
@@ -176,6 +268,8 @@ log "Installing backend dependencies"
 cd "$BACKEND_DIR"
 if [ ! -d ".venv" ]; then
     uv venv
+elif [ "${FORCE_INSTALL:-0}" = "1" ]; then
+    uv venv --clear
 fi
 uv pip install -r requirements.txt
 uv pip install -r requirements-dev.txt
@@ -184,6 +278,9 @@ if [ "${SKIP_PLAYWRIGHT:-0}" = "1" ]; then
     echo "Skipped Playwright browser install because SKIP_PLAYWRIGHT=1"
 else
     log "Installing Playwright Chromium"
+    if [ "$(uname -s)" = "Linux" ] && [ "${SKIP_PLAYWRIGHT_SYSTEM_DEPS:-0}" != "1" ]; then
+        uv run playwright install-deps chromium
+    fi
     uv run playwright install chromium
 fi
 
