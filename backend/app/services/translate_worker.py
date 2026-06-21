@@ -98,10 +98,6 @@ def start_translate_job(file_path: str, original_name: str) -> str:
     return job_id
 
 
-def _probe_duration(path: str) -> Optional[float]:
-    return probe_duration(path)
-
-
 def _extract_audio(job: TranslateJob, video_path: str, audio_path: str) -> bool:
     """Extract mono 16kHz WAV for Whisper. Returns True on success."""
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
@@ -361,7 +357,7 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
         with _lock:
             job.phase = "burning"
 
-        video_duration = _probe_duration(file_path)
+        video_duration = probe_duration(file_path)
         ok = _burn_subtitles(job, file_path, srt_path, out_path, video_duration)
         if not ok and job.status != "cancelled":
             with _lock:

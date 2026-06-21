@@ -35,7 +35,7 @@ def test_upload_video_creates_job(client):
 
 def test_upload_job_completes_and_video_appears(client):
     with patch("app.services.upload_worker.probe_video_dimensions", return_value=None), \
-         patch("app.services.upload_worker._probe_duration", return_value=30.0):
+         patch("app.services.upload_worker.probe_duration", return_value=30.0):
         r = client.post(
             "/upload-video",
             files={"file": ("myvid.mp4", io.BytesIO(_fake_mp4_bytes()), "video/mp4")},

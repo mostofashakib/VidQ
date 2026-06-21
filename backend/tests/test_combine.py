@@ -116,7 +116,7 @@ def test_combine_job_completes(client):
     """Job moves from queued → processing → done with overall_progress = 100."""
     FakePopen = _make_fake_popen()
     with (
-        patch("app.services.combine_worker._probe_duration", return_value=10.0),
+        patch("app.services.combine_worker.probe_duration", return_value=10.0),
         patch("app.services.combine_worker.subprocess.Popen", FakePopen),
     ):
         r = client.post(
@@ -154,7 +154,7 @@ def test_combine_job_overall_progress_reaches_100(client):
     ]
     FakePopen = _make_fake_popen(progress_lines)
     with (
-        patch("app.services.combine_worker._probe_duration", return_value=10.0),
+        patch("app.services.combine_worker.probe_duration", return_value=10.0),
         patch("app.services.combine_worker.subprocess.Popen", FakePopen),
     ):
         r = client.post(
@@ -184,7 +184,7 @@ def test_combine_job_three_clips(client):
     """Works with more than 2 clips."""
     FakePopen = _make_fake_popen()
     with (
-        patch("app.services.combine_worker._probe_duration", return_value=5.0),
+        patch("app.services.combine_worker.probe_duration", return_value=5.0),
         patch("app.services.combine_worker.subprocess.Popen", FakePopen),
     ):
         r = client.post(
@@ -334,7 +334,7 @@ def test_combine_job_ffmpeg_failure_marks_failed(client):
             self.returncode = -9
 
     with (
-        patch("app.services.combine_worker._probe_duration", return_value=10.0),
+        patch("app.services.combine_worker.probe_duration", return_value=10.0),
         patch("app.services.combine_worker.subprocess.Popen", FailingPopen),
     ):
         r = client.post(

@@ -4,6 +4,7 @@ from sqlalchemy.orm import Session
 from app.db import get_db, Video
 from app.models import VideoCreate, VideoOut
 from app.routers.auth import verify_token
+from app.services.url_safety import is_safe_url, filename_from_url
 from typing import List, Optional
 import os
 import requests
@@ -12,9 +13,8 @@ from app.services.llm_manager import FallbackLLMManager
 from app.services.scraper import USER_AGENTS, clean_html
 from app.services.prompts import Prompts
 import random
-from app.config import get_settings, Settings
+from app.config import get_settings
 from urllib.parse import urlparse
-import ipaddress
 import logging
 
 logger = logging.getLogger("VideoRouter")
@@ -29,33 +29,6 @@ def _get_llm_manager() -> FallbackLLMManager:
 def _get_queue():
     from app.services.queue import video_queue
     return video_queue
-
-def is_safe_url(url: str) -> bool:
-    try:
-        parsed = urlparse(url)
-        if parsed.scheme not in ["http", "https"]:
-            return False
-        hostname = parsed.hostname
-        if not hostname:
-            return False
-            
-        # Explicitly allow temp_storage loopbacks so saving blob files doesn't throw 400 Bad Request
-        if hostname.lower() in ["localhost", "127.0.0.1", "0.0.0.0"]:
-            if parsed.path.startswith("/temp_storage/"):
-                return True
-            return False
-            
-        # Prevent internal IP blocks
-        try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback:
-                return False
-        except ValueError:
-            pass # Not an IP, assume domain is external
-
-        return True
-    except Exception:
-        return False
 
 def extract_title_and_duration(url: str) -> tuple[str, Optional[float]]:
     try:
@@ -148,7 +121,7 @@ def delete_video(video_id: int, db: Session = Depends(get_db), token: str = Depe
 
     if video.source == "upload":
         settings = get_settings()
-        filename = video.url.rstrip("/").split("/")[-1].split("?")[0]
+        filename = filename_from_url(video.url)
         filepath = os.path.join(settings.temp_storage_dir, filename)
         if os.path.exists(filepath):
             try:
@@ -181,7 +154,7 @@ def download_video(video_id: int, db: Session = Depends(get_db), token: str = De
 
     # Local uploaded file
     if "temp_storage" in video_url and ("localhost" in video_url or "127.0.0.1" in video_url):
-        filename = video_url.split("/")[-1].split("?")[0]
+        filename = filename_from_url(video_url)
         filepath = os.path.join(settings.temp_storage_dir, filename)
         if os.path.exists(filepath):
             ext = filename.rsplit(".", 1)[-1] if "." in filename else "mp4"
@@ -193,10 +166,8 @@ def download_video(video_id: int, db: Session = Depends(get_db), token: str = De
 
     # External URL: proxy so the browser receives Content-Disposition: attachment
     if is_safe_url(video_url):
-        raw_path = video_url.split("?")[0].rsplit("/", 1)[-1]
-        ext = raw_path.rsplit(".", 1)[-1] if "." in raw_path else "mp4"
-        if len(ext) > 5 or not ext.isalnum():
-            ext = "mp4"
+        ext_filename = filename_from_url(video_url)
+        ext = ext_filename.rsplit(".", 1)[-1] if "." in ext_filename else "mp4"
 
         def _stream():
             try:

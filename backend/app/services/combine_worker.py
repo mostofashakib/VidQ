@@ -92,10 +92,6 @@ def start_combine_job(file_paths: list[str], filenames: list[str]) -> str:
     return job_id
 
 
-def _probe_duration(path: str) -> Optional[float]:
-    return probe_duration(path)
-
-
 def _combine_fade_duration(durations: list[float], preferred: float = 0.5) -> float:
     positive_durations = [duration for duration in durations if duration > 0]
     if not positive_durations:
@@ -198,7 +194,7 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
 
         durations: list[float] = []
         for path in file_paths:
-            d = _probe_duration(path)
+            d = probe_duration(path)
             durations.append(d or 5.0)
         fade_duration = _combine_fade_duration(durations)
 

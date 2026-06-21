@@ -12,6 +12,7 @@ from app.models import VideoOut
 from app.routers.auth import verify_token
 from app.routers.upload_utils import save_upload_file
 from app.services.upload_worker import cancel_job, get_job, start_upload_job
+from app.services.url_safety import filename_from_url
 
 logger = logging.getLogger("UploadRouter")
 
@@ -83,7 +84,7 @@ def delete_all_upload_videos(
     settings = get_settings()
     videos = db.query(Video).filter(Video.source == "upload").all()
     for video in videos:
-        filename = video.url.rstrip("/").split("/")[-1].split("?")[0]
+        filename = filename_from_url(video.url)
         filepath = os.path.join(settings.temp_storage_dir, filename)
         if os.path.exists(filepath):
             try:

@@ -61,6 +61,58 @@ class RecordingJob:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
 
+def _video_payload(video) -> dict:
+    return {
+        "id": video.id,
+        "url": video.url,
+        "category": video.category,
+        "title": video.title,
+        "duration": video.duration,
+        "thumbnail": video.thumbnail,
+        "source": video.source,
+        "created_at": video.created_at.isoformat() if video.created_at else None,
+    }
+
+
+def _save_video_to_db(job: "RecordingJob", result: dict, temp_video_url: Optional[str]) -> dict:
+    """Persist the downloaded video to the database and return the enriched result dict."""
+    from app.db import SessionLocal, Video
+
+    video_url = result.get("video_url") or job.url
+    title = result.get("title")
+    duration = result.get("duration")
+    thumbnail = result.get("thumbnail")
+
+    db = SessionLocal()
+    try:
+        existing = db.query(Video).filter(Video.url == video_url.strip().lower()).first()
+        if not existing and title and title.strip() not in ("", "Untitled Video", "Video"):
+            existing = db.query(Video).filter(Video.title == title.strip()).first()
+
+        if not existing:
+            v = Video(
+                url=video_url.strip().lower(),
+                category=job.category,
+                title=title,
+                duration=duration,
+                thumbnail=thumbnail,
+            )
+            db.add(v)
+            db.commit()
+            db.refresh(v)
+            result["db_id"] = v.id
+            result["video"] = _video_payload(v)
+            logger.info(f"Job {job.job_id} saved video id={v.id}")
+        else:
+            result["db_id"] = existing.id
+            result["video"] = _video_payload(existing)
+            logger.info(f"Job {job.job_id} — video already exists.")
+    finally:
+        db.close()
+
+    return result
+
+
 class VideoQueue:
     """Thread-safe queue backed by capped per-job daemon threads."""
 
@@ -292,48 +344,7 @@ class VideoQueue:
                 logger.info(f"Job {job.job_id} marked cancelled after processing.")
                 return
 
-            from app.db import SessionLocal, Video
-            db = SessionLocal()
-            try:
-                def _video_payload(video: Video) -> dict:
-                    return {
-                        "id": video.id,
-                        "url": video.url,
-                        "category": video.category,
-                        "title": video.title,
-                        "duration": video.duration,
-                        "thumbnail": video.thumbnail,
-                        "source": video.source,
-                        "created_at": video.created_at.isoformat() if video.created_at else None,
-                    }
-
-                video_url = result.get("video_url") or job.url
-                title = result.get("title")
-                duration = result.get("duration")
-                thumbnail = result.get("thumbnail")
-                existing = db.query(Video).filter(Video.url == video_url.strip().lower()).first()
-                if not existing and title and title.strip() not in ["", "Untitled Video", "Video"]:
-                    existing = db.query(Video).filter(Video.title == title.strip()).first()
-                if not existing:
-                    v = Video(
-                        url=video_url.strip().lower(),
-                        category=job.category,
-                        title=title,
-                        duration=duration,
-                        thumbnail=thumbnail,
-                    )
-                    db.add(v)
-                    db.commit()
-                    db.refresh(v)
-                    result["db_id"] = v.id
-                    result["video"] = _video_payload(v)
-                    logger.info(f"Job {job.job_id} saved video id={v.id}")
-                else:
-                    result["db_id"] = existing.id
-                    result["video"] = _video_payload(existing)
-                    logger.info(f"Job {job.job_id} — video already exists.")
-            finally:
-                db.close()
+            result = _save_video_to_db(job, result, temp_video_url)
 
             with self._lock:
                 job.result = result

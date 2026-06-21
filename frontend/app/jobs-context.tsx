@@ -106,6 +106,21 @@ const JobsContext = createContext<JobsContextValue | null>(null);
 
 const TERMINAL = ["done", "failed", "cancelled"];
 
+function loadFromStorage<T>(
+  key: string,
+  filter: (item: T) => boolean,
+  setter: Dispatch<SetStateAction<T[]>>,
+): void {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return;
+    const active = (JSON.parse(raw) as T[]).filter(filter);
+    if (active.length) setter(active);
+  } catch {
+    // Silently ignore parse errors — stale or malformed storage is discarded
+  }
+}
+
 // Serialise only fields that survive JSON round-trip (drop AbortController etc.)
 function serializeDownload(d: DownloadJob) {
   return {
@@ -140,71 +155,36 @@ export function JobsProvider({ children }: { children: ReactNode }) {
 
   // ── Restore from localStorage once on mount ──────────────────────────────
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem("vidq_downloads");
-      if (raw) {
-        const parsed = JSON.parse(raw) as DownloadJob[];
-        const active = parsed.filter(
-          (d) => d.jobId && !TERMINAL.includes(d.status)
-        );
-        if (active.length) setDownloads(active);
-      }
-    } catch {}
-
-    try {
-      const raw = localStorage.getItem("vidq_uploads");
-      if (raw) {
-        const parsed = JSON.parse(raw) as UploadJob[];
-        const active = parsed.filter(
-          (j) => j.jobId && !TERMINAL.includes(j.status)
-        );
-        if (active.length) setUploadJobs(active);
-      }
-    } catch {}
-
-    try {
-      const raw = localStorage.getItem("vidq_combine");
-      if (raw) {
-        const parsed = JSON.parse(raw) as CombineJobItem[];
-        const active = parsed.filter(
-          (j) => j.jobId && !TERMINAL.includes(j.data.status)
-        );
-        if (active.length) setCombineJobs(active);
-      }
-    } catch {}
-
-    try {
-      const raw = localStorage.getItem("vidq_translate");
-      if (raw) {
-        const parsed = JSON.parse(raw) as TranslateJobItem[];
-        const active = parsed.filter(
-          (j) => j.jobId && !TERMINAL.includes(j.data.status)
-        );
-        if (active.length) setTranslateJobs(active);
-      }
-    } catch {}
-
-    try {
-      const raw = localStorage.getItem("vidq_trim");
-      if (raw) {
-        const parsed = JSON.parse(raw) as TrimJobItem[];
-        const active = parsed.filter(
-          (j) => j.jobId && !TERMINAL.includes(j.data.status)
-        );
-        if (active.length) setTrimJobs(active);
-      }
-    } catch {}
-
-    try {
-      const raw = localStorage.getItem("vidq_enhance");
-      if (raw) {
-        const parsed = JSON.parse(raw) as EnhanceJobItem[];
-        const active = parsed.filter(
-          (j) => j.jobId && !TERMINAL.includes(j.data.status)
-        );
-        if (active.length) setEnhanceJobs(active);
-      }
-    } catch {}
+    loadFromStorage<DownloadJob>(
+      "vidq_downloads",
+      (d) => !!(d.jobId && !TERMINAL.includes(d.status)),
+      setDownloads,
+    );
+    loadFromStorage<UploadJob>(
+      "vidq_uploads",
+      (j) => !!(j.jobId && !TERMINAL.includes(j.status)),
+      setUploadJobs,
+    );
+    loadFromStorage<CombineJobItem>(
+      "vidq_combine",
+      (j) => !!(j.jobId && !TERMINAL.includes(j.data.status)),
+      setCombineJobs,
+    );
+    loadFromStorage<TranslateJobItem>(
+      "vidq_translate",
+      (j) => !!(j.jobId && !TERMINAL.includes(j.data.status)),
+      setTranslateJobs,
+    );
+    loadFromStorage<TrimJobItem>(
+      "vidq_trim",
+      (j) => !!(j.jobId && !TERMINAL.includes(j.data.status)),
+      setTrimJobs,
+    );
+    loadFromStorage<EnhanceJobItem>(
+      "vidq_enhance",
+      (j) => !!(j.jobId && !TERMINAL.includes(j.data.status)),
+      setEnhanceJobs,
+    );
 
     // Allow save effects to run from here on.
     persistReady.current = true;

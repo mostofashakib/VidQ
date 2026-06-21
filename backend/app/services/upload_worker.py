@@ -107,10 +107,6 @@ def start_upload_job(file_path: str, original_name: str) -> str:
 # Internal processing
 # ---------------------------------------------------------------------------
 
-def _probe_duration(path: str) -> Optional[float]:
-    return probe_duration(path)
-
-
 def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[float] = None) -> Optional[str]:
     """
     Normalize uploaded videos.
@@ -201,13 +197,13 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
     title = os.path.splitext(original_name)[0]
 
     try:
-        duration = _probe_duration(file_path)
+        duration = probe_duration(file_path)
         final_path = _scale_to_720p(job, file_path, total_duration_s=duration)
         if final_path is None:
             return  # cancelled or failed — status already set
 
         if final_path != file_path:
-            duration = _probe_duration(final_path) or duration
+            duration = probe_duration(final_path) or duration
         final_filename = os.path.basename(final_path)
         video_url = f"{settings.base_url}/temp_storage/{final_filename}"
 

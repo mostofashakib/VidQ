@@ -99,7 +99,7 @@ def test_translate_job_completes(client):
 
     with (
         patch("app.services.translate_worker._extract_audio", side_effect=_fake_extract_audio),
-        patch("app.services.translate_worker._probe_duration", return_value=10.0),
+        patch("app.services.translate_worker.probe_duration", return_value=10.0),
         patch("app.services.translate_worker.subprocess.Popen", FakePopen),
         patch("app.state.transcription_adapter", fake_adapter),
         patch("app.state.translate_llm_manager", fake_llm),
@@ -141,7 +141,7 @@ def test_translate_all_pipeline_stages_executed(client):
 
     with (
         patch("app.services.translate_worker._extract_audio", side_effect=tracking_extract),
-        patch("app.services.translate_worker._probe_duration", return_value=10.0),
+        patch("app.services.translate_worker.probe_duration", return_value=10.0),
         patch("app.services.translate_worker.subprocess.Popen", FakePopen),
         patch("app.state.transcription_adapter", fake_adapter),
         patch("app.state.translate_llm_manager", fake_llm),
@@ -182,7 +182,7 @@ def test_translate_transcription_failure_marks_failed(client):
 
     with (
         patch("app.services.translate_worker._extract_audio", side_effect=fake_extract_audio_ok),
-        patch("app.services.translate_worker._probe_duration", return_value=10.0),
+        patch("app.services.translate_worker.probe_duration", return_value=10.0),
         patch("app.state.transcription_adapter", fake_adapter),
         patch("app.state.translate_llm_manager", fake_llm),
     ):
@@ -278,7 +278,7 @@ def test_translate_subtitle_burn_failure_marks_failed(client):
 
     with (
         patch("app.services.translate_worker._extract_audio", side_effect=_fake_extract_audio),
-        patch("app.services.translate_worker._probe_duration", return_value=10.0),
+        patch("app.services.translate_worker.probe_duration", return_value=10.0),
         patch("app.services.translate_worker.subprocess.Popen", FailingPopen),
         patch("app.state.transcription_adapter", fake_adapter),
         patch("app.state.translate_llm_manager", fake_llm),
