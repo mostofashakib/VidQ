@@ -1,5 +1,10 @@
 import ipaddress
+import logging
 from urllib.parse import urlparse
+
+from app.logging_utils import log_suppressed
+
+logger = logging.getLogger(__name__)
 
 
 def is_safe_url(url: str) -> bool:
@@ -35,7 +40,8 @@ def is_safe_url(url: str) -> bool:
             pass  # not a numeric IP — treat as an external hostname
 
         return True
-    except Exception:
+    except Exception as exc:
+        log_suppressed(logger, f"URL safety check failed for {url!r}", exc, level="warning")
         return False
 
 

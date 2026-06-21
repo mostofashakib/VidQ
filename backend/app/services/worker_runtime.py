@@ -1,3 +1,4 @@
+import logging
 import os
 import queue
 import threading
@@ -5,6 +6,10 @@ import uuid
 from collections.abc import Callable, MutableMapping
 from dataclasses import dataclass, field
 from typing import Any, Optional, TypeVar
+
+from app.logging_utils import log_suppressed
+
+_logger = logging.getLogger(__name__)
 
 
 TERMINAL_STATUSES = ("done", "failed", "cancelled")
@@ -63,8 +68,8 @@ def cancel_registered_job(
         if job._proc:
             try:
                 job._proc.kill()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_suppressed(_logger, f"Could not kill process for job {job_id}", exc)
     return True
 
 
@@ -90,8 +95,8 @@ def cleanup_paths(paths: list[str]) -> None:
         try:
             if os.path.exists(path):
                 os.remove(path)
-        except OSError:
-            pass
+        except OSError as exc:
+            log_suppressed(_logger, f"Could not remove temp file {path}", exc)
 
 
 def process_queued_job(

@@ -17,9 +17,9 @@ _settings = get_settings()
 
 _providers = [OllamaProvider(model_name=_settings.ollama_model, host=_settings.ollama_host)]
 if _settings.openai_api_key:
-    _providers.append(OpenAIProvider(api_key=_settings.openai_api_key))
+    _providers.append(OpenAIProvider(api_key=_settings.openai_api_key, model=_settings.openai_model))
 if _settings.anthropic_api_key:
-    _providers.append(AnthropicProvider(api_key=_settings.anthropic_api_key))
+    _providers.append(AnthropicProvider(api_key=_settings.anthropic_api_key, model=_settings.claude_model))
 if _settings.openrouter_api_key:
     _providers.append(OpenRouterProvider(api_key=_settings.openrouter_api_key, model=_settings.openrouter_model))
 

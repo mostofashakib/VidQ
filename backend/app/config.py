@@ -15,6 +15,11 @@ class Settings:
         self.anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
         self.openrouter_api_key: str = os.getenv("OPENROUTER_API_KEY", "")
         self.openrouter_model: str = os.getenv("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+        # Model names for each provider — override via env var to switch without code changes
+        self.openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o")
+        self.claude_model: str = os.getenv("CLAUDE_MODEL", "claude-haiku-4-5-20251001")
+        # HTTP-Referer sent to OpenRouter so usage is attributed correctly
+        self.openrouter_site_url: str = os.getenv("OPENROUTER_SITE_URL", "https://vidq.app")
         self.auth_enabled: bool = os.getenv("AUTH_ENABLED", "False").lower() in ("true", "1", "yes")
         # LLM provider selection: "ollama" | "openai" | "anthropic" | "openrouter" | "" (auto-fallback chain)
         self.llm_provider: str = os.getenv("LLM_PROVIDER", "ollama").lower().strip()

@@ -5,7 +5,11 @@ import subprocess
 
 import imageio_ffmpeg
 
+from app.logging_utils import log_suppressed
+
 logger = logging.getLogger("VideoUtils")
+
+FFMPEG_RESIZE_TIMEOUT_SECS = 600  # 10 min; large 4K source files can be slow
 
 
 def probe_video_dimensions(video_path: str) -> tuple[int, int] | None:
@@ -19,8 +23,8 @@ def probe_video_dimensions(video_path: str) -> tuple[int, int] | None:
         match = re.search(r'Video:.*?(\d{2,5})x(\d{2,5})', result.stderr)
         if match:
             return int(match.group(1)), int(match.group(2))
-    except Exception:
-        pass
+    except Exception as exc:
+        log_suppressed(logger, f"Could not probe dimensions for {os.path.basename(video_path)}", exc)
     return None
 
 
@@ -55,7 +59,7 @@ def ensure_min_quality(video_path: str, min_height: int = 720) -> str:
             "-c:a", "copy",
             out_path,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_RESIZE_TIMEOUT_SECS)
         if result.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
             os.remove(video_path)
             size_kb = os.path.getsize(out_path) // 1024

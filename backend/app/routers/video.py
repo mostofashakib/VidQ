@@ -2,9 +2,10 @@ from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 from app.db import get_db, Video
-from app.models import VideoCreate, VideoOut
+from app.models import VideoCreate, VideoOut, DEFAULT_CATEGORY, FORBIDDEN_URL_MSG
 from app.routers.auth import verify_token
 from app.services.url_safety import is_safe_url, filename_from_url
+from app.logging_utils import get_logger, log_suppressed
 from typing import List, Optional
 import os
 import requests
@@ -15,9 +16,11 @@ from app.services.prompts import Prompts
 import random
 from app.config import get_settings
 from urllib.parse import urlparse
-import logging
 
-logger = logging.getLogger("VideoRouter")
+logger = get_logger("VideoRouter")
+
+METADATA_FETCH_TIMEOUT_SECS = 8   # quick head-request for title/duration
+PROXY_DOWNLOAD_TIMEOUT_SECS = 30  # streaming proxy to browser
 
 router = APIRouter()
 
@@ -32,7 +35,7 @@ def _get_queue():
 
 def extract_title_and_duration(url: str) -> tuple[str, Optional[float]]:
     try:
-        resp = requests.get(url, timeout=8, headers={"User-Agent": random.choice(USER_AGENTS)})
+        resp = requests.get(url, timeout=METADATA_FETCH_TIMEOUT_SECS, headers={"User-Agent": random.choice(USER_AGENTS)})
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         # Title
@@ -50,30 +53,31 @@ def extract_title_and_duration(url: str) -> tuple[str, Optional[float]]:
         if video_tag and video_tag.has_attr("duration"):
             try:
                 duration = float(video_tag["duration"])
-            except Exception:
-                pass
+            except (ValueError, TypeError) as exc:
+                log_suppressed(logger, "Could not parse <video duration>", exc, level="debug")
         # Try og:video:duration
         ogd = soup.find("meta", property="og:video:duration", content=True)
         if ogd:
             try:
                 duration = float(ogd["content"])
-            except Exception:
-                pass
+            except (ValueError, TypeError) as exc:
+                log_suppressed(logger, "Could not parse og:video:duration", exc, level="debug")
         # Try <meta name="duration">
         meta_dur = soup.find("meta", attrs={"name": "duration"}, content=True)
         if meta_dur:
             try:
                 duration = float(meta_dur["content"])
-            except Exception:
-                pass
+            except (ValueError, TypeError) as exc:
+                log_suppressed(logger, "Could not parse meta[name=duration]", exc, level="debug")
         return title, duration
-    except Exception:
+    except Exception as exc:
+        log_suppressed(logger, f"Could not fetch metadata for {url}", exc, level="warning")
         return url, None
 
 @router.post("/videos", response_model=VideoOut)
 def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = Depends(verify_token)):
     if not is_safe_url(video.url):
-        raise HTTPException(status_code=400, detail="Forbidden URL strictly isolated.")
+        raise HTTPException(status_code=400, detail=FORBIDDEN_URL_MSG)
         
     # Prevent duplicate videos by URL (normalize URL)
     norm_url = video.url.strip().lower()
@@ -95,7 +99,7 @@ def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = De
             title = scraped_title
         if duration is None:
             duration = scraped_duration
-    db_video = Video(url=norm_url, category=video.category or "uncategorized", title=title, duration=duration)
+    db_video = Video(url=norm_url, category=video.category or DEFAULT_CATEGORY, title=title, duration=duration)
     db.add(db_video)
     db.commit()
     db.refresh(db_video)
@@ -152,8 +156,9 @@ def download_video(video_id: int, db: Session = Depends(get_db), token: str = De
     settings = get_settings()
     title = _safe_title(video.title or "", video_id)
 
-    # Local uploaded file
-    if "temp_storage" in video_url and ("localhost" in video_url or "127.0.0.1" in video_url):
+    # Local uploaded file — use URL parsing instead of substring matching
+    _parsed = urlparse(video_url)
+    if _parsed.path.startswith("/temp_storage/") and _parsed.hostname in ("localhost", "127.0.0.1", "0.0.0.0"):
         filename = filename_from_url(video_url)
         filepath = os.path.join(settings.temp_storage_dir, filename)
         if os.path.exists(filepath):
@@ -172,7 +177,7 @@ def download_video(video_id: int, db: Session = Depends(get_db), token: str = De
         def _stream():
             try:
                 with requests.get(
-                    video_url, stream=True, timeout=30,
+                    video_url, stream=True, timeout=PROXY_DOWNLOAD_TIMEOUT_SECS,
                     headers={"User-Agent": random.choice(USER_AGENTS)},
                 ) as r:
                     r.raise_for_status()
@@ -217,12 +222,12 @@ def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_token)
     and the worker adds the video to the DB when done.
     """
     url = data.get("url")
-    category = data.get("category", "uncategorized")
+    category = data.get("category", DEFAULT_CATEGORY)
     logger.info(f"Received video extraction request for URL: {url}")
     if not url:
         raise HTTPException(status_code=400, detail="Missing url")
     if not is_safe_url(url):
-        raise HTTPException(status_code=400, detail="Forbidden URL strictly isolated.")
+        raise HTTPException(status_code=400, detail=FORBIDDEN_URL_MSG)
 
     queue = _get_queue()
     job = queue.enqueue(url=url, category=category, token=token)
@@ -240,11 +245,11 @@ def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_token)
 def enqueue_video(data: dict = Body(...), token: str = Depends(verify_token)):
     """Enqueue a long-running video recording job (up to 2h). Returns immediately."""
     url = data.get("url")
-    category = data.get("category", "uncategorized")
+    category = data.get("category", DEFAULT_CATEGORY)
     if not url:
         raise HTTPException(status_code=400, detail="Missing url")
     if not is_safe_url(url):
-        raise HTTPException(status_code=400, detail="Forbidden URL strictly isolated.")
+        raise HTTPException(status_code=400, detail=FORBIDDEN_URL_MSG)
 
     queue = _get_queue()
     job = queue.enqueue(url=url, category=category, token=token)

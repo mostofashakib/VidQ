@@ -25,6 +25,7 @@ from app.services.worker_runtime import (
 logger = logging.getLogger("TranslateWorker")
 
 MAX_WORKERS = 3  # Whisper + LLM are heavy; keep pool smaller
+AUDIO_EXTRACT_TIMEOUT_SECS = 120  # ffmpeg audio strip for a 2h file is ~30s; 120s is a safe ceiling
 
 _jobs: dict[str, "TranslateJob"] = {}
 _lock = threading.Lock()
@@ -108,7 +109,7 @@ def _extract_audio(job: TranslateJob, video_path: str, audio_path: str) -> bool:
         audio_path,
     ]
     logger.info(f"[{job.job_id}] Extracting audio → {os.path.basename(audio_path)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=AUDIO_EXTRACT_TIMEOUT_SECS)
     if result.returncode != 0 or not os.path.exists(audio_path):
         logger.error(f"[{job.job_id}] Audio extraction failed: {result.stderr[-300:]}")
         return False

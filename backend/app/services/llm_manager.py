@@ -6,7 +6,11 @@ import httpx
 from openai import AsyncOpenAI, RateLimitError
 from anthropic import AsyncAnthropic
 
-logger = logging.getLogger(__name__)
+from app.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+OPENROUTER_MAX_RETRIES = 4  # exponential backoff: 1s, 2s, 4s before final raise
 
 def _parse_json(text: str) -> dict:
     """Extract the first JSON object from an LLM response string."""
@@ -69,8 +73,8 @@ class LLMProvider(abc.ABC):
 class OllamaProvider(LLMProvider):
     def __init__(
         self,
-        model_name: str = "qwen3.5:latest",
-        host: str = "http://127.0.0.1:11434",
+        model_name: str,
+        host: str,
     ):
         self.model_name = model_name
         self.host = host.rstrip("/")
@@ -161,12 +165,13 @@ class OllamaProvider(LLMProvider):
 
 
 class OpenAIProvider(LLMProvider):
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str):
         self.client = AsyncOpenAI(api_key=api_key)
+        self.model_name = model
 
     async def call_text(self, prompt: str) -> dict:
         response = await self.client.chat.completions.create(
-            model="gpt-4o",
+            model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=1000,
             temperature=0.2,
@@ -175,7 +180,7 @@ class OpenAIProvider(LLMProvider):
 
     async def call_translate_text(self, prompt: str) -> str:
         response = await self.client.chat.completions.create(
-            model="gpt-4o",
+            model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=4096,
             temperature=0.1,
@@ -184,7 +189,7 @@ class OpenAIProvider(LLMProvider):
 
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
         response = await self.client.chat.completions.create(
-            model="gpt-4o",
+            model=self.model_name,
             messages=[
                 {
                     "role": "user",
@@ -201,25 +206,30 @@ class OpenAIProvider(LLMProvider):
 
 
 class OpenRouterProvider(LLMProvider):
-    def __init__(self, api_key: str, model: str = "google/gemma-4-31b-it:free"):
+    def __init__(self, api_key: str, model: str = "google/gemma-4-31b-it:free", site_url: str = ""):
+        from app.config import get_settings
         self.model_name = model
+        referer = site_url or get_settings().openrouter_site_url
         self.client = AsyncOpenAI(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
-            default_headers={"HTTP-Referer": "https://vidq.app", "X-Title": "vidQ"},
+            default_headers={"HTTP-Referer": referer, "X-Title": "vidQ"},
         )
 
     async def _create(self, **kwargs) -> str:
         """Call completions with exponential backoff on 429s."""
-        for attempt in range(4):
+        for attempt in range(OPENROUTER_MAX_RETRIES):
             try:
                 response = await self.client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content.strip()
             except RateLimitError:
-                if attempt == 3:
+                if attempt == OPENROUTER_MAX_RETRIES - 1:
                     raise
                 wait = 2 ** attempt
-                logger.warning(f"OpenRouter 429 — retrying in {wait}s (attempt {attempt + 1}/4)…")
+                logger.warning(
+                    f"OpenRouter 429 — retrying in {wait}s "
+                    f"(attempt {attempt + 1}/{OPENROUTER_MAX_RETRIES})…"
+                )
                 await asyncio.sleep(wait)
 
     async def call_text(self, prompt: str) -> dict:
@@ -258,12 +268,13 @@ class OpenRouterProvider(LLMProvider):
 
 
 class AnthropicProvider(LLMProvider):
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, model: str):
         self.client = AsyncAnthropic(api_key=api_key)
+        self.model_name = model
 
     async def call_text(self, prompt: str) -> dict:
         response = await self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=self.model_name,
             max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -271,7 +282,7 @@ class AnthropicProvider(LLMProvider):
 
     async def call_translate_text(self, prompt: str) -> str:
         response = await self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=self.model_name,
             max_tokens=4096,
             messages=[{"role": "user", "content": prompt}],
         )
@@ -279,7 +290,7 @@ class AnthropicProvider(LLMProvider):
 
     async def call_vision(self, prompt: str, image_b64: str) -> dict:
         response = await self.client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=self.model_name,
             max_tokens=1000,
             messages=[
                 {
@@ -345,21 +356,16 @@ class FallbackLLMManager:
         for original_idx, provider in self._ordered_providers():
             provider_label = self._provider_label(provider)
             method = getattr(provider, method_name)
-            for attempt in range(1):
-                try:
-                    if attempt == 0:
-                        logger.info(f"[{method_name}] Using {provider_label}")
-                    else:
-                        logger.warning(f"[{method_name}] Retrying {provider_label} (attempt 2)...")
-                    result = await method(*args)
-                    if self._working_provider_index != original_idx:
-                        logger.info(f"Promoting {provider_label} as preferred provider.")
-                        self._working_provider_index = original_idx
-                    return result
-                except Exception as e:
-                    logger.warning(f"[{method_name}] Attempt {attempt + 1} failed for {provider_label}: {e}")
-                    last_error = e
-            logger.error(f"[{method_name}] Both attempts failed for {provider_label}. Trying next...")
+            try:
+                logger.info(f"[{method_name}] Using {provider_label}")
+                result = await method(*args)
+                if self._working_provider_index != original_idx:
+                    logger.info(f"Promoting {provider_label} as preferred provider.")
+                    self._working_provider_index = original_idx
+                return result
+            except Exception as e:
+                logger.warning(f"[{method_name}] {provider_label} failed: {e} — trying next provider")
+                last_error = e
         raise Exception(f"All LLM providers failed. Last error: {last_error}")
 
     async def execute_text(self, prompt: str) -> dict:

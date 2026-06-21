@@ -1,3 +1,4 @@
+import logging
 import os
 import shutil
 import uuid
@@ -5,6 +6,9 @@ import uuid
 from fastapi import HTTPException, UploadFile
 
 from app.config import get_settings
+from app.logging_utils import log_suppressed
+
+logger = logging.getLogger(__name__)
 
 
 def save_upload_file(file: UploadFile, *, prefix: str = "") -> tuple[str, str]:
@@ -22,8 +26,8 @@ def save_upload_file(file: UploadFile, *, prefix: str = "") -> tuple[str, str]:
     except Exception as error:
         try:
             os.remove(file_path)
-        except OSError:
-            pass
+        except OSError as cleanup_err:
+            log_suppressed(logger, f"Could not remove partial upload {file_path}", cleanup_err, level="debug")
         raise HTTPException(status_code=500, detail=f"File upload failed: {error}")
 
     return file_path, original_name
@@ -41,8 +45,8 @@ def save_upload_files(files: list[UploadFile], *, prefix: str = "") -> tuple[lis
         for path in saved_paths:
             try:
                 os.remove(path)
-            except OSError:
-                pass
+            except OSError as cleanup_err:
+                log_suppressed(logger, f"Could not remove partial upload {path}", cleanup_err, level="debug")
         raise
 
     return saved_paths, original_names

@@ -2,9 +2,13 @@ from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime
 
+DEFAULT_CATEGORY = "uncategorized"
+FORBIDDEN_URL_MSG = "Forbidden URL: access to internal addresses is not allowed."
+
+
 class VideoCreate(BaseModel):
     url: str
-    category: str = "uncategorized"
+    category: str = DEFAULT_CATEGORY
     title: Optional[str] = None
     duration: Optional[float] = None
     thumbnail: Optional[str] = None

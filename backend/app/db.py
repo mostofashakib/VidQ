@@ -3,6 +3,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 from app.config import get_settings
+from app.models import DEFAULT_CATEGORY
 
 settings = get_settings()
 SQLALCHEMY_DATABASE_URL = settings.database_url
@@ -15,7 +16,7 @@ class Video(Base):
     __tablename__ = "videos"
     id = Column(Integer, primary_key=True, index=True)
     url = Column(String, nullable=False)
-    category = Column(String, nullable=True, default="uncategorized")
+    category = Column(String, nullable=True, default=DEFAULT_CATEGORY)
     title = Column(String, nullable=True)
     duration = Column(Float, nullable=True)  # duration in seconds
     thumbnail = Column(String, nullable=True)  # URL or base64
