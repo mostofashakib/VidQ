@@ -1,0 +1,27 @@
+# Python
+backend/.venv/
+backend/.realesrgan-venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/models/
+backend/temp_storage/
+backend/videos.db
+backend/.env
+backend/tests/
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/.vercel/
+frontend/coverage/
+
+# Dev/local
+.uv-cache/
+.claude/
+.vscode/
+.DS_Store
+*.pem
+storage_state.json
