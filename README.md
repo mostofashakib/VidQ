@@ -1,8 +1,8 @@
-# VidQ
+# VidQ — AI Media Studio
 
-Self-hosted video automation for downloading, converting, combining, translating, trimming, and enhancing videos from one local web app.
+Self-hosted AI media studio for downloading, converting, combining, translating, trimming, and enhancing videos from one local web app.
 
-VidQ is built for people who want a private video workstation they can clone, run, and use without hunting through dependency docs.
+VidQ is an AI Media Studio built for people who want a private video workstation they can clone, run, and use without hunting through dependency docs.
 
 ## Install
 
