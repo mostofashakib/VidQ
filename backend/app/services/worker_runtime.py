@@ -103,6 +103,7 @@ def process_queued_job(
     cleanup_cancelled: Callable[[Any | None], None],
     picked_message: Callable[[Any], str],
     process: Callable[[Any], None],
+    acquire_global_slot: bool = True,
 ) -> None:
     from app.services.global_semaphore import global_job_semaphore
 
@@ -112,11 +113,13 @@ def process_queued_job(
         logger.info(f"[{job_id}] Skipped (cancelled before pickup)")
         return
 
-    global_job_semaphore.acquire()
+    if acquire_global_slot:
+        global_job_semaphore.acquire()
     try:
         with lock:
             job.status = "processing"
         logger.info(picked_message(job))
         process(job)
     finally:
-        global_job_semaphore.release()
+        if acquire_global_slot:
+            global_job_semaphore.release()

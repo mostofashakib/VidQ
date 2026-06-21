@@ -67,6 +67,8 @@ def run_progress_process(
         **process_kwargs,
     )
     with lock:
+        if hasattr(job, "_procs"):
+            job._procs.add(proc)
         job._proc = proc
 
     def drain_stderr() -> None:
@@ -94,7 +96,11 @@ def run_progress_process(
     stderr_thread.join(timeout=2)
 
     with lock:
-        job._proc = None
+        if hasattr(job, "_procs"):
+            job._procs.discard(proc)
+            job._proc = next(iter(job._procs), None)
+        else:
+            job._proc = None
         cancelled = job.status == "cancelled"
 
     return ProcessRunResult(

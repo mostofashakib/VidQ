@@ -7,6 +7,8 @@ import subprocess
 import threading
 import logging
 import signal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from typing import Optional
 from pathlib import Path
 
@@ -14,9 +16,9 @@ import imageio_ffmpeg
 
 from app.config import get_settings
 from app.services.ffmpeg_utils import ProcessRunResult, run_progress_process
+from app.services.global_semaphore import global_job_semaphore
 from app.services.worker_runtime import (
     WorkerPoolState,
-    cancel_registered_job,
     cleanup_paths,
     enqueue_registered_job,
     ensure_worker_pool,
@@ -29,6 +31,7 @@ logger = logging.getLogger("EnhanceWorker")
 
 MAX_WORKERS = 5
 CHUNK_DURATION = 60
+MAX_CHUNK_WORKERS = 5
 
 _jobs: dict[str, "EnhanceJob"] = {}
 _lock = threading.Lock()
@@ -46,6 +49,7 @@ class EnhanceJob:
         self.error: Optional[str] = None
         self.result_url: Optional[str] = None
         self._proc: Optional[subprocess.Popen] = None
+        self._procs: set[subprocess.Popen] = set()
 
 
 class _CancelledError(Exception):
@@ -168,6 +172,7 @@ def _worker_loop() -> None:
                 cleanup_cancelled=lambda job: cleanup_paths([job.input_path]) if job else None,
                 picked_message=lambda job: f"[{job.job_id}] Worker picked up enhance job",
                 process=lambda job: _process_job(job.job_id),
+                acquire_global_slot=False,
             )
         except Exception as e:
             logger.error(f"Enhance worker loop error for {job_id}: {e}", exc_info=True)
@@ -179,8 +184,31 @@ def get_job(job_id: str) -> Optional[EnhanceJob]:
     return get_registered_job(_jobs, _lock, job_id)
 
 
+def _kill_job_processes(job: EnhanceJob) -> None:
+    with _lock:
+        procs = list(job._procs)
+        current_proc = job._proc
+
+    for proc in procs:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    if current_proc:
+        try:
+            current_proc.kill()
+        except Exception:
+            pass
+
+
 def cancel_job(job_id: str) -> bool:
-    return cancel_registered_job(_jobs, _lock, job_id)
+    with _lock:
+        job = _jobs.get(job_id)
+        if not job or job.status in ("done", "failed", "cancelled"):
+            return False
+        job.status = "cancelled"
+    _kill_job_processes(job)
+    return True
 
 
 def start_enhance_job(input_path: str) -> str:
@@ -261,6 +289,25 @@ def _run_subprocess(job_id: str, cmd: list[str]) -> None:
     result = _run_subprocess_result(job_id, cmd)
     if result.returncode != 0:
         raise _SubprocessError(result.returncode, result.stderr)
+
+
+def _raise_if_cancelled(job_id: str) -> None:
+    with _lock:
+        job = _jobs[job_id]
+        if job.status == "cancelled":
+            raise _CancelledError()
+
+
+@contextmanager
+def _global_slot(job_id: str):
+    acquired = False
+    while not acquired:
+        _raise_if_cancelled(job_id)
+        acquired = global_job_semaphore.acquire(timeout=0.1)
+    try:
+        yield
+    finally:
+        global_job_semaphore.release()
 
 
 def _frame_paths(frames_dir: str) -> list[str]:
@@ -461,6 +508,65 @@ def _target_enhance_height(height: int) -> int:
     return target_height
 
 
+def _process_chunk(
+    *,
+    job_id: str,
+    chunk_index: int,
+    chunk_path: str,
+    tmp_base: str,
+    ffmpeg_exe: str,
+    fps: float,
+    target_height: int,
+    backend: str,
+    real_esrgan_bin: str | None,
+    real_esrgan_python: str | None,
+    real_esrgan_model_path: str | None,
+) -> tuple[int, str]:
+    with _global_slot(job_id):
+        _raise_if_cancelled(job_id)
+
+        frames_dir = os.path.join(tmp_base, f"frames_{chunk_index:04d}")
+        enhanced_dir = os.path.join(tmp_base, f"enhanced_{chunk_index:04d}")
+        enhanced_chunk = os.path.join(tmp_base, f"enhanced_chunk_{chunk_index:04d}.mp4")
+
+        try:
+            os.makedirs(frames_dir)
+            os.makedirs(enhanced_dir)
+
+            _run_subprocess(job_id, [
+                ffmpeg_exe, "-y", "-i", chunk_path,
+                os.path.join(frames_dir, "%08d.png"),
+            ])
+
+            _run_real_esrgan(
+                job_id,
+                backend=backend,
+                real_esrgan_bin=real_esrgan_bin,
+                python_executable=real_esrgan_python,
+                model_path=real_esrgan_model_path,
+                frames_dir=frames_dir,
+                enhanced_dir=enhanced_dir,
+            )
+
+            _run_subprocess(job_id, [
+                ffmpeg_exe, "-y",
+                "-framerate", str(fps),
+                "-i", os.path.join(enhanced_dir, "%08d.png"),
+                "-vf", f"scale=-2:{target_height}",
+                "-c:v", "libx264",
+                "-crf", "18",
+                "-preset", "slow",
+                "-pix_fmt", "yuv420p",
+                enhanced_chunk,
+            ])
+
+            return chunk_index, enhanced_chunk
+
+        finally:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+            shutil.rmtree(enhanced_dir, ignore_errors=True)
+
+
 def _process_job(job_id: str) -> None:
     job = _jobs[job_id]
     settings = get_settings()
@@ -509,11 +615,12 @@ def _process_job(job_id: str) -> None:
         audio_path = os.path.join(tmp_base, "audio.m4a")
         has_audio = False
         try:
-            _run_subprocess(job_id, [
-                ffmpeg_exe, "-y", "-i", job.input_path,
-                "-vn", "-c:a", "aac", "-b:a", "192k",
-                audio_path,
-            ])
+            with _global_slot(job_id):
+                _run_subprocess(job_id, [
+                    ffmpeg_exe, "-y", "-i", job.input_path,
+                    "-vn", "-c:a", "aac", "-b:a", "192k",
+                    audio_path,
+                ])
             has_audio = os.path.exists(audio_path) and os.path.getsize(audio_path) > 0
         except _CancelledError:
             raise
@@ -522,13 +629,14 @@ def _process_job(job_id: str) -> None:
 
         # 6. Split into 60s chunks (video track only)
         chunk_pattern = os.path.join(chunks_dir, "chunk_%04d.mp4")
-        _run_subprocess(job_id, [
-            ffmpeg_exe, "-y", "-i", job.input_path,
-            "-c", "copy", "-map", "0:v",
-            "-f", "segment", "-segment_time", str(CHUNK_DURATION),
-            "-reset_timestamps", "1",
-            chunk_pattern,
-        ])
+        with _global_slot(job_id):
+            _run_subprocess(job_id, [
+                ffmpeg_exe, "-y", "-i", job.input_path,
+                "-c", "copy", "-map", "0:v",
+                "-f", "segment", "-segment_time", str(CHUNK_DURATION),
+                "-reset_timestamps", "1",
+                chunk_pattern,
+            ])
 
         chunk_files = sorted(glob.glob(os.path.join(chunks_dir, "chunk_*.mp4")))
         if not chunk_files:
@@ -538,60 +646,61 @@ def _process_job(job_id: str) -> None:
         with _lock:
             job.progress = 5
 
-        # 7. Process each chunk
-        enhanced_chunks: list[str] = []
-        for idx, chunk_path in enumerate(chunk_files):
-            with _lock:
-                if job.status == "cancelled":
-                    raise _CancelledError()
-                job.phase = f"enhancing {idx + 1}/{total_chunks}"
-                job.progress = 5 + int((idx / total_chunks) * 85)
+        # 7. Process chunks in parallel, preserving output order for concat.
+        enhanced_chunks: list[str | None] = [None] * total_chunks
+        completed_chunks = 0
+        chunk_workers = min(MAX_CHUNK_WORKERS, total_chunks)
+        logger.info(f"[{job_id}] Enhancing {total_chunks} chunks with {chunk_workers} workers")
 
-            frames_dir = os.path.join(tmp_base, f"frames_{idx:04d}")
-            enhanced_dir = os.path.join(tmp_base, f"enhanced_{idx:04d}")
-            enhanced_chunk = os.path.join(tmp_base, f"enhanced_chunk_{idx:04d}.mp4")
+        with _lock:
+            if job.status == "cancelled":
+                raise _CancelledError()
+            job.phase = f"enhancing 0/{total_chunks}"
+            job.progress = 5
 
-            try:
-                os.makedirs(frames_dir)
-                os.makedirs(enhanced_dir)
-
-                # a. Extract frames as PNG to avoid lossy pre-processing.
-                _run_subprocess(job_id, [
-                    ffmpeg_exe, "-y", "-i", chunk_path,
-                    os.path.join(frames_dir, "%08d.png"),
-                ])
-
-                # b. AI upscale 4× with realesrgan-x4plus.
-                _run_real_esrgan(
-                    job_id,
+        with ThreadPoolExecutor(max_workers=chunk_workers, thread_name_prefix=f"enhance-{job_id[:8]}") as executor:
+            futures = [
+                executor.submit(
+                    _process_chunk,
+                    job_id=job_id,
+                    chunk_index=idx,
+                    chunk_path=chunk_path,
+                    tmp_base=tmp_base,
+                    ffmpeg_exe=ffmpeg_exe,
+                    fps=fps,
+                    target_height=target_height,
                     backend=backend,
                     real_esrgan_bin=real_esrgan_bin,
-                    python_executable=real_esrgan_python,
-                    model_path=real_esrgan_model_path,
-                    frames_dir=frames_dir,
-                    enhanced_dir=enhanced_dir,
+                    real_esrgan_python=real_esrgan_python,
+                    real_esrgan_model_path=real_esrgan_model_path,
                 )
+                for idx, chunk_path in enumerate(chunk_files)
+            ]
 
-                # c. Reassemble chunk at target resolution
-                video_filter = f"scale=-2:{target_height}"
+            try:
+                for future in as_completed(futures):
+                    idx, enhanced_chunk = future.result()
+                    enhanced_chunks[idx] = enhanced_chunk
+                    completed_chunks += 1
+                    with _lock:
+                        if job.status == "cancelled":
+                            raise _CancelledError()
+                        job.phase = f"enhancing {completed_chunks}/{total_chunks}"
+                        job.progress = 5 + int((completed_chunks / total_chunks) * 85)
+            except _CancelledError:
+                for future in futures:
+                    future.cancel()
+                _kill_job_processes(job)
+                raise
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                _kill_job_processes(job)
+                raise
 
-                _run_subprocess(job_id, [
-                    ffmpeg_exe, "-y",
-                    "-framerate", str(fps),
-                    "-i", os.path.join(enhanced_dir, "%08d.png"),
-                    "-vf", video_filter,
-                    "-c:v", "libx264",
-                    "-crf", "18",
-                    "-preset", "slow",
-                    "-pix_fmt", "yuv420p",
-                    enhanced_chunk,
-                ])
-
-                enhanced_chunks.append(enhanced_chunk)
-
-            finally:
-                shutil.rmtree(frames_dir, ignore_errors=True)
-                shutil.rmtree(enhanced_dir, ignore_errors=True)
+        if any(chunk is None for chunk in enhanced_chunks):
+            raise RuntimeError("One or more chunks did not finish enhancing")
+        ordered_enhanced_chunks = [chunk for chunk in enhanced_chunks if chunk is not None]
 
         # 8. Assemble all chunks + mux audio
         with _lock:
@@ -600,25 +709,27 @@ def _process_job(job_id: str) -> None:
 
         concat_list = os.path.join(tmp_base, "concat_list.txt")
         with open(concat_list, "w") as f:
-            for c in enhanced_chunks:
+            for c in ordered_enhanced_chunks:
                 f.write(f"file '{c}'\n")
 
         if has_audio:
-            _run_subprocess(job_id, [
-                ffmpeg_exe, "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_list,
-                "-i", audio_path,
-                "-map", "0:v", "-map", "1:a",
-                "-c:v", "copy", "-c:a", "copy",
-                out_path,
-            ])
+            with _global_slot(job_id):
+                _run_subprocess(job_id, [
+                    ffmpeg_exe, "-y",
+                    "-f", "concat", "-safe", "0", "-i", concat_list,
+                    "-i", audio_path,
+                    "-map", "0:v", "-map", "1:a",
+                    "-c:v", "copy", "-c:a", "copy",
+                    out_path,
+                ])
         else:
-            _run_subprocess(job_id, [
-                ffmpeg_exe, "-y",
-                "-f", "concat", "-safe", "0", "-i", concat_list,
-                "-c", "copy",
-                out_path,
-            ])
+            with _global_slot(job_id):
+                _run_subprocess(job_id, [
+                    ffmpeg_exe, "-y",
+                    "-f", "concat", "-safe", "0", "-i", concat_list,
+                    "-c", "copy",
+                    out_path,
+                ])
 
         if not os.path.exists(out_path) or os.path.getsize(out_path) < 1000:
             raise RuntimeError("Assembly produced empty output")

@@ -4,6 +4,7 @@ import io
 import os
 import shutil
 import subprocess
+import threading
 import time
 import pytest
 from unittest.mock import patch
@@ -11,6 +12,7 @@ from unittest.mock import patch
 import imageio_ffmpeg
 
 from app.config import get_settings
+from app.services.global_semaphore import global_job_semaphore
 
 AUTH = {"Authorization": "Bearer test-token"}
 
@@ -397,6 +399,97 @@ def test_enhance_job_completes(client):
     assert result["status"] == "done", f"Expected done, got: {result}"
     assert result["result_url"] is not None
     assert result["progress"] == 100
+
+
+def test_enhance_processes_chunks_in_parallel(client):
+    """Chunk workers should draw from the shared global semaphore capacity."""
+    active_count = 0
+    max_active_count = 0
+    active_lock = threading.Lock()
+
+    def fake_popen(cmd, stdout=None, stderr=None, **kwargs):
+        cmd_list = list(cmd)
+
+        class FP:
+            def __init__(self):
+                self.stdout = iter([])
+                self.stderr = iter([])
+                self.returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+            def kill(self):
+                self.returncode = -9
+
+        if "-segment_time" in cmd_list:
+            pattern = cmd_list[-1]
+            chunk_dir = os.path.dirname(pattern)
+            os.makedirs(chunk_dir, exist_ok=True)
+            for chunk_index in range(5):
+                with open(os.path.join(chunk_dir, f"chunk_{chunk_index:04d}.mp4"), "wb") as f:
+                    f.write(b"fake-chunk" * 200)
+        elif str(cmd_list[-1]).endswith("%08d.png"):
+            frames_dir = os.path.dirname(cmd_list[-1])
+            os.makedirs(frames_dir, exist_ok=True)
+            with open(os.path.join(frames_dir, "00000001.png"), "wb") as f:
+                f.write(b"fake-png" * 200)
+        else:
+            output_path = cmd_list[-1]
+            if not output_path.startswith("-") and "%" not in output_path and not output_path.endswith(".txt"):
+                parent = os.path.dirname(output_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(output_path, "wb") as f:
+                    f.write(b"fake-data" * 200)
+
+        return FP()
+
+    def fake_real_esrgan(*args, **kwargs):
+        nonlocal active_count, max_active_count
+        with active_lock:
+            active_count += 1
+            max_active_count = max(max_active_count, active_count)
+
+        try:
+            time.sleep(0.1)
+            frames_dir = kwargs["frames_dir"]
+            enhanced_dir = kwargs["enhanced_dir"]
+            os.makedirs(enhanced_dir, exist_ok=True)
+            for frame_name in os.listdir(frames_dir):
+                shutil.copy(
+                    os.path.join(frames_dir, frame_name),
+                    os.path.join(enhanced_dir, frame_name),
+                )
+        finally:
+            with active_lock:
+                active_count -= 1
+
+    reserved_slots = 2
+    for _ in range(reserved_slots):
+        global_job_semaphore.acquire()
+    try:
+        with patch("app.services.enhance_worker._resolve_real_esrgan_bin",
+                   return_value="/usr/local/bin/realesrgan-ncnn-vulkan"):
+            with patch("app.services.enhance_worker._probe_video",
+                       return_value=(30.0, 305.0, 640, 480)):
+                with patch("app.services.enhance_worker.subprocess.Popen", fake_popen):
+                    with patch("app.services.enhance_worker._run_real_esrgan",
+                               side_effect=fake_real_esrgan):
+                        r = client.post(
+                            "/enhance-video",
+                            files=[("file", ("video.mp4", io.BytesIO(_fake_mp4()), "video/mp4"))],
+                            headers=AUTH,
+                        )
+                        assert r.status_code == 200
+                        result = _wait_for_enhance_job(client, r.json()["job_id"])
+    finally:
+        for _ in range(reserved_slots):
+            global_job_semaphore.release()
+
+    assert result["status"] == "done", f"Expected done, got: {result}"
+    assert max_active_count > 1
+    assert max_active_count <= 3
 
 
 def test_enhance_retries_frame_by_frame_when_realesrgan_directory_mode_crashes(client):

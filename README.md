@@ -129,7 +129,7 @@ REAL_ESRGAN_MODEL_PATH=/path/to/backend/models/realesrgan/RealESRGAN_x4plus.pth
 - **Combine** - drop 2-20 clips; VidQ merges them into one MP4 with crossfades.
 - **Translate** - upload a video; VidQ transcribes, translates, and burns English subtitles.
 - **Trim** - upload a video; VidQ exports the selected timeline segment.
-- **Enhance** - upload low-quality footage; VidQ uses Real-ESRGAN to clean and upscale it.
+- **Enhance** - upload low-quality footage; VidQ runs parallel chunked Real-ESRGAN upscaling with safe fallback handling.
 
 Every feature has a job queue with progress, cancellation, and download links.
 
@@ -265,14 +265,14 @@ Download uses a staged pipeline:
 2. Launch Chromium, inspect network traffic, and use heuristics plus an LLM-guided click loop to start playback.
 3. Fall back to MediaRecorder for blob and DRM-adjacent streams when direct download fails.
 
-Enhance uses a chunked Real-ESRGAN pipeline:
+Enhance uses a parallel chunked Real-ESRGAN pipeline:
 
 1. Split the video into 60-second chunks.
-2. Extract frames from one chunk at a time.
-3. Upscale frames with Real-ESRGAN ncnn, falling back to Python Real-ESRGAN if ncnn crashes.
-4. Reassemble chunks and mux the original audio.
+2. Process up to 5 chunks in parallel across the shared global worker capacity.
+3. Extract frames, upscale them with Real-ESRGAN ncnn, and fall back to Python Real-ESRGAN when ncnn crashes.
+4. Preserve chunk order, reassemble the video, and mux the original audio.
 
-This keeps disk usage bounded during long Enhance jobs.
+This keeps disk usage bounded during long Enhance jobs while fully using available worker capacity without starving other queued jobs.
 
 ## License
 
