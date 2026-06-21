@@ -80,6 +80,70 @@ install_real_esrgan_macos() {
     echo "Symlinked: ${bin_dir}/realesrgan-ncnn-vulkan"
 }
 
+install_python_realesrgan() {
+    local venv_dir="${BACKEND_DIR}/.realesrgan-venv"
+    local model_dir="${BACKEND_DIR}/models/realesrgan"
+    local model_path="${model_dir}/RealESRGAN_x4plus.pth"
+    local model_url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+    local python_bin="${venv_dir}/bin/python"
+
+    ensure_command curl "Install curl, then rerun ./setup.sh."
+
+    if [ ! -x "$python_bin" ]; then
+        log "Creating Python Real-ESRGAN backend venv"
+        if command -v uv >/dev/null 2>&1; then
+            uv python install 3.11
+            uv venv --python 3.11 "$venv_dir"
+        else
+            python3 -m venv "$venv_dir"
+        fi
+    else
+        echo "Found Python Real-ESRGAN backend venv: ${python_bin}"
+    fi
+
+    if ! "$python_bin" - <<'PY' >/dev/null 2>&1
+import cv2
+import torch
+import basicsr
+import facexlib
+import gfpgan
+import realesrgan
+PY
+    then
+        log "Installing Python Real-ESRGAN backend packages"
+        if ! "$python_bin" -m pip --version >/dev/null 2>&1; then
+            "$python_bin" -m ensurepip --upgrade || true
+        fi
+        if "$python_bin" -m pip --version >/dev/null 2>&1; then
+            "$python_bin" -m pip install --upgrade pip
+            "$python_bin" -m pip install "numpy<2" "torch==2.1.2" "torchvision==0.16.2"
+            "$python_bin" -m pip install "opencv-python==4.9.0.80" basicsr facexlib gfpgan realesrgan
+        elif command -v uv >/dev/null 2>&1; then
+            uv pip install --python "$python_bin" "numpy<2" "torch==2.1.2" "torchvision==0.16.2"
+            uv pip install --python "$python_bin" "opencv-python==4.9.0.80" basicsr facexlib gfpgan realesrgan
+        else
+            echo "Could not install Python Real-ESRGAN packages because pip is missing." >&2
+            echo "Install pip in ${venv_dir}, or install uv and rerun ./setup.sh." >&2
+            exit 1
+        fi
+    else
+        echo "Python Real-ESRGAN packages already installed"
+    fi
+
+    mkdir -p "$model_dir"
+    if [ ! -f "$model_path" ]; then
+        log "Downloading RealESRGAN_x4plus weights"
+        curl -L --fail "$model_url" -o "$model_path"
+    fi
+
+    update_env_value "REAL_ESRGAN_BACKEND" "auto"
+    update_env_value "REAL_ESRGAN_PYTHON" "$python_bin"
+    update_env_value "REAL_ESRGAN_MODEL_PATH" "$model_path"
+
+    echo "Installed Python Real-ESRGAN backend: ${python_bin}"
+    echo "Installed model weights: ${model_path}"
+}
+
 log "Checking required runtimes"
 ensure_command python3 "Install Python 3.10+ from https://www.python.org/downloads/."
 
@@ -145,6 +209,12 @@ elif [ "$(uname -s)" = "Darwin" ]; then
 else
     echo "Real-ESRGAN is only auto-installed by this script on macOS."
     echo "Install realesrgan-ncnn-vulkan manually, then set REAL_ESRGAN_BIN in backend/.env."
+fi
+
+if [ "${SKIP_PYTHON_REALESRGAN:-0}" = "1" ]; then
+    echo "Skipped Python Real-ESRGAN backend because SKIP_PYTHON_REALESRGAN=1"
+else
+    install_python_realesrgan
 fi
 
 log "Setup complete"

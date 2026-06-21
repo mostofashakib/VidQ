@@ -39,6 +39,10 @@ class Settings:
         # Set this when the binary is installed outside PATH, for example:
         # REAL_ESRGAN_BIN=/opt/homebrew/bin/realesrgan-ncnn-vulkan
         self.real_esrgan_bin: str = os.getenv("REAL_ESRGAN_BIN", "").strip()
+        # Enhance backend selection: auto | ncnn | python
+        self.real_esrgan_backend: str = os.getenv("REAL_ESRGAN_BACKEND", "auto").lower().strip()
+        self.real_esrgan_python: str = os.getenv("REAL_ESRGAN_PYTHON", "").strip()
+        self.real_esrgan_model_path: str = os.getenv("REAL_ESRGAN_MODEL_PATH", "").strip()
 
         # Base URL for generating self-referencing URLs (e.g. temp_storage links)
         self.base_url: str = os.getenv("BASE_URL", "http://localhost:8000")

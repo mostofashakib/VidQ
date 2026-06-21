@@ -45,16 +45,26 @@ def run_progress_process(
     lock: threading.Lock,
     popen: Callable[..., subprocess.Popen],
     on_progress: Callable[[float], None] | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> ProcessRunResult:
     stderr_lines: list[str] = []
+    process_kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+    }
+    if cwd is not None:
+        process_kwargs["cwd"] = cwd
+    if env is not None:
+        process_kwargs["env"] = env
+
     proc = popen(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        bufsize=1,
+        **process_kwargs,
     )
     with lock:
         job._proc = proc

@@ -6,13 +6,14 @@ import shutil
 import subprocess
 import threading
 import logging
+import signal
 from typing import Optional
 from pathlib import Path
 
 import imageio_ffmpeg
 
 from app.config import get_settings
-from app.services.ffmpeg_utils import run_progress_process
+from app.services.ffmpeg_utils import ProcessRunResult, run_progress_process
 from app.services.worker_runtime import (
     WorkerPoolState,
     cancel_registered_job,
@@ -51,11 +52,18 @@ class _CancelledError(Exception):
     pass
 
 
+class _SubprocessError(RuntimeError):
+    def __init__(self, returncode: int, stderr: str):
+        self.returncode = returncode
+        self.stderr = stderr
+        super().__init__(_format_subprocess_failure(returncode, stderr))
+
+
 def _real_esrgan_install_message() -> str:
     return (
-        "realesrgan-ncnn-vulkan not found. "
-        "Run ./setup.sh, or set REAL_ESRGAN_BIN "
-        "to the full path of the realesrgan-ncnn-vulkan executable."
+        "Real-ESRGAN is not configured. Run ./setup.sh, or set "
+        "REAL_ESRGAN_BIN for ncnn Vulkan / REAL_ESRGAN_PYTHON and "
+        "REAL_ESRGAN_MODEL_PATH for the Python backend."
     )
 
 
@@ -77,6 +85,64 @@ def _resolve_real_esrgan_bin(configured_path: str = "") -> Optional[str]:
             return candidate
 
     return None
+
+
+def _resolve_real_esrgan_python(configured_path: str = "") -> Optional[str]:
+    candidates = []
+    if configured_path:
+        candidates.append(str(Path(configured_path).expanduser()))
+
+    service_dir = Path(__file__).resolve().parent
+    backend_dir = service_dir.parent.parent
+    candidates.extend([
+        str(backend_dir / ".realesrgan-venv" / "bin" / "python"),
+        str(backend_dir / ".venv" / "bin" / "python"),
+    ])
+
+    for candidate in candidates:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def _resolve_real_esrgan_model_path(
+    configured_path: str = "",
+) -> Optional[str]:
+    candidates = []
+    if configured_path:
+        candidates.append(str(Path(configured_path).expanduser()))
+
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    candidates.append(str(backend_dir / "models" / "realesrgan" / "RealESRGAN_x4plus.pth"))
+
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _python_backend_install_message() -> str:
+    return (
+        "Real-ESRGAN ncnn Vulkan crashed and the Python backend is not ready. "
+        "Run ./setup.sh without SKIP_PYTHON_REALESRGAN=1, then restart ./run.sh."
+    )
+
+
+def _format_subprocess_failure(returncode: int, stderr: str) -> str:
+    stderr_tail = stderr[-300:].strip()
+    if returncode < 0:
+        signal_number = -returncode
+        try:
+            signal_name = signal.Signals(signal_number).name
+        except ValueError:
+            signal_name = f"signal {signal_number}"
+        message = f"Subprocess crashed ({signal_name})"
+    else:
+        message = f"Subprocess failed (rc={returncode})"
+
+    if stderr_tail:
+        return f"{message}: {stderr_tail}"
+    return message
 
 
 def _ensure_pool() -> None:
@@ -152,8 +218,8 @@ def _probe_video(input_path: str) -> tuple[float, float, int, int]:
     return fps, duration, width, height
 
 
-def _run_subprocess(job_id: str, cmd: list[str]) -> None:
-    """Run cmd via Popen, store handle in job._proc. Raises _CancelledError or RuntimeError."""
+def _run_subprocess_result(job_id: str, cmd: list[str]) -> ProcessRunResult:
+    """Run cmd via Popen, store handle in job._proc. Raises _CancelledError."""
     job = _jobs[job_id]
     result = run_progress_process(
         cmd=cmd,
@@ -164,10 +230,235 @@ def _run_subprocess(job_id: str, cmd: list[str]) -> None:
 
     if result.cancelled:
         raise _CancelledError()
+    return result
+
+
+def _run_subprocess_result_isolated(
+    job_id: str,
+    cmd: list[str],
+    *,
+    cwd: str,
+) -> ProcessRunResult:
+    """Run helper scripts outside the app package to avoid stdlib module shadowing."""
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    result = run_progress_process(
+        cmd=cmd,
+        job=_jobs[job_id],
+        lock=_lock,
+        popen=subprocess.Popen,
+        cwd=cwd,
+        env=env,
+    )
+
+    if result.cancelled:
+        raise _CancelledError()
+    return result
+
+
+def _run_subprocess(job_id: str, cmd: list[str]) -> None:
+    """Run cmd via Popen, store handle in job._proc. Raises _CancelledError or RuntimeError."""
+    result = _run_subprocess_result(job_id, cmd)
     if result.returncode != 0:
-        raise RuntimeError(
-            f"Subprocess failed (rc={result.returncode}): {result.stderr[-300:]}"
+        raise _SubprocessError(result.returncode, result.stderr)
+
+
+def _frame_paths(frames_dir: str) -> list[str]:
+    return sorted(
+        path for path in glob.glob(os.path.join(frames_dir, "*"))
+        if os.path.isfile(path)
+    )
+
+
+def _is_process_segfault(returncode: int) -> bool:
+    return returncode in (-signal.SIGSEGV, 128 + signal.SIGSEGV)
+
+
+def _is_invalid_tilesize_error(stderr: str) -> bool:
+    return "invalid tilesize argument" in stderr.lower()
+
+
+def _real_esrgan_model_args(real_esrgan_bin: str) -> list[str]:
+    model_dir = os.path.join(os.path.dirname(real_esrgan_bin), "models")
+    if os.path.isdir(model_dir):
+        return ["-m", model_dir]
+    return []
+
+
+def _real_esrgan_python_runner_path() -> str:
+    backend_dir = Path(__file__).resolve().parent.parent.parent
+    return str(backend_dir / "scripts" / "realesrgan_python_runner.py")
+
+
+def _real_esrgan_base_command(
+    real_esrgan_bin: str,
+    input_path: str,
+    output_path: str,
+) -> list[str]:
+    return [
+        real_esrgan_bin,
+        "-i", input_path,
+        "-o", output_path,
+        "-n", "realesrgan-x4plus",
+        "-s", "4",
+        "-f", "png",
+        *_real_esrgan_model_args(real_esrgan_bin),
+    ]
+
+
+def _run_real_esrgan_directory(
+    job_id: str,
+    real_esrgan_bin: str,
+    frames_dir: str,
+    enhanced_dir: str,
+) -> ProcessRunResult:
+    return _run_subprocess_result(
+        job_id,
+        _real_esrgan_base_command(real_esrgan_bin, frames_dir, enhanced_dir),
+    )
+
+
+def _run_real_esrgan_per_frame(
+    job_id: str,
+    real_esrgan_bin: str,
+    frames_dir: str,
+    enhanced_dir: str,
+) -> None:
+    frame_paths = _frame_paths(frames_dir)
+    if not frame_paths:
+        raise RuntimeError("No extracted frames available for Real-ESRGAN")
+
+    os.makedirs(enhanced_dir, exist_ok=True)
+    for frame_path in frame_paths:
+        output_path = os.path.join(
+            enhanced_dir,
+            f"{Path(frame_path).stem}.png",
         )
+        result = _run_subprocess_result(
+            job_id,
+            [
+                *_real_esrgan_base_command(real_esrgan_bin, frame_path, output_path),
+                "-j", "1:1:1",
+            ],
+        )
+        if result.returncode != 0:
+            raise _SubprocessError(result.returncode, result.stderr)
+
+
+def _run_real_esrgan_python_backend(
+    job_id: str,
+    python_executable: str,
+    model_path: str,
+    frames_dir: str,
+    enhanced_dir: str,
+) -> None:
+    backend_dir = str(Path(__file__).resolve().parent.parent.parent)
+    result = _run_subprocess_result_isolated(
+        job_id,
+        [
+            python_executable,
+            _real_esrgan_python_runner_path(),
+            "--input", frames_dir,
+            "--output", enhanced_dir,
+            "--model", model_path,
+            "--tile", "0",
+        ],
+        cwd=backend_dir,
+    )
+    if result.returncode != 0:
+        raise _SubprocessError(result.returncode, result.stderr)
+
+
+def _run_real_esrgan_ncnn_with_frame_retry(
+    job_id: str,
+    real_esrgan_bin: str,
+    frames_dir: str,
+    enhanced_dir: str,
+) -> None:
+    result = _run_real_esrgan_directory(job_id, real_esrgan_bin, frames_dir, enhanced_dir)
+    if result.returncode == 0:
+        return
+
+    last_error = _SubprocessError(result.returncode, result.stderr)
+    if not (
+        _is_process_segfault(result.returncode)
+        or _is_invalid_tilesize_error(result.stderr)
+    ):
+        raise last_error
+
+    logger.warning(
+        "[%s] Real-ESRGAN directory mode failed; retrying frame-by-frame: %s",
+        job_id,
+        last_error,
+    )
+    shutil.rmtree(enhanced_dir, ignore_errors=True)
+    os.makedirs(enhanced_dir, exist_ok=True)
+
+    _run_real_esrgan_per_frame(job_id, real_esrgan_bin, frames_dir, enhanced_dir)
+
+
+def _run_real_esrgan(
+    job_id: str,
+    *,
+    backend: str,
+    real_esrgan_bin: str | None,
+    python_executable: str | None,
+    model_path: str | None,
+    frames_dir: str,
+    enhanced_dir: str,
+) -> None:
+    if backend not in {"auto", "ncnn", "python"}:
+        raise RuntimeError("REAL_ESRGAN_BACKEND must be one of: auto, ncnn, python")
+
+    ncnn_error: Exception | None = None
+    if backend in {"auto", "ncnn"} and real_esrgan_bin:
+        try:
+            _run_real_esrgan_ncnn_with_frame_retry(
+                job_id,
+                real_esrgan_bin,
+                frames_dir,
+                enhanced_dir,
+            )
+            return
+        except _CancelledError:
+            raise
+        except Exception as error:
+            ncnn_error = error
+            if backend == "ncnn":
+                raise
+            logger.warning(
+                "[%s] Real-ESRGAN ncnn backend failed; trying Python backend: %s",
+                job_id,
+                error,
+            )
+            shutil.rmtree(enhanced_dir, ignore_errors=True)
+            os.makedirs(enhanced_dir, exist_ok=True)
+
+    if backend in {"auto", "python"}:
+        if not python_executable or not model_path:
+            if ncnn_error:
+                raise RuntimeError(_python_backend_install_message()) from ncnn_error
+            raise RuntimeError(_real_esrgan_install_message())
+        _run_real_esrgan_python_backend(
+            job_id,
+            python_executable,
+            model_path,
+            frames_dir,
+            enhanced_dir,
+        )
+        return
+
+    raise RuntimeError(_real_esrgan_install_message())
+
+
+def _target_enhance_height(height: int) -> int:
+    if height >= 2160:
+        target_height = height
+    else:
+        target_height = min(max(720, height * 2), 2160)
+    if target_height % 2 != 0:
+        target_height += 1
+    return target_height
 
 
 def _process_job(job_id: str) -> None:
@@ -181,9 +472,22 @@ def _process_job(job_id: str) -> None:
     out_path = os.path.join(settings.temp_storage_dir, out_filename)
 
     try:
-        # 1. Binary check
+        # 1. Backend check
+        backend = settings.real_esrgan_backend
         real_esrgan_bin = _resolve_real_esrgan_bin(settings.real_esrgan_bin)
-        if not real_esrgan_bin:
+        real_esrgan_python = _resolve_real_esrgan_python(settings.real_esrgan_python)
+        real_esrgan_model_path = _resolve_real_esrgan_model_path(settings.real_esrgan_model_path)
+        if backend == "ncnn" and not real_esrgan_bin:
+            with _lock:
+                job.status = "failed"
+                job.error = _real_esrgan_install_message()
+            return
+        if backend == "python" and (not real_esrgan_python or not real_esrgan_model_path):
+            with _lock:
+                job.status = "failed"
+                job.error = _real_esrgan_install_message()
+            return
+        if backend == "auto" and not real_esrgan_bin and (not real_esrgan_python or not real_esrgan_model_path):
             with _lock:
                 job.status = "failed"
                 job.error = _real_esrgan_install_message()
@@ -191,9 +495,7 @@ def _process_job(job_id: str) -> None:
 
         # 2. Probe video metadata
         fps, duration, width, height = _probe_video(job.input_path)
-        target_height = max(720, height)
-        if target_height % 2 != 0:
-            target_height += 1
+        target_height = _target_enhance_height(height)
 
         # 3. Create temp dirs
         os.makedirs(chunks_dir, exist_ok=True)
@@ -253,30 +555,31 @@ def _process_job(job_id: str) -> None:
                 os.makedirs(frames_dir)
                 os.makedirs(enhanced_dir)
 
-                # a. Extract frames as JPEG
+                # a. Extract frames as PNG to avoid lossy pre-processing.
                 _run_subprocess(job_id, [
                     ffmpeg_exe, "-y", "-i", chunk_path,
-                    "-qscale:v", "2",
-                    os.path.join(frames_dir, "%08d.jpg"),
+                    os.path.join(frames_dir, "%08d.png"),
                 ])
 
-                # b. AI upscale 4× with realesrgan-x4plus
-                _run_subprocess(job_id, [
-                    real_esrgan_bin,
-                    "-i", frames_dir,
-                    "-o", enhanced_dir,
-                    "-n", "realesrgan-x4plus",
-                    "-s", "4",
-                    "-t", "128",
-                    "-j", "1:4:1",
-                ])
+                # b. AI upscale 4× with realesrgan-x4plus.
+                _run_real_esrgan(
+                    job_id,
+                    backend=backend,
+                    real_esrgan_bin=real_esrgan_bin,
+                    python_executable=real_esrgan_python,
+                    model_path=real_esrgan_model_path,
+                    frames_dir=frames_dir,
+                    enhanced_dir=enhanced_dir,
+                )
 
                 # c. Reassemble chunk at target resolution
+                video_filter = f"scale=-2:{target_height}"
+
                 _run_subprocess(job_id, [
                     ffmpeg_exe, "-y",
                     "-framerate", str(fps),
-                    "-i", os.path.join(enhanced_dir, "%08d.jpg"),
-                    "-vf", f"scale=-2:{target_height}",
+                    "-i", os.path.join(enhanced_dir, "%08d.png"),
+                    "-vf", video_filter,
                     "-c:v", "libx264",
                     "-crf", "18",
                     "-preset", "slow",

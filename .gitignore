@@ -6,6 +6,8 @@ temp_storage/
 videos.db
 .env
 backend/.venv/
+backend/.realesrgan-venv/
+backend/models/realesrgan/
 .uv-cache/
 **/__pycache__/
 .next/

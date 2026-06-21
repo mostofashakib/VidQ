@@ -28,13 +28,19 @@ The setup script installs:
 - backend test packages from `backend/requirements-dev.txt`
 - Playwright Chromium
 - frontend packages from `frontend/package-lock.json`
-- `realesrgan-ncnn-vulkan` on macOS for the Enhance feature
+- Real-ESRGAN ncnn and Python backends for the Enhance feature
 - `backend/.env` from `backend/.env.example` if it does not exist
 
-Skip the Enhance dependency during setup:
+Skip the ncnn Enhance dependency during setup:
 
 ```bash
 SKIP_REAL_ESRGAN=1 ./setup.sh
+```
+
+Skip the Python Real-ESRGAN fallback:
+
+```bash
+SKIP_PYTHON_REALESRGAN=1 ./setup.sh
 ```
 
 Skip the browser download in constrained environments:
@@ -107,10 +113,13 @@ AUTH_ENABLED=true
 APP_PASSWORD=change-me
 ```
 
-Enhance binary override:
+Enhance backend override:
 
 ```env
+REAL_ESRGAN_BACKEND=auto
 REAL_ESRGAN_BIN=/Users/you/.local/opt/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan
+REAL_ESRGAN_PYTHON=/path/to/backend/.realesrgan-venv/bin/python
+REAL_ESRGAN_MODEL_PATH=/path/to/backend/models/realesrgan/RealESRGAN_x4plus.pth
 ```
 
 ## Features
@@ -128,9 +137,12 @@ Every feature has a job queue with progress, cancellation, and download links.
 
 ### Real-ESRGAN
 
-Homebrew does not provide `realesrgan-ncnn-vulkan`.
+Homebrew does not provide `realesrgan-ncnn-vulkan`. VidQ installs two Enhance backends:
 
-On macOS, run:
+- **ncnn Vulkan** - fast, but can crash on some macOS GPU/Vulkan setups.
+- **Python Real-ESRGAN** - slower, but uses the upstream PyTorch implementation as a fallback.
+
+Run:
 
 ```bash
 ./setup.sh
@@ -148,7 +160,7 @@ It also links the binary into:
 ~/.local/bin/realesrgan-ncnn-vulkan
 ```
 
-When `backend/.env` exists, it writes `REAL_ESRGAN_BIN` automatically.
+When `backend/.env` exists, setup writes `REAL_ESRGAN_BIN`, `REAL_ESRGAN_PYTHON`, and `REAL_ESRGAN_MODEL_PATH` automatically.
 
 ### Whisper
 
@@ -192,6 +204,10 @@ Then restart:
 ```bash
 ./run.sh
 ```
+
+### Enhance fails with `SIGSEGV`
+
+`realesrgan-ncnn-vulkan` can crash on some macOS Vulkan/MoltenVK setups. VidQ first tries ncnn. If ncnn crashes, VidQ automatically retries the same frames through the Python Real-ESRGAN backend. If both backends fail, the Enhance job fails instead of returning a fake non-AI upscale.
 
 ### `Missing required environment variable: DATABASE_URL`
 
@@ -253,7 +269,7 @@ Enhance uses a chunked Real-ESRGAN pipeline:
 
 1. Split the video into 60-second chunks.
 2. Extract frames from one chunk at a time.
-3. Upscale frames with `realesrgan-ncnn-vulkan`.
+3. Upscale frames with Real-ESRGAN ncnn, falling back to Python Real-ESRGAN if ncnn crashes.
 4. Reassemble chunks and mux the original audio.
 
 This keeps disk usage bounded during long Enhance jobs.
