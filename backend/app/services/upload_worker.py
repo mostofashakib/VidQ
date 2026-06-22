@@ -10,7 +10,6 @@ import imageio_ffmpeg
 from app.config import get_settings
 from app.db import SessionLocal, Video
 from app.services.ffmpeg_utils import output_file_is_valid, probe_duration, run_progress_process
-from app.services.video_utils import probe_video_dimensions
 from app.services.worker_runtime import (
     WorkerPoolState,
     cancel_registered_job,
@@ -109,55 +108,28 @@ def start_upload_job(file_path: str, original_name: str) -> str:
 
 def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[float] = None) -> Optional[str]:
     """
-    Normalize uploaded videos.
-
-    - WebM uploads are always transcoded to MP4 for browser/download consistency.
-    - Non-720p videos keep the existing 720p scaling behavior.
+    Normalize uploaded video to H.264/AAC 1280×720 MP4 regardless of source format.
+    Aspect ratio is preserved with letterbox/pillarbox padding to fill exactly 1280×720.
     Returns final path, or None on cancel/failure.
     """
-    dims = probe_video_dimensions(file_path)
-    base, ext = os.path.splitext(file_path)
-    ext_lower = ext.lower()
-    is_webm = ext_lower == ".webm"
-    needs_scale = dims is not None and dims[1] != 720
-
-    if not is_webm and not needs_scale:
-        return file_path
-
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    suffix = "_720p" if needs_scale else "_mp4"
-    out_ext = ".mp4" if is_webm else ext
-    out_path = f"{base}{suffix}{out_ext}"
+    base = os.path.splitext(file_path)[0]
+    out_path = f"{base}_converted.mp4"
     cmd = [
         ffmpeg_exe, "-y", "-i", file_path,
-    ]
-    if needs_scale:
-        cmd.extend(["-vf", "scale=-2:720:flags=lanczos"])
-    cmd.extend([
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black",
         "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-        "-c:a", "aac" if is_webm else "copy",
+        "-c:a", "aac",
         "-movflags", "+faststart",
         "-progress", "pipe:1", "-nostats",
         out_path,
-    ])
-
-    actions = []
-    if needs_scale:
-        actions.append("scaling to 720p")
-    if is_webm:
-        actions.append("converting WebM to MP4")
-    action_label = " and ".join(actions) or "processing"
-    failure_label = (
-        "Could not convert WebM to MP4"
-        if is_webm
-        else "Video scaling failed"
-    )
-    complete_label = "Converted" if is_webm else "Scaled"
+    ]
 
     logger.info(
-        f"[{job.job_id}] {action_label.capitalize()}: "
+        f"[{job.job_id}] Converting to 1280×720 H.264/AAC MP4: "
         f"{os.path.basename(file_path)} → {os.path.basename(out_path)}"
     )
+
     def update_progress(current_s: float) -> None:
         if not total_duration_s or total_duration_s <= 0:
             return
@@ -180,14 +152,14 @@ def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[fl
         logger.error(f"[{job.job_id}] ffmpeg failed: {result.stderr[-200:]}")
         with _lock:
             job.status = "failed"
-            job.error = failure_label
+            job.error = "Video conversion failed"
         cleanup_paths([file_path])
         return None
 
     cleanup_paths([file_path])
     with _lock:
         job.scale_progress = 100
-    logger.info(f"[{job.job_id}] {complete_label} → {os.path.basename(out_path)}")
+    logger.info(f"[{job.job_id}] Converted → {os.path.basename(out_path)}")
     return out_path
 
 
