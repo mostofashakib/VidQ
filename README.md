@@ -163,7 +163,7 @@ REAL_ESRGAN_MODEL_PATH=/path/to/backend/models/realesrgan/RealESRGAN_x4plus.pth
 ## Features
 
 - **Download** - paste a URL; VidQ opens the page, starts playback, finds the stream, and downloads the video.
-- **Convert** - upload a video; VidQ scales to 720p and converts WebM to MP4.
+- **Convert** - upload a video; VidQ transcodes it to H.264/AAC 1280×720 MP4, preserving aspect ratio with letterbox/pillarbox padding.
 - **Combine** - drop 2-20 clips; VidQ merges them into one MP4 with crossfades.
 - **Translate** - upload a video; VidQ transcribes, translates, and burns English subtitles.
 - **Trim** - upload a video; VidQ exports the selected timeline segment.
@@ -279,7 +279,7 @@ Media tools, browser automation, LLM providers, and local storage
 ## How It Is Built
 
 - **Download** runs parallel direct extraction (yt-dlp, curl, ffmpeg candidates in parallel), then launches Chromium with stealth injection and Cloudflare bypass when direct extraction fails, falling back to MediaRecorder capture for blob-only streams.
-- **Convert** saves uploads, normalizes video to 720p MP4, and exposes the finished file in the uploaded video library.
+- **Convert** saves uploads, transcodes every file to H.264/AAC 1280×720 MP4 (letterbox/pillarbox preserves aspect ratio), and exposes the finished file in the uploaded video library.
 - **Combine** accepts ordered clips, runs one high-quality ffmpeg pass, outputs 720p MP4, and preserves aspect ratio with padding.
 - **Translate** extracts audio, transcribes locally with `faster-whisper` or OpenAI Whisper, translates text, creates subtitles, and burns them into the video.
 - **Trim** lets the UI choose start/end timestamps, then ffmpeg exports only that segment.
@@ -309,4 +309,4 @@ This keeps disk usage bounded during long Enhance jobs while fully using availab
 
 MIT. See [LICENSE](LICENSE).
 
-Built by [Variant Labs](https://www.vriantlabs.com).
+Built by [Mostofa Shakib](https://www.mostofashakib.com) and [Variant Labs](https://www.vriantlabs.com).
