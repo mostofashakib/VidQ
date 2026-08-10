@@ -5,11 +5,14 @@ import threading
 import logging
 from typing import Optional
 
-import imageio_ffmpeg
-
 from app.config import get_settings
 from app.db import SessionLocal, Video
-from app.services.ffmpeg_utils import output_file_is_valid, probe_duration, run_progress_process
+from app.services.ffmpeg_utils import (
+    build_normalize_command,
+    output_file_is_valid,
+    probe_duration,
+    run_progress_process,
+)
 from app.services.worker_runtime import (
     WorkerPoolState,
     cancel_registered_job,
@@ -112,18 +115,9 @@ def _scale_to_720p(job: UploadJob, file_path: str, total_duration_s: Optional[fl
     Aspect ratio is preserved with letterbox/pillarbox padding to fill exactly 1280×720.
     Returns final path, or None on cancel/failure.
     """
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     base = os.path.splitext(file_path)[0]
     out_path = f"{base}_converted.mp4"
-    cmd = [
-        ffmpeg_exe, "-y", "-i", file_path,
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black",
-        "-c:v", "libx264", "-crf", "18", "-preset", "slow",
-        "-c:a", "aac",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1", "-nostats",
-        out_path,
-    ]
+    cmd = build_normalize_command(input_path=file_path, output_path=out_path)
 
     logger.info(
         f"[{job.job_id}] Converting to 1280×720 H.264/AAC MP4: "

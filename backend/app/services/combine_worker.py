@@ -8,7 +8,15 @@ from typing import Optional
 import imageio_ffmpeg
 
 from app.config import get_settings
-from app.services.ffmpeg_utils import output_file_is_valid, probe_duration, run_progress_process
+from app.services.ffmpeg_utils import (
+    TARGET_FPS,
+    build_normalize_command,
+    output_file_is_valid,
+    probe_duration,
+    probe_missing_audio,
+    run_progress_process,
+    scale_to_target_chain,
+)
 from app.services.worker_runtime import (
     WorkerPoolState,
     cancel_registered_job,
@@ -23,6 +31,9 @@ from app.services.worker_runtime import (
 logger = logging.getLogger("CombineWorker")
 
 MAX_WORKERS = 5
+
+# Share of overall_progress spent on the per-clip normalize prepass.
+NORMALIZE_PROGRESS_SHARE = 40
 
 _jobs: dict[str, "CombineJob"] = {}
 _lock = threading.Lock()
@@ -101,13 +112,10 @@ def _combine_fade_duration(durations: list[float], preferred: float = 0.5) -> fl
 
 
 def _scale_to_720p_filter(input_label: str, output_label: str) -> str:
-    return (
-        f"{input_label}"
-        "scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,"
-        "pad=1280:720:(ow-iw)/2:(oh-ih)/2,"
-        "setsar=1,format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS,fps=30"
-        f"{output_label}"
-    )
+    # fps has to come last: xfade rejects its inputs unless the frame rate is constant
+    # at the point it sees them, and setpts alone leaves the rate undefined.
+    chain = scale_to_target_chain(fps=None)
+    return f"{input_label}{chain},settb=AVTB,setpts=PTS-STARTPTS,fps={TARGET_FPS}{output_label}"
 
 
 def _build_xfade_filter(durations: list[float], fade_duration: float = 0.5) -> tuple[str, str]:
@@ -161,99 +169,205 @@ def _build_xfade_filter(durations: list[float], fade_duration: float = 0.5) -> t
     return ";".join(video_parts), ";".join(audio_parts)
 
 
+def _normalize_clip(
+    job: CombineJob,
+    source_path: str,
+    out_path: str,
+    *,
+    silent_audio: bool,
+    duration: float,
+    progress_base: float,
+    progress_span: float,
+) -> Optional[str]:
+    """Re-encode one clip to the canonical format, the same conversion the upload path
+    runs. Returns the normalized path, or None if it was cancelled or ffmpeg failed."""
+    cmd = build_normalize_command(
+        input_path=source_path,
+        output_path=out_path,
+        fps=TARGET_FPS,
+        crf=14,
+        preset="veryfast",
+        audio_bitrate="320k",
+        silent_audio=silent_audio,
+        fixed_duration=duration or None,
+    )
+
+    def update_progress(current_s: float) -> None:
+        if duration <= 0:
+            return
+        with _lock:
+            job.overall_progress = min(
+                NORMALIZE_PROGRESS_SHARE,
+                int(progress_base + min(1.0, current_s / duration) * progress_span),
+            )
+
+    result = run_progress_process(
+        cmd=cmd,
+        job=job,
+        lock=_lock,
+        popen=subprocess.Popen,
+        on_progress=update_progress,
+    )
+
+    if result.cancelled:
+        return None
+
+    if result.returncode != 0 or not output_file_is_valid(out_path):
+        logger.error(f"[{job.job_id}] Clip normalize failed: {result.stderr[-400:]}")
+        cleanup_paths([out_path])
+        return None
+
+    return out_path
+
+
+def _normalize_clips(
+    job: CombineJob,
+    file_paths: list[str],
+    filenames: list[str],
+    temp_paths: list[str],
+) -> list[str]:
+    """Re-encode every clip to the canonical format before it reaches the xfade graph,
+    the same conversion the upload path runs. Returns the paths to concatenate.
+
+    This is unconditional on purpose. A clip can change resolution, pixel format or
+    frame rate part way through and still advertise clean, matching parameters in its
+    header, and ffmpeg reacts to the change by reconfiguring the filter graph mid-run.
+    That either stalls xfade ("N buffers queued in out_#0:0" → best_input assertion) or
+    silently drops every frame after the change, and no probe of the source reveals it
+    beforehand. Re-encoding each clip first collapses it to one stable configuration.
+    """
+    total = len(file_paths)
+    prepared = list(file_paths)
+    with _lock:
+        job.phase = "normalizing"
+        job.overall_progress = 0
+
+    for i, path in enumerate(file_paths):
+        if job.status == "cancelled":
+            return prepared
+
+        with _lock:
+            job.clip_index = i + 1
+        progress_base = i / total * NORMALIZE_PROGRESS_SHARE
+        progress_span = NORMALIZE_PROGRESS_SHARE / total
+
+        logger.info(f"[{job.job_id}] Normalizing clip {i+1}/{total}: {filenames[i]}")
+        result_path = _normalize_clip(
+            job,
+            path,
+            f"{os.path.splitext(path)[0]}_norm.mp4",
+            silent_audio=probe_missing_audio(path),
+            duration=probe_duration(path) or 0.0,
+            progress_base=progress_base,
+            progress_span=progress_span,
+        )
+
+        if result_path is None:
+            if job.status == "cancelled":
+                return prepared
+            # Fall back to the source clip; the in-graph scale/pad filters may still cope.
+            logger.warning(
+                f"[{job.job_id}] Could not normalize {filenames[i]} — using the source clip"
+            )
+        else:
+            prepared[i] = result_path
+            temp_paths.append(result_path)
+
+        with _lock:
+            job.overall_progress = int(progress_base + progress_span)
+
+    return prepared
+
+
+def _run_concat(job: CombineJob, paths: list[str], out_path: str) -> str:
+    """Run the xfade concat pass. Returns "done", "cancelled" or "failed"."""
+    durations = [probe_duration(path) or 5.0 for path in paths]
+    fade_duration = _combine_fade_duration(durations)
+    total_duration = sum(durations) - (len(durations) - 1) * fade_duration
+
+    with _lock:
+        job.phase = "concatenating"
+        job.overall_progress = NORMALIZE_PROGRESS_SHARE
+
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    cmd = [ffmpeg_exe, "-y"]
+    for path in paths:
+        cmd.extend(["-i", path])
+
+    if len(paths) == 1:
+        filter_args = [
+            "-filter_complex", _scale_to_720p_filter("[0:v]", "[vout]"),
+            "-map", "[vout]", "-map", "0:a?",
+        ]
+    else:
+        v_filter, a_filter = _build_xfade_filter(durations, fade_duration=fade_duration)
+        filter_args = [
+            "-filter_complex", f"{v_filter};{a_filter}",
+            "-map", "[vout]", "-map", "[aout]",
+        ]
+
+    cmd.extend([
+        *filter_args,
+        "-c:v", "libx264", "-crf", "14", "-preset", "slow",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
+        "-progress", "pipe:1", "-nostats",
+        out_path,
+    ])
+
+    logger.info(f"[{job.job_id}] Running ffmpeg concat ({len(paths)} clips) at 1280x720")
+
+    def update_progress(current_s: float) -> None:
+        if total_duration <= 0:
+            return
+        with _lock:
+            job.overall_progress = min(
+                99,
+                int(NORMALIZE_PROGRESS_SHARE + current_s / total_duration * (99 - NORMALIZE_PROGRESS_SHARE)),
+            )
+
+    result = run_progress_process(
+        cmd=cmd,
+        job=job,
+        lock=_lock,
+        popen=subprocess.Popen,
+        on_progress=update_progress,
+    )
+
+    if result.cancelled:
+        cleanup_paths([out_path])
+        return "cancelled"
+
+    if result.returncode != 0 or not output_file_is_valid(out_path):
+        logger.error(f"[{job.job_id}] ffmpeg failed: {result.stderr[-400:]}")
+        cleanup_paths([out_path])
+        return "failed"
+
+    return "done"
+
+
 def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> None:
     job = _jobs[job_id]
     settings = get_settings()
-    total = len(file_paths)
+
+    temp_paths: list[str] = []
 
     try:
-        # Phase 1: Register clips and keep source files for a single high-quality ffmpeg pass.
-        with _lock:
-            job.phase = "normalizing"
-            job.overall_progress = 0
-
-        for i, path in enumerate(file_paths):
-            if job.status == "cancelled":
-                return
-
-            with _lock:
-                job.clip_index = i + 1
-
-            logger.info(f"[{job_id}] Preparing clip {i+1}/{total}: {filenames[i]}")
-
-            with _lock:
-                job.overall_progress = int((i + 1) / total * 40)  # 0-40%
-
+        # Phase 1: re-encode every clip to the canonical format.
+        prepared = _normalize_clips(job, file_paths, filenames, temp_paths)
         if job.status == "cancelled":
             return
-
-        # Phase 2: Probe durations for xfade offsets
-        with _lock:
-            job.phase = "concatenating"
-            job.overall_progress = 40
-
-        durations: list[float] = []
-        for path in file_paths:
-            d = probe_duration(path)
-            durations.append(d or 5.0)
-        fade_duration = _combine_fade_duration(durations)
 
         out_filename = f"combined_{job_id}.mp4"
         out_path = os.path.join(settings.temp_storage_dir, out_filename)
 
-        # Phase 3: Build and run ffmpeg xfade concat
-        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        cmd = [ffmpeg_exe, "-y"]
-        for path in file_paths:
-            cmd.extend(["-i", path])
+        # Phase 2: probe durations for the xfade offsets and run the concat.
+        outcome = _run_concat(job, prepared, out_path)
 
-        total_duration = sum(durations) - (len(durations) - 1) * fade_duration
-
-        if len(file_paths) == 1:
-            cmd.extend([
-                "-filter_complex", _scale_to_720p_filter("[0:v]", "[vout]"),
-                "-map", "[vout]", "-map", "0:a?",
-                "-c:v", "libx264", "-crf", "14", "-preset", "slow",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
-                "-progress", "pipe:1", "-nostats",
-                out_path,
-            ])
-        else:
-            v_filter, a_filter = _build_xfade_filter(durations, fade_duration=fade_duration)
-            filter_complex = f"{v_filter};{a_filter}"
-            cmd.extend([
-                "-filter_complex", filter_complex,
-                "-map", "[vout]", "-map", "[aout]",
-                "-c:v", "libx264", "-crf", "14", "-preset", "slow",
-                "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart",
-                "-progress", "pipe:1", "-nostats",
-                out_path,
-            ])
-
-        logger.info(f"[{job_id}] Running ffmpeg concat ({len(file_paths)} clips) at 1280x720")
-
-        def update_progress(current_s: float) -> None:
-            if total_duration <= 0:
-                return
-            with _lock:
-                job.overall_progress = min(99, int(40 + current_s / total_duration * 59))
-
-        result = run_progress_process(
-            cmd=cmd,
-            job=job,
-            lock=_lock,
-            popen=subprocess.Popen,
-            on_progress=update_progress,
-        )
-
-        if result.cancelled:
-            cleanup_paths([out_path])
+        if outcome == "cancelled":
             return
 
-        if result.returncode != 0 or not output_file_is_valid(out_path):
-            logger.error(f"[{job_id}] ffmpeg failed: {result.stderr[-400:]}")
+        if outcome == "failed":
             with _lock:
                 job.status = "failed"
                 job.error = "Video merge failed"
@@ -273,4 +387,4 @@ def _process_job(job_id: str, file_paths: list[str], filenames: list[str]) -> No
                 job.status = "failed"
                 job.error = str(e)
     finally:
-        cleanup_paths(file_paths)
+        cleanup_paths(file_paths + temp_paths)

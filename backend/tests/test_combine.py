@@ -9,6 +9,7 @@ from unittest.mock import patch
 import imageio_ffmpeg
 
 from app.config import get_settings
+from app.services.ffmpeg_utils import probe_duration
 from app.services.video_utils import probe_video_dimensions
 
 AUTH = {"Authorization": "Bearer test-token"}
@@ -42,6 +43,73 @@ def _make_test_video_bytes(
         text=True,
     )
     return path.read_bytes()
+
+
+def _make_silent_video_bytes(tmp_path, filename: str, *, size: str) -> bytes:
+    """A clip with no audio track at all."""
+    path = tmp_path / filename
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    subprocess.run(
+        [
+            ffmpeg_exe, "-y",
+            "-f", "lavfi", "-i", f"testsrc=size={size}:rate=30:duration=2",
+            "-c:v", "libx264", "-pix_fmt", "yuv420p",
+            str(path),
+        ],
+        check=True, capture_output=True, text=True,
+    )
+    return path.read_bytes()
+
+
+def _make_varying_params_video_bytes(tmp_path, filename: str) -> bytes:
+    """A clip whose resolution changes mid-stream while its header still advertises the
+    first configuration. ffmpeg reconfigures the filter graph at the switch, which used
+    to stall xfade or silently drop every frame after it."""
+    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+    segments = []
+    for index, size in enumerate(("1280x720", "640x360")):
+        segment = tmp_path / f"{filename}.part{index}.ts"
+        subprocess.run(
+            [
+                ffmpeg_exe, "-y",
+                "-f", "lavfi", "-i", f"testsrc=size={size}:rate=30:duration=2",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-c:a", "aac", "-ar", "48000", "-ac", "2",
+                str(segment),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        segments.append(segment)
+
+    joined = tmp_path / f"{filename}.ts"
+    joined.write_bytes(b"".join(segment.read_bytes() for segment in segments))
+
+    path = tmp_path / filename
+    subprocess.run(
+        [ffmpeg_exe, "-y", "-i", str(joined), "-c", "copy", str(path)],
+        check=True, capture_output=True, text=True,
+    )
+    return path.read_bytes()
+
+
+def _run_combine(client, files: list[tuple[str, bytes]], timeout: float = 120) -> dict:
+    r = client.post(
+        "/combine-video",
+        files=[("files", (name, io.BytesIO(data), "video/mp4")) for name, data in files],
+        headers=AUTH,
+    )
+    assert r.status_code == 200
+    job_id = r.json()["job_id"]
+
+    deadline = time.time() + timeout
+    result = {}
+    while time.time() < deadline:
+        result = client.get(f"/combine-jobs/{job_id}", headers=AUTH).json()
+        if result["status"] in ("done", "failed"):
+            break
+        time.sleep(0.1)
+    return result
 
 
 def _make_fake_popen(progress_lines=None):
@@ -293,6 +361,41 @@ def test_combine_downscales_1080p_to_high_quality_720p(client, tmp_path):
     output_filename = result["result_url"].rsplit("/", 1)[-1]
     output_path = os.path.join(get_settings().temp_storage_dir, output_filename)
     assert probe_video_dimensions(output_path) == (1280, 720)
+
+
+def test_combine_keeps_full_length_when_clip_params_change_mid_stream(client, tmp_path):
+    """Regression: a clip that switches resolution part way through used to stall the
+    xfade graph ("buffers queued" → best_input assertion) or drop every frame after the
+    switch, silently truncating the merge. Every clip is normalized first now."""
+    varying = _make_varying_params_video_bytes(tmp_path, "varying.mp4")
+    steady = _make_test_video_bytes(tmp_path, "steady.mp4", size="1280x720", frequency=880)
+
+    result = _run_combine(client, [("varying.mp4", varying), ("steady.mp4", steady)])
+
+    assert result["status"] == "done", f"Expected done, got: {result}"
+    output_path = os.path.join(
+        get_settings().temp_storage_dir, result["result_url"].rsplit("/", 1)[-1]
+    )
+    assert probe_video_dimensions(output_path) == (1280, 720)
+    # 4s of varying clip + 1s clip, less the 0.5s crossfade.
+    assert probe_duration(output_path) == pytest.approx(4.5, abs=0.4)
+
+
+def test_combine_handles_clip_without_audio(client, tmp_path):
+    """A clip with no audio track leaves the xfade graph with no [n:a] pad to read from;
+    normalization gives it a silent one."""
+    silent = _make_silent_video_bytes(tmp_path, "silent.mp4", size="640x360")
+    with_audio = _make_test_video_bytes(tmp_path, "sound.mp4", size="1280x720", frequency=440)
+
+    result = _run_combine(client, [("silent.mp4", silent), ("sound.mp4", with_audio)])
+
+    assert result["status"] == "done", f"Expected done, got: {result}"
+    output_path = os.path.join(
+        get_settings().temp_storage_dir, result["result_url"].rsplit("/", 1)[-1]
+    )
+    assert probe_video_dimensions(output_path) == (1280, 720)
+    # 2s silent clip + 1s clip, less the 0.5s crossfade.
+    assert probe_duration(output_path) == pytest.approx(2.5, abs=0.4)
 
 
 def test_combine_cancel_job(client):
