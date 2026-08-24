@@ -1,3 +1,4 @@
+import logging
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -5,6 +6,25 @@ from dotenv import load_dotenv
 # Load env file once globally
 env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(dotenv_path=env_path)
+
+logger = logging.getLogger("Config")
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    """Parse a boolean env var without turning typos into unsafe behavior."""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    normalized = raw_value.lower().strip()
+    if normalized in ("true", "1", "yes", "on"):
+        return True
+    if normalized in ("false", "0", "no", "off"):
+        return False
+
+    logger.warning("Invalid %s=%r; using default %s", name, raw_value, default)
+    return default
+
 
 class Settings:
     def __init__(self):
@@ -52,8 +72,13 @@ class Settings:
         # Base URL for generating self-referencing URLs (e.g. temp_storage links)
         self.base_url: str = os.getenv("BASE_URL", "http://localhost:8000")
 
-        # Browser settings — BROWSER_HEADLESS=false to see the browser window (useful for debugging)
-        self.browser_headless: bool = os.getenv("BROWSER_HEADLESS", "true").lower() in ("true", "1", "yes")
+        # All browser providers run headless unless explicitly overridden.
+        # BROWSER_HEADLESS=false enables a visible window for local debugging.
+        self.browser_headless: bool = _get_bool_env("BROWSER_HEADLESS", default=True)
+        # Browser adapter: agent-browser is the default; direct Playwright is the
+        # compatibility fallback and can also be selected explicitly.
+        self.browser_provider: str = os.getenv("BROWSER_PROVIDER", "agent-browser").lower().strip()
+        self.agent_browser_command: str = os.getenv("AGENT_BROWSER_COMMAND", "agent-browser").strip()
         # Persistent browser profile: cookies/localStorage saved here and reloaded each session
         # so the browser looks like a returning human visitor rather than a fresh bot.
         default_profile = str(Path(__file__).parent / "browser_profile")

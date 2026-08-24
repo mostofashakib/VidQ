@@ -9,7 +9,7 @@ VidQ is an AI Media Studio built for people who want a private video workstation
 Runtime requirements:
 
 - Python 3.10+
-- Node.js 18+
+- Node.js 24+ (required by `agent-browser`)
 - macOS or Linux
 - At least one LLM provider for agentic Download and Translate workflows
 
@@ -28,6 +28,7 @@ The setup script installs:
 - backend Python packages from `backend/requirements.txt`
 - backend test packages from `backend/requirements-dev.txt`
 - Playwright Chromium
+- `agent-browser` and its managed Chrome browser
 - Playwright Linux system libraries when running on Linux
 - frontend packages from `frontend/package-lock.json`
 - Real-ESRGAN ncnn and Python backends for the Enhance feature
@@ -56,6 +57,12 @@ Skip the browser download in constrained environments:
 
 ```bash
 SKIP_PLAYWRIGHT=1 ./setup.sh
+```
+
+Skip the default `agent-browser` installation (the app will use its Playwright fallback):
+
+```bash
+SKIP_AGENT_BROWSER=1 ./setup.sh
 ```
 
 Skip Playwright Linux system packages:
@@ -145,11 +152,16 @@ APP_PASSWORD=change-me
 Download browser options:
 
 ```env
+BROWSER_PROVIDER=agent-browser
 PROXY_URLS=http://user:pass@host:port,socks5://host2:port2
-BROWSER_HEADLESS=false
+BROWSER_HEADLESS=true
 ```
 
-`PROXY_URLS` is a comma-separated proxy pool; the pipeline rotates to a fresh proxy when Cloudflare blocks a request. Set `BROWSER_HEADLESS=false` to watch the browser during download for debugging.
+`agent-browser` is the default browser provider. VidQ connects to its Chrome session over CDP so the existing network interception and recording pipeline keeps working. If `agent-browser` cannot start, VidQ automatically falls back to bundled Playwright Chromium. Set `BROWSER_PROVIDER=playwright` to select the fallback explicitly.
+
+All browser providers run headless by default. Set `BROWSER_HEADLESS=false` to explicitly open a visible browser window for local debugging.
+
+`PROXY_URLS` is a comma-separated proxy pool; the pipeline rotates to a fresh proxy when Cloudflare blocks a request.
 
 Enhance backend override:
 
@@ -272,7 +284,7 @@ Media tools, browser automation, LLM providers, and local storage
 - **API layer** - FastAPI routers in `backend/app/routers` validate requests, save uploads, create jobs, and expose job status endpoints.
 - **Workers** - Service workers in `backend/app/services` run long video tasks outside request handlers so the UI stays responsive.
 - **Queue runtime** - Shared worker helpers centralize job state, cancellation, cleanup, and global concurrency limits.
-- **Media layer** - `imageio-ffmpeg`, `yt-dlp`, and Playwright handle downloading, probing, converting, trimming, combining, subtitles, and final MP4 output.
+- **Media layer** - `imageio-ffmpeg`, `yt-dlp`, `agent-browser`, and Playwright handle downloading, probing, converting, trimming, combining, subtitles, and final MP4 output.
 - **AI layer** - Download can use LLM-guided browser navigation; Translate uses Whisper plus an LLM provider; Enhance uses Real-ESRGAN.
 - **Storage** - SQLite stores saved video metadata, while generated files live under `backend/temp_storage` and are served back through FastAPI.
 
@@ -291,7 +303,7 @@ Media tools, browser automation, LLM providers, and local storage
 Download uses a staged pipeline:
 
 1. Run `yt-dlp`, `curl`, and `ffmpeg` direct extraction candidates in parallel — the first successful result wins.
-2. If direct extraction fails, launch Chromium with stealth injection; detect Cloudflare challenges and bypass them, rotating through the `PROXY_URLS` pool on repeated blocks; use heuristics and an LLM-guided click loop to start playback and intercept the stream URL from network traffic.
+2. If direct extraction fails, launch Chrome through the `agent-browser` adapter and attach the extraction pipeline over CDP. If that fails, launch bundled Playwright Chromium. Apply stealth injection, detect Cloudflare challenges, rotate through the `PROXY_URLS` pool, and use heuristics plus an LLM-guided click loop to start playback and intercept the stream URL.
 3. Fall back to MediaRecorder capture for blob streams and DRM-adjacent content when no direct URL can be intercepted.
 
 A persistent browser profile (`BROWSER_PROFILE_DIR`) is reloaded each session so the browser appears as a returning visitor rather than a fresh bot.

@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="${ROOT_DIR}/backend"
 FRONTEND_DIR="${ROOT_DIR}/frontend"
+AGENT_BROWSER_VERSION="0.34.0"
+AGENT_BROWSER_INSTALL_PREFIX="${AGENT_BROWSER_INSTALL_PREFIX:-$HOME/.local}"
 
 export PATH="${BACKEND_DIR}/.venv/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${ROOT_DIR}/.uv-cache}"
@@ -102,8 +104,32 @@ PY
 
 node_version_ok() {
     local major
+    local required_major="18"
+    if [ "${SKIP_AGENT_BROWSER:-0}" != "1" ]; then
+        required_major="24"
+    fi
     major="$(version_major "$(node --version)")"
-    [ "$major" -ge 18 ]
+    [ "$major" -ge "$required_major" ]
+}
+
+install_agent_browser() {
+    local installed_version=""
+
+    if command -v agent-browser >/dev/null 2>&1; then
+        installed_version="$(agent-browser --version 2>/dev/null | sed -E 's/[^0-9]*([0-9]+\.[0-9]+\.[0-9]+).*/\1/' || true)"
+    fi
+
+    if [ "$installed_version" != "$AGENT_BROWSER_VERSION" ] || [ "${FORCE_INSTALL:-0}" = "1" ]; then
+        log "Installing agent-browser ${AGENT_BROWSER_VERSION}"
+        npm install --global --prefix "$AGENT_BROWSER_INSTALL_PREFIX" "agent-browser@${AGENT_BROWSER_VERSION}"
+    else
+        echo "Found agent-browser ${installed_version}"
+    fi
+
+    export PATH="${AGENT_BROWSER_INSTALL_PREFIX}/bin:$PATH"
+    ensure_command agent-browser "Install agent-browser with: npm install -g agent-browser@${AGENT_BROWSER_VERSION}"
+    log "Installing agent-browser Chrome"
+    agent-browser install
 }
 
 update_env_value() {
@@ -245,10 +271,15 @@ if ! command -v node >/dev/null 2>&1; then
     install_node_runtime
 fi
 
-ensure_command npm "Install npm with Node.js 18+ from https://nodejs.org/."
+ensure_command npm "Install npm with Node.js 24+ from https://nodejs.org/."
 if ! node_version_ok; then
-    echo "Node.js 18+ is required. Found: $(node --version)" >&2
-    echo "Install Node.js 18+ and rerun ./setup.sh." >&2
+    if [ "${SKIP_AGENT_BROWSER:-0}" = "1" ]; then
+        echo "Node.js 18+ is required. Found: $(node --version)" >&2
+        echo "Install Node.js 18+ and rerun ./setup.sh." >&2
+    else
+        echo "Node.js 24+ is required by agent-browser. Found: $(node --version)" >&2
+        echo "Install Node.js 24+ and rerun ./setup.sh." >&2
+    fi
     exit 1
 fi
 
@@ -282,6 +313,12 @@ else
         uv run playwright install-deps chromium
     fi
     uv run playwright install chromium
+fi
+
+if [ "${SKIP_AGENT_BROWSER:-0}" = "1" ]; then
+    echo "Skipped agent-browser install because SKIP_AGENT_BROWSER=1"
+else
+    install_agent_browser
 fi
 
 log "Installing frontend dependencies"

@@ -44,6 +44,7 @@ from app.services.scraper.playback import (
     _human_scroll,
 )
 from app.services.scraper.computer_use import ComputerUse
+from app.services.scraper.browser_adapter import launch_browser
 from app.services.prompts import Prompts
 
 logger = logging.getLogger("VideoScraper")
@@ -243,10 +244,15 @@ async def run_extraction(
 
     try:
         async with async_playwright() as p:
-            logger.debug(f"Launching bundled Chromium ({'headless' if _settings.browser_headless else 'headed'})")
-            browser = await p.chromium.launch(
-                headless=_settings.browser_headless,
-                args=HEADLESS_OPTIONS,
+            logger.debug(
+                "Launching browser through the configured adapter (%s)",
+                _settings.browser_provider,
+            )
+            browser = await launch_browser(
+                p,
+                _settings,
+                user_agent,
+                HEADLESS_OPTIONS,
             )
 
             # ─────────────────────────────────────────
