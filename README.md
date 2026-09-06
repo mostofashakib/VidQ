@@ -174,7 +174,7 @@ REAL_ESRGAN_MODEL_PATH=/path/to/backend/models/realesrgan/RealESRGAN_x4plus.pth
 
 ## Features
 
-- **Download** - paste a URL; VidQ opens the page, starts playback, finds the stream, and downloads the video.
+- **Download** - paste a URL; VidQ opens the page, starts playback, finds the stream, and downloads the video. Features direct extraction, agentic browser automation, and a multi-tier ComputerUse fallback for protected players.
 - **Convert** - upload a video; VidQ transcodes it to H.264/AAC 1280×720 MP4, preserving aspect ratio with letterbox/pillarbox padding.
 - **Combine** - drop 2-20 clips; VidQ merges them into one MP4 with crossfades.
 - **Translate** - upload a video; VidQ transcribes, translates, and burns English subtitles.
@@ -285,12 +285,12 @@ Media tools, browser automation, LLM providers, and local storage
 - **Workers** - Service workers in `backend/app/services` run long video tasks outside request handlers so the UI stays responsive.
 - **Queue runtime** - Shared worker helpers centralize job state, cancellation, cleanup, and global concurrency limits.
 - **Media layer** - `imageio-ffmpeg`, `yt-dlp`, `agent-browser`, and Playwright handle downloading, probing, converting, trimming, combining, subtitles, and final MP4 output.
-- **AI layer** - Download can use LLM-guided browser navigation; Translate uses Whisper plus an LLM provider; Enhance uses Real-ESRGAN.
+- **AI layer** - Download uses LLM-guided browser navigation and the ComputerUse fallback engine; Translate uses Whisper plus an LLM provider; Enhance uses Real-ESRGAN.
 - **Storage** - SQLite stores saved video metadata, while generated files live under `backend/temp_storage` and are served back through FastAPI.
 
 ## How It Is Built
 
-- **Download** runs parallel direct extraction (yt-dlp, curl, ffmpeg candidates in parallel), then launches Chromium with stealth injection and Cloudflare bypass when direct extraction fails, falling back to MediaRecorder capture for blob-only streams.
+- **Download** runs parallel direct extraction (yt-dlp, curl, ffmpeg candidates in parallel), then launches Chromium with stealth injection and Cloudflare bypass when direct extraction fails, using the ComputerUse multi-tier fallback to defeat hostile players, and falling back to MediaRecorder capture for blob-only streams.
 - **Convert** saves uploads, transcodes every file to H.264/AAC 1280×720 MP4 (letterbox/pillarbox preserves aspect ratio), and exposes the finished file in the uploaded video library.
 - **Combine** accepts ordered clips, runs one high-quality ffmpeg pass, outputs 720p MP4, and preserves aspect ratio with padding.
 - **Translate** extracts audio, transcribes locally with `faster-whisper` or OpenAI Whisper, translates text, creates subtitles, and burns them into the video.
@@ -304,7 +304,7 @@ Download uses a staged pipeline:
 
 1. Run `yt-dlp`, `curl`, and `ffmpeg` direct extraction candidates in parallel — the first successful result wins.
 2. If direct extraction fails, launch Chrome through the `agent-browser` adapter and attach the extraction pipeline over CDP. If that fails, launch bundled Playwright Chromium. Apply stealth injection, detect Cloudflare challenges, rotate through the `PROXY_URLS` pool, and use heuristics plus an LLM-guided click loop to start playback and intercept the stream URL.
-3. Fall back to MediaRecorder capture for blob streams and DRM-adjacent content when no direct URL can be intercepted.
+3. Fall back to the ComputerUse engine and in-page MediaRecorder capture for blob streams, obfuscated players, and DRM-adjacent content when no direct URL can be intercepted.
 
 A persistent browser profile (`BROWSER_PROFILE_DIR`) is reloaded each session so the browser appears as a returning visitor rather than a fresh bot.
 
@@ -316,6 +316,32 @@ Enhance uses a parallel chunked Real-ESRGAN pipeline:
 4. Preserve chunk order, reassemble the video, and mux the original audio.
 
 This keeps disk usage bounded during long Enhance jobs while fully using available worker capacity without starving other queued jobs.
+
+## The ComputerUse Fallback
+
+Video streaming platforms are actively hostile to automated downloading. Standard direct extraction (`yt-dlp`, `curl`, headless stream sniffers) frequently fails on modern sites that rely on client-side state machines, single-page video apps, encrypted blob streams, or Cloudflare Turnstile verification.
+
+When direct stream interception fails, VidQ must fall back to driving the browser directly. Automating playback on hostile streaming sites is the most technically demanding part of this project due to several adversarial web patterns:
+
+- **Deceptive Overlays & Click-Jacking**: Streaming sites stack invisible click-jackers, fake play buttons, cookie consent walls, and age gates over the video element. A naive click triggers popup windows, ad redirects, or full page refreshes instead of video playback.
+- **Cross-Origin & Sandboxed Iframes**: Video players are routinely embedded inside nested, cross-origin iframes. Standard DOM JavaScript selectors (`document.querySelector`) cannot cross browser security boundaries to reach controls.
+- **Dynamic & Canvas-Based Players**: Modern players frequently randomize or hash CSS class names on each deploy, while custom players render controls onto an HTML5 Canvas where traditional DOM elements do not exist at all.
+- **Popup & Navigation Traps**: Interacting with players often triggers native browser alerts (`alert()`, `confirm()`), spawn-on-click popup tabs, or unexpected navigation away from the media page.
+
+### How the ComputerUse Engine Solves It
+
+VidQ centralizes all browser interactions in a resilient `ComputerUse` interface (`backend/app/services/scraper/computer_use.py` and `playback.py`) with a multi-tier fallback escalation strategy:
+
+1. **Zero-LLM Fast Path**: Attempts immediate playback via the Media Session API and direct `video.play()` DOM invocation to minimize latency when standard controls are present.
+2. **Tier 1 — ARIA-First Accessibility Targeting**: Queries the browser's accessibility tree (`aria_snapshot` and `get_by_role`) instead of fragile CSS selectors. Accessible roles and names (`button[name~="Play"]`) bypass scrambled CSS class names and traverse main and child frames to dismiss consent modals and start playback.
+3. **Tier 2 — Multimodal Vision + ARIA + HTML Guidance**: If heuristics stall, VidQ captures a high-resolution screenshot, a compact ARIA tree, and sanitized interaction HTML. A vision-enabled LLM evaluates both the visual layout and semantic tree to pinpoint the true play button and avoid deceptive ads.
+4. **Tier 3 — Synthesized Hardware Pixel Clicks**: When elements live inside sandboxed iframes or canvas surfaces where selectors cannot operate, `ComputerUse` falls back to direct viewport coordinate clicks (`page.mouse.click(x, y)`). It calculates bounding boxes of the largest visible video/iframe elements or uses LLM-predicted pixel coordinates to synthesize hardware mouse events.
+5. **Chaos Handling & Resilient Recovery**:
+   - Auto-dismisses native browser dialogs (`dialog.dismiss()`).
+   - Auto-closes rogue popup tabs as soon as they spawn.
+   - Detects unwanted page navigations and resets playback state.
+   - Executes multi-click popup retries (up to 10 attempts) to peel away multi-layer ad overlays until continuous video playback is verified.
+6. **MediaRecorder Stream Capture**: Once `ComputerUse` confirms genuine playback and stabilizes the viewport in fullscreen, VidQ injects in-page `MediaRecorder` capture directly into the active player frame to record the video stream, bypassing network-level blocking.
 
 ## License
 
