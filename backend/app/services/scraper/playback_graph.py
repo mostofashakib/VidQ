@@ -326,8 +326,12 @@ class PlaybackGraph:
                 clicked = await cu.click_by_selector(payload["selector"])
             elif strategy == "llm_pixel" and payload.get("pixel_x") is not None:
                 clicked = await cu.click_at_pixel(int(payload["pixel_x"]), int(payload["pixel_y"]))
+                if clicked:
+                    await self.request_fullscreen_fn(state.page)
             elif strategy == "heuristic_pixel":
                 clicked = await cu.find_play_by_pixel()
+                if clicked:
+                    await self.request_fullscreen_fn(state.page)
 
             if not clicked:
                 return False
@@ -400,11 +404,11 @@ class PlaybackGraph:
         # Capture HTML (lazy traversal limited to top frames to prevent memory bloat)
         try:
             raw_html = await page.content()
-            for frame in page.frames[1:6]:
+            for frame in page.frames[1:]:
                 try:
                     f_html = await frame.content()
                     if f_html and len(f_html) > 500:
-                        raw_html += f"\n<!-- IFRAME ({getattr(frame, 'url', '')[:80]}) -->\n" + f_html[:15000]
+                        raw_html += f"\n<!-- IFRAME ({getattr(frame, 'url', '')[:80]}) -->\n" + f_html
                 except Exception:
                     pass
             interact_html = _clean_for_interaction(raw_html, max_len=10000)
