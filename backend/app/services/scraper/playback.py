@@ -9,6 +9,11 @@ from app.config import get_settings
 from app.services.prompts import Prompts
 from app.services.scraper.html import _clean_for_interaction
 from app.services.scraper.computer_use import ComputerUse
+from app.services.scraper.playback_graph import (
+    PlaybackGraph,
+    PlaybackState,
+    poll_until_playing,
+)
 
 logger = logging.getLogger("VideoScraper")
 
@@ -466,13 +471,13 @@ async def _pre_pass_unblock(page) -> int:
     """
     cu = ComputerUse(page)
     await cu.press_key("Escape")
-    await asyncio.sleep(0.3)
+    await asyncio.sleep(0.1)
 
     # ARIA-first: catch consent buttons exposed via accessible names
     aria_clicked = await cu.find_and_click_consent()
     if aria_clicked:
         logger.info(f"Pre-pass ARIA: dismissed {aria_clicked} consent element(s).")
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.3)
 
     clicked = await page.evaluate(r"""() => {
         let count = 0;
@@ -560,7 +565,7 @@ async def _pre_pass_unblock(page) -> int:
     total = aria_clicked + clicked
     if clicked:
         logger.info(f"Pre-pass JS: dismissed {clicked} overlay/banner element(s).")
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(0.5)
     return total
 
 
@@ -573,7 +578,7 @@ async def _try_click(page, selector: str) -> bool:
     return await ComputerUse(page).click_by_selector(selector)
 
 
-async def _try_direct_play(page, max_click_retries: int = 10) -> bool:
+async def _try_direct_play(page, max_click_retries: int = 3) -> bool:
     """
     Heuristic play-button trigger — no LLM.
     1. Accessibility tree: find_and_click_play() via ARIA roles (most reliable).
@@ -583,8 +588,7 @@ async def _try_direct_play(page, max_click_retries: int = 10) -> bool:
     cu = ComputerUse(page)
 
     async def _check_after_click(label: str, retry_index: int) -> bool:
-        await asyncio.sleep(1.5)
-        if await _is_playing(page):
+        if await poll_until_playing(page, _is_playing, timeout_s=1.2, interval_s=0.15):
             logger.info(
                 f"[Agent] Playback confirmed after {label} click "
                 f"(try {retry_index}/{max_click_retries})."
@@ -779,500 +783,23 @@ async def _request_fullscreen_main_video(page) -> None:
 
 async def _agentic_interact(page, llm_manager, max_attempts: int = 6) -> bool:
     """
-    Agentic playback loop.  Goal: get the MAIN video playing so it can be
-    recorded.  Each iteration runs three layers in order:
-
-      Layer 1 – No-LLM fast path
-        a. ARIA pre-pass + JS fallback: dismiss consent / ad overlays via
-           ComputerUse (accessibility tree first, then DOM scan).
-        b. force_play_js: call video.play() directly.
-        c. Accessibility-first heuristics: ARIA role "button"[name~=Play],
-           then common CSS selectors.
-
-      Layer 2 – Vision + ARIA tree + HTML → LLM guidance
-        Capture screenshot + accessibility snapshot + interaction-safe HTML.
-        The ARIA snapshot gives the LLM a compact, semantic view of all
-        interactive elements without parsing noisy HTML.
-        LLM returns a single CSS selector to click RIGHT NOW.
-
-      Layer 3 – Post-click recovery
-        Re-run pre-pass (handles overlays triggered by the click), then
-        force_play_js. For unblocking clicks also try heuristic selectors.
-
-    Throughout: native browser dialogs (alert/confirm/prompt) are
-    auto-dismissed and unexpected popup windows are auto-closed.
-    All browser interactions go through ComputerUse.
+    Agentic playback loop backed by PlaybackGraph (State Graph / FSM architecture).
+    Coordinates pre-pass unblocking, fast heuristic triggers, LLM vision guidance,
+    click-jacking popup recovery, and fullscreen confirmation with page-refresh resilience.
     """
     if not llm_manager:
         return False
 
-    cu = ComputerUse(page)
-
-    # Capture the actual viewport dimensions once — used to tell the LLM the
-    # exact coordinate space of every screenshot we send it.
-    _vp = page.viewport_size or {"width": 1920, "height": 1080}
-    vp_w, vp_h = _vp["width"], _vp["height"]
-
-    # ── Auto-dismiss native browser dialogs ─────────────────────────────────
-    def _on_dialog(dialog):
-        logger.info(f"Auto-dismissing browser dialog: {dialog.type} — '{dialog.message[:60]}'")
-        asyncio.ensure_future(dialog.dismiss())
-
-    # ── Auto-close unexpected popup windows ──────────────────────────────────
-    popup_seen = False
-    nav_after_action = False
-    playing_started = False
-    action_triggered = False
-    preferred_strategy: str | None = None
-    preferred_payload: dict = {}
-    preferred_reason: str = ""
-    preferred_failures = 0
-
-    def _on_popup(new_page):
-        nonlocal popup_seen
-        popup_seen = True
-        popup_url = getattr(new_page, "url", "") or ""
-        logger.info(f"Closing popup window: {popup_url[:80]}")
-        asyncio.ensure_future(new_page.close())
-
-    def _on_nav(frame):
-        nonlocal nav_after_action
-        if frame == page.main_frame and action_triggered:
-            nav_after_action = True
-            logger.info(f"[Event] Page navigation/refresh detected: {frame.url[:80]}")
-
-    page.on("dialog", _on_dialog)
-    page.context.on("page", _on_popup)
-    page.on("framenavigated", _on_nav)
-
-    try:
-        async def _remember_strategy(name: str, reason: str, payload: dict | None = None) -> bool:
-            nonlocal preferred_strategy, preferred_payload, preferred_reason, preferred_failures
-            if not await _is_playing(page):
-                return False
-            preferred_strategy = name
-            preferred_payload = dict(payload or {})
-            preferred_reason = reason
-            preferred_failures = 0
-            logger.info(
-                f"[AgenticStrategy] Cached successful playback strategy: "
-                f"{name} ({reason})."
-            )
-            return True
-
-        async def _replay_click_payload(payload: dict, label: str) -> bool:
-            nonlocal action_triggered, popup_seen
-            selector = payload.get("selector")
-            pixel_x = payload.get("pixel_x")
-            pixel_y = payload.get("pixel_y")
-            heuristic_pixel = bool(payload.get("heuristic_pixel"))
-
-            for retry_index in range(1, 11):
-                action_triggered = True
-                if selector:
-                    logger.info(
-                        f"[AgenticStrategy] Replaying cached CSS selector "
-                        f"{selector!r} ({retry_index}/10)."
-                    )
-                    await cu.click_by_selector(selector)
-                elif pixel_x is not None and pixel_y is not None:
-                    logger.info(
-                        f"[AgenticStrategy] Replaying cached pixel click "
-                        f"({pixel_x}, {pixel_y}) ({retry_index}/10)."
-                    )
-                    await cu.click_at_pixel(int(pixel_x), int(pixel_y))
-                elif heuristic_pixel:
-                    logger.info(
-                        f"[AgenticStrategy] Replaying cached heuristic pixel search "
-                        f"({retry_index}/10)."
-                    )
-                    await cu.find_play_by_pixel()
-                else:
-                    return False
-
-                await asyncio.sleep(1.5)
-                if await _is_playing(page):
-                    logger.info(f"[AgenticStrategy] Cached {label} replay started playback.")
-                    return True
-
-                dismissed = await _pre_pass_unblock(page)
-                saw_popup = popup_seen
-                popup_seen = False
-                if dismissed or saw_popup:
-                    logger.info(
-                        f"[AgenticStrategy] Popup/overlay handled during cached "
-                        f"{label} replay ({retry_index}/10)."
-                    )
-
-            logger.info(f"[AgenticStrategy] Cached {label} replay did not start playback.")
-            return False
-
-        async def _run_preferred_strategy(attempt_index: int) -> bool:
-            nonlocal action_triggered
-            if not preferred_strategy:
-                return False
-
-            _log_strategy(
-                f"Cached success replay: {preferred_strategy} from {preferred_reason} "
-                f"(agentic attempt {attempt_index})"
-            )
-            action_triggered = True
-
-            if preferred_strategy == "media_session":
-                return await _media_session_play_and_fullscreen(page)
-            if preferred_strategy == "pre_pass_unblock":
-                dismissed = await _pre_pass_unblock(page)
-                if dismissed:
-                    await asyncio.sleep(1.5)
-                return await _is_playing(page)
-            if preferred_strategy == "force_play_js":
-                return await _force_play_js(page)
-            if preferred_strategy == "direct_play":
-                return await _try_direct_play(page)
-            if preferred_strategy in {"llm_selector", "llm_pixel", "heuristic_pixel"}:
-                return await _replay_click_payload(preferred_payload, preferred_strategy)
-
-            logger.info(f"[AgenticStrategy] Unknown cached strategy: {preferred_strategy}")
-            return False
-
-        async def _confirm_playing_and_fullscreen(reason: str) -> bool:
-            nonlocal action_triggered, nav_after_action, playing_started
-
-            if not await _is_playing(page):
-                logger.info(f"[Event] Playback not confirmed after {reason}.")
-                return False
-
-            playing_started = True
-            for fullscreen_attempt in range(1, 11):
-                logger.info(
-                    f"[Event] VIDEO PLAYBACK CONFIRMED after {reason}; "
-                    f"requesting fullscreen ({fullscreen_attempt}/10)."
-                )
-                action_triggered = True
-                nav_after_action = False
-                await _request_fullscreen_main_video(page)
-                await asyncio.sleep(1.5)
-
-                if nav_after_action:
-                    logger.warning(
-                        f"[Event] Page refreshed after fullscreen request "
-                        f"({fullscreen_attempt}/10); retrying playback setup."
-                    )
-                    nav_after_action = False
-                    action_triggered = False
-                    playing_started = False
-                    await asyncio.sleep(1.0)
-                    if await _force_play_js(page):
-                        continue
-                    if await _try_direct_play(page):
-                        continue
-                    return False
-
-                if await _is_playing(page):
-                    logger.info("[Event] Playback still active after fullscreen; ready for MediaRecorder injection.")
-                    return True
-
-                logger.warning(
-                    f"[Event] Playback stopped after fullscreen request "
-                    f"({fullscreen_attempt}/10); retrying playback setup."
-                )
-                if await _force_play_js(page):
-                    continue
-                if await _try_direct_play(page):
-                    continue
-                return False
-
-            logger.warning("[Event] Fullscreen/playback confirmation exhausted after 10 attempts.")
-            return False
-
-        # Short-circuit after event listeners are attached, so fullscreen-triggered
-        # refreshes are logged and do not accidentally fall through to recording.
-        if await _is_playing(page):
-            _log_strategy("Video already playing (autoplay) — confirming fullscreen before recording")
-            if await _confirm_playing_and_fullscreen("autoplay"):
-                return True
-
-        # ── Layer 0: Media Session API + fullscreen kick ────────────────────
-        _log_strategy("Layer0: MediaSession + fullscreen pre-kick")
-        action_triggered = True
-        if await _media_session_play_and_fullscreen(page):
-            await _remember_strategy("media_session", "MediaSession pre-kick")
-            if await _confirm_playing_and_fullscreen("MediaSession pre-kick"):
-                return True
-
-        for attempt in range(max_attempts):
-            popup_seen = False
-            nav_after_action = False
-            playing_started = False
-            action_triggered = False
-
-            logger.info(f"--- Agentic attempt {attempt + 1}/{max_attempts} ---")
-
-            if await _is_playing(page):
-                logger.info(f"[Event] Video playing at attempt {attempt + 1} entry.")
-                if await _confirm_playing_and_fullscreen(f"attempt {attempt + 1} entry"):
-                    return True
-
-            if preferred_strategy:
-                if await _run_preferred_strategy(attempt + 1):
-                    await _remember_strategy(
-                        preferred_strategy,
-                        f"cached replay on attempt {attempt + 1}",
-                        preferred_payload,
-                    )
-                    if await _confirm_playing_and_fullscreen(
-                        f"cached {preferred_strategy} replay"
-                    ):
-                        return True
-                preferred_failures += 1
-                logger.info(
-                    f"[AgenticStrategy] Cached strategy {preferred_strategy} did not complete "
-                    f"attempt {attempt + 1} ({preferred_failures}/2 fallback threshold)."
-                )
-                if preferred_failures < 2:
-                    continue
-                logger.info(
-                    f"[AgenticStrategy] Clearing stale cached strategy "
-                    f"{preferred_strategy}; falling back to full strategy stack."
-                )
-                preferred_strategy = None
-                preferred_payload = {}
-                preferred_reason = ""
-                preferred_failures = 0
-
-            # ── Layer 1a: ARIA + JS pre-pass (consent/ad dismissal) ──────
-            _log_strategy("Layer1a: pre-pass unblock (ARIA/JS)")
-            action_triggered = True
-            dismissed = await _pre_pass_unblock(page)
-            if dismissed:
-                await asyncio.sleep(2.0)
-                await _remember_strategy("pre_pass_unblock", "pre-pass unblock")
-                if await _confirm_playing_and_fullscreen("pre-pass unblock"):
-                    return True
-
-            # ── Layer 1b: force video.play() ─────────────────────────────
-            _log_strategy("Layer1b: force video.play()")
-            action_triggered = True
-            if await _force_play_js(page):
-                await _remember_strategy("force_play_js", "force video.play()")
-                if await _confirm_playing_and_fullscreen("force video.play()"):
-                    return True
-
-            # ── Layer 1c: accessibility-first play heuristics ─────────────
-            _log_strategy("Layer1c: accessibility heuristics (play buttons)")
-            action_triggered = True
-            if await _try_direct_play(page):
-                await _remember_strategy("direct_play", "accessibility/direct play")
-                if await _confirm_playing_and_fullscreen("accessibility/direct play"):
-                    return True
-
-            # ── Layer 2: screenshot + ARIA snapshot + HTML → LLM ─────────
-            _log_strategy("Layer2: LLM-guided selector/pixel click")
-            # All three signals give the LLM different views of the page:
-            # - screenshot: visual context
-            # - ARIA snapshot: compact semantic tree of interactive elements
-            # - HTML: full source for custom/non-standard player UIs
-            try:
-                screenshot_bytes = await cu.screenshot(quality=80)
-                screenshot_b64 = base64.b64encode(screenshot_bytes).decode()
-            except Exception as e:
-                logger.warning(f"  Screenshot failed: {e}")
-                break
-
-            try:
-                with open(os.path.join(_settings.temp_storage_dir, f"debug_agentic_{attempt}.jpg"), "wb") as f:
-                    f.write(screenshot_bytes)
-            except Exception:
-                pass
-
-            # Accessibility tree — compact YAML-like string of all ARIA roles/names
-            aria_tree = await cu.aria_snapshot()
-            for frame in page.frames[1:]:
-                try:
-                    frame_snap = await cu.aria_snapshot_for_frame(frame)
-                    if frame_snap:
-                        aria_tree += f"\n# iframe ({frame.url[:60]})\n{frame_snap}"
-                except Exception:
-                    pass
-
-            try:
-                raw_html = await page.content()
-                for frame in page.frames[1:]:
-                    try:
-                        frame_html = await frame.content()
-                        if frame_html and len(frame_html) > 500:
-                            raw_html += f"\n<!-- IFRAME ({frame.url[:80]}) -->\n" + frame_html
-                    except Exception:
-                        pass
-                interact_html = _clean_for_interaction(raw_html, max_len=10000)
-                logger.info(f"  HTML for LLM: {len(interact_html)} chars, ARIA: {len(aria_tree)} chars")
-            except Exception as e:
-                logger.warning(f"  HTML capture failed: {e}")
-                break
-
-            try:
-                result = await llm_manager.execute(
-                    Prompts.agentic_interact(
-                        interact_html,
-                        attempt,
-                        aria_snapshot=aria_tree,
-                        viewport_width=vp_w,
-                        viewport_height=vp_h,
-                    ),
-                    screenshot_b64,
-                )
-                selector = result.get("action_selector")
-                pixel_x = result.get("pixel_x")
-                pixel_y = result.get("pixel_y")
-                reason = result.get("reason", "—")
-                logger.info(
-                    f"  LLM action: selector={selector!r} "
-                    f"pixel=({pixel_x},{pixel_y}) — {reason}"
-                )
-            except Exception as e:
-                logger.warning(f"  LLM call failed: {e}")
-                break
-
-            if not selector and pixel_x is None:
-                logger.info("  LLM returned no selector and no coordinates — nothing to click.")
-                break
-
-            reason_ctx = (reason + " " + (selector or "")).lower()
-            is_unblocking = any(kw in reason_ctx for kw in [
-                "cookie", "consent", "accept", "banner", "age", "gdpr",
-                "overlay", "modal", "popup", "close", "dismiss",
-            ])
-
-            # ── Tier 1: ARIA accessibility (already attempted above via  ──
-            # ── _pre_pass_unblock + _try_direct_play before the LLM call ──
-
-            # ── Tier 2: CSS selector — covers standard DOM elements ───────
-            clicked = False
-            if selector:
-                clicked = await cu.click_by_selector(selector)
-                if clicked:
-                    logger.info(f"[Agent] Clicked via CSS selector: {selector!r} — {reason}")
-                    action_triggered = True
-                else:
-                    logger.info(f"[Agent] CSS selector click failed (element not found/visible): {selector!r}")
-
-            # ── Tier 3a: LLM-provided pixel coordinates ───────────────────
-            # Used when the element is in a sandboxed iframe or canvas UI
-            # where CSS selectors cannot reach but the LLM can SEE the button.
-            if not clicked and pixel_x is not None and pixel_y is not None:
-                try:
-                    clicked = await cu.click_at_pixel(int(pixel_x), int(pixel_y))
-                    if clicked:
-                        logger.info(f"[Agent] Clicked via pixel coordinates: ({pixel_x}, {pixel_y}) — {reason}")
-                        action_triggered = True
-                        await _request_fullscreen_main_video(page)
-                    else:
-                        logger.info(f"[Agent] Pixel click returned no result: ({pixel_x}, {pixel_y})")
-                except Exception as e:
-                    logger.debug(f"  Tier-3a pixel click error: {e}")
-
-            # ── Tier 3b: Heuristic pixel search (largest video/iframe) ────
-            if not clicked:
-                _log_strategy("Tier3b: heuristic pixel search")
-                clicked = await cu.find_play_by_pixel()
-                if clicked:
-                    logger.info("[Agent] Clicked via heuristic pixel search (largest video/iframe)")
-                    action_triggered = True
-                    await _request_fullscreen_main_video(page)
-
-            # ── Multi-click popup retry ───────────────────────────────────
-            # Some sites show a third-party popup/ad after the first play
-            # click.  Dismiss it and re-click the same target up to 10 times.
-            if clicked:
-                _last_px, _last_py = pixel_x, pixel_y
-                for _popup_retry in range(10):
-                    await asyncio.sleep(1.5)
-                    if await _is_playing(page):
-                        logger.info(f"[Event] Video playback CONFIRMED during popup retry {_popup_retry + 1}")
-                        break
-                    dismissed = await _pre_pass_unblock(page)
-                    saw_popup = popup_seen
-                    popup_seen = False
-                    action_triggered = True
-                    if dismissed or saw_popup:
-                        logger.info(
-                            f"[Agent] Popup/overlay dismissed (retry {_popup_retry + 1}/10) — re-clicking play"
-                        )
-                    else:
-                        logger.info(
-                            f"[Agent] Re-clicking play target (retry {_popup_retry + 1}/10) — no popup detected"
-                        )
-                    await asyncio.sleep(0.5)
-                    # Re-click using the best available handle for this element
-                    if selector:
-                        logger.info(f"[Agent] Re-clicking CSS selector: {selector!r}")
-                        await cu.click_by_selector(selector)
-                    elif _last_px is not None and _last_py is not None:
-                        logger.info(f"[Agent] Re-clicking pixel ({_last_px}, {_last_py})")
-                        await cu.click_at_pixel(int(_last_px), int(_last_py))
-                    else:
-                        logger.info("[Agent] Re-clicking via heuristic pixel search")
-                        await cu.find_play_by_pixel()
-
-            await asyncio.sleep(2.0)
-
-            if clicked:
-                if selector:
-                    await _remember_strategy(
-                        "llm_selector",
-                        f"LLM selector click on attempt {attempt + 1}",
-                        {"selector": selector},
-                    )
-                elif pixel_x is not None and pixel_y is not None:
-                    await _remember_strategy(
-                        "llm_pixel",
-                        f"LLM pixel click on attempt {attempt + 1}",
-                        {"pixel_x": pixel_x, "pixel_y": pixel_y},
-                    )
-                else:
-                    await _remember_strategy(
-                        "heuristic_pixel",
-                        f"heuristic pixel click on attempt {attempt + 1}",
-                        {"heuristic_pixel": True},
-                    )
-
-            if await _confirm_playing_and_fullscreen(f"attempt {attempt + 1} clicks"):
-                return True
-
-            # ── Layer 3: post-click recovery ──────────────────────────
-            await _pre_pass_unblock(page)
-            await asyncio.sleep(1.0)
-
-            if await _force_play_js(page):
-                await _remember_strategy("force_play_js", "post-click force video.play()")
-                if await _confirm_playing_and_fullscreen("post-click force video.play()"):
-                    return True
-
-            if is_unblocking:
-                logger.info("  Unblocking click — trying accessibility heuristics.")
-                if await _try_direct_play(page):
-                    await _remember_strategy("direct_play", "post-click accessibility/direct play")
-                    if await _confirm_playing_and_fullscreen("post-click accessibility/direct play"):
-                        return True
-
-            logger.info(f"  Still not playing after attempt {attempt + 1}.")
-
-    finally:
-        try:
-            page.remove_listener("dialog", _on_dialog)
-        except Exception:
-            pass
-        try:
-            page.context.remove_listener("page", _on_popup)
-        except Exception:
-            pass
-        try:
-            page.remove_listener("framenavigated", _on_nav)
-        except Exception:
-            pass
-
-    logger.warning("Agentic interact: all attempts exhausted without confirmed playback.")
-    return False
+    graph = PlaybackGraph(
+        is_playing_fn=_is_playing,
+        pre_pass_fn=_pre_pass_unblock,
+        force_play_js_fn=_force_play_js,
+        try_direct_play_fn=_try_direct_play,
+        media_session_fn=_media_session_play_and_fullscreen,
+        request_fullscreen_fn=_request_fullscreen_main_video,
+    )
+    state = PlaybackState(page=page, llm_manager=llm_manager, max_attempts=max_attempts)
+    return await graph.run(state)
 
 
 async def _set_quality(page, settings_selector: str | None, quality_selector: str | None) -> None:
