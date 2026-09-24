@@ -1,7 +1,6 @@
 import abc
 import asyncio
 import json
-import logging
 import httpx
 from openai import AsyncOpenAI, RateLimitError
 from anthropic import AsyncAnthropic

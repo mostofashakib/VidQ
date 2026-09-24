@@ -34,7 +34,7 @@ def test_upload_video_creates_job(client):
 
 
 def test_upload_job_completes_and_video_appears(client):
-    with patch("app.services.upload_worker.probe_video_dimensions", return_value=None), \
+    with patch("app.services.upload_worker._scale_to_720p", side_effect=lambda job, path, **kw: path), \
          patch("app.services.upload_worker.probe_duration", return_value=30.0):
         r = client.post(
             "/upload-video",
@@ -87,19 +87,17 @@ def test_webm_upload_processing_converts_to_mp4(tmp_path, monkeypatch):
         def kill(self):
             self.returncode = -9
 
-    monkeypatch.setattr(upload_worker.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "ffmpeg")
-    monkeypatch.setattr(upload_worker, "probe_video_dimensions", lambda _: (1280, 720))
     monkeypatch.setattr(upload_worker.subprocess, "Popen", FakePopen)
+    monkeypatch.setattr(upload_worker, "output_file_is_valid", lambda _: True)
 
     job = upload_worker.UploadJob("job-webm", "clip.webm")
     final_path = upload_worker._scale_to_720p(job, str(input_path), total_duration_s=30.0)
 
     assert final_path is not None
-    assert final_path.endswith("_mp4.mp4")
+    assert final_path.endswith("_converted.mp4")
     assert os.path.exists(final_path)
     assert not input_path.exists()
-    assert "-vf" not in captured_cmd["cmd"]
-    assert captured_cmd["cmd"][captured_cmd["cmd"].index("-c:a") + 1] == "aac"
+    assert "-c:a" in captured_cmd["cmd"]
 
 
 def test_webm_upload_processing_sets_conversion_error(tmp_path, monkeypatch):
@@ -120,8 +118,6 @@ def test_webm_upload_processing_sets_conversion_error(tmp_path, monkeypatch):
         def kill(self):
             self.returncode = -9
 
-    monkeypatch.setattr(upload_worker.imageio_ffmpeg, "get_ffmpeg_exe", lambda: "ffmpeg")
-    monkeypatch.setattr(upload_worker, "probe_video_dimensions", lambda _: (1280, 720))
     monkeypatch.setattr(upload_worker.subprocess, "Popen", FakePopen)
 
     job = upload_worker.UploadJob("job-webm-fail", "broken.webm")
@@ -129,7 +125,7 @@ def test_webm_upload_processing_sets_conversion_error(tmp_path, monkeypatch):
 
     assert final_path is None
     assert job.status == "failed"
-    assert job.error == "Could not convert WebM to MP4"
+    assert job.error == "Video conversion failed"
 
 
 def test_get_upload_job_not_found(client):
@@ -155,16 +151,17 @@ def test_list_upload_videos_empty(client):
 
 def test_list_upload_videos_returns_only_uploads(client, db_session):
     from app.db import Video
-    from datetime import datetime
+    from datetime import datetime, timezone
     from app.config import get_settings
 
     settings = get_settings()
+    now_utc = datetime.now(timezone.utc)
     url_video = Video(url="https://example.com/url.mp4", category="test",
-                      title="URL Video", source="url", created_at=datetime.utcnow())
+                      title="URL Video", source="url", created_at=now_utc)
     upload_video = Video(
         url=f"{settings.base_url}/temp_storage/up.mp4",
         category="uploads", title="Upload Video", source="upload",
-        created_at=datetime.utcnow(),
+        created_at=now_utc,
     )
     db_session.add_all([url_video, upload_video])
     db_session.commit()

@@ -132,14 +132,14 @@ def test_add_video_rejects_private_ip(client):
 
 def test_list_videos_excludes_uploads(client, db_session):
     from app.db import Video
-    from datetime import datetime
+    from datetime import datetime, timezone
     upload = Video(
         url="http://localhost:8000/temp_storage/uploaded.mp4",
         category="test",
         title="Uploaded",
         duration=10.0,
         source="upload",
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db_session.add(upload)
     db_session.commit()
@@ -152,14 +152,14 @@ def test_list_videos_excludes_uploads(client, db_session):
 
 def test_list_categories_excludes_uploads(client, db_session):
     from app.db import Video
-    from datetime import datetime
+    from datetime import datetime, timezone
     upload = Video(
         url="http://localhost:8000/temp_storage/cat_upload.mp4",
         category="upload-only-cat",
         title="Upload Cat",
         duration=5.0,
         source="upload",
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db_session.add(upload)
     db_session.commit()
@@ -172,7 +172,7 @@ def test_list_categories_excludes_uploads(client, db_session):
 def test_delete_upload_removes_file(client, db_session, tmp_path):
     import shutil
     from app.db import Video
-    from datetime import datetime
+    from datetime import datetime, timezone
     from app.config import get_settings
 
     settings = get_settings()
@@ -189,7 +189,7 @@ def test_delete_upload_removes_file(client, db_session, tmp_path):
         title="Fake Upload",
         duration=5.0,
         source="upload",
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc),
     )
     db_session.add(upload)
     db_session.commit()

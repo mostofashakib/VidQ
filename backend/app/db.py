@@ -1,7 +1,7 @@
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, Float
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm import sessionmaker
-from datetime import datetime
+from datetime import datetime, timezone
 from app.config import get_settings
 from app.models import DEFAULT_CATEGORY
 
@@ -21,10 +21,8 @@ class Video(Base):
     duration = Column(Float, nullable=True)  # duration in seconds
     thumbnail = Column(String, nullable=True)  # URL or base64
     source = Column(String, nullable=False, default="url")
-    created_at = Column(DateTime, default=datetime.utcnow)
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
-# For local dev: drop and recreate table to add 'source' column
-Base.metadata.drop_all(bind=engine)
 Base.metadata.create_all(bind=engine)
 
 def get_db():

@@ -1,9 +1,7 @@
 import asyncio
 import base64
 import logging
-import os
 import random
-import re
 
 from app.config import get_settings
 from app.services.prompts import Prompts
@@ -757,10 +755,6 @@ async def _media_session_play_and_fullscreen(page) -> bool:
     except Exception as e:
         logger.debug(f"MediaSession fullscreen attempt failed: {e}")
         return False
-
-
-def _log_strategy(reason: str) -> None:
-    logger.info(f"[AgenticStrategy] {reason}")
 
 
 async def _request_fullscreen_main_video(page) -> None:
