@@ -41,12 +41,12 @@ cd ..
 
 cd frontend
 
-# Load NVM and use Node 20 to avoid Next.js localStorage crashes on Node 22/25
+# Load NVM and use Node 22 (LTS)
 if [ -s "$HOME/.nvm/nvm.sh" ]; then
     export NVM_DIR="$HOME/.nvm"
     source "$NVM_DIR/nvm.sh"
-    nvm install 20
-    nvm use 20
+    nvm install 22
+    nvm use 22
 fi
 
 echo "Starting frontend..."
