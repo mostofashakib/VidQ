@@ -7,7 +7,7 @@ import random
 import re
 import threading
 import uuid
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
@@ -22,6 +22,7 @@ from app.services.scraper.media import (
     _try_ytdlp_on_page,
     _download_embed_video,
     _download_video_direct,
+    _ffmpeg_cookies,
     _convert_to_mp4,
     _probe_file_duration,
 )
@@ -44,6 +45,16 @@ from app.services.scraper.playback import (
     _human_scroll,
 )
 from app.services.scraper.computer_use import ComputerUse
+from app.services.scraper.candidates import (
+    VIDEO_ELEMENTS_JS,
+    VideoElement,
+    _parse_duration_seconds,
+    extract_page_facts,
+    is_acceptable_download,
+    main_element,
+    parse_video_elements,
+    rank_candidates,
+)
 from app.services.scraper.browser_adapter import launch_browser
 from app.services.prompts import Prompts
 
@@ -54,68 +65,17 @@ _settings = get_settings()
 _RECORD_DURATION_PAD_SECONDS = 2
 
 
-def _parse_duration_seconds(raw_value) -> float | None:
-    if raw_value is None:
-        return None
-    raw = str(raw_value).strip()
-    if not raw:
-        return None
-    try:
-        duration = float(raw)
-        if 0 < duration < float("inf"):
-            return duration
-    except ValueError:
-        pass
-    if re.fullmatch(r"\d{1,2}:\d{2}(:\d{2})?", raw):
-        parts = [float(part) for part in raw.split(":")]
-        if len(parts) == 2:
-            return parts[0] * 60 + parts[1]
-        return parts[0] * 3600 + parts[1] * 60 + parts[2]
-    iso_match = re.fullmatch(
-        r"P(?:T)?(?:(?P<hours>\d+(?:\.\d+)?)H)?(?:(?P<minutes>\d+(?:\.\d+)?)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?",
-        raw.upper(),
-    )
-    if iso_match:
-        duration = (
-            float(iso_match.group("hours") or 0) * 3600
-            + float(iso_match.group("minutes") or 0) * 60
-            + float(iso_match.group("seconds") or 0)
-        )
-        return duration if duration > 0 else None
-    return None
-
-
-def _extract_html_duration(soup: BeautifulSoup | None) -> float | None:
-    if not soup:
-        return None
-    candidates = []
-    video_tag = soup.find("video", duration=True)
-    if video_tag:
-        candidates.append(video_tag.get("duration"))
-    for attrs in (
-        {"property": "og:video:duration"},
-        {"property": "video:duration"},
-        {"name": "duration"},
-        {"itemprop": "duration"},
-    ):
-        tag = soup.find("meta", attrs={**attrs, "content": True})
-        if tag:
-            candidates.append(tag.get("content"))
-    for candidate in candidates:
-        duration = _parse_duration_seconds(candidate)
-        if duration:
-            return duration
-    return None
-
-# Proxy-level errors that mean the proxy itself is broken — rotate to another
-_PROXY_ERR_SIGNALS = (
-    "ERR_INVALID_AUTH_CREDENTIALS",
-    "ERR_TUNNEL_CONNECTION_FAILED",
-    "ERR_PROXY_CONNECTION_FAILED",
-    "ERR_SOCKS_CONNECTION_FAILED",
-    "ERR_NO_SUPPORTED_PROXIES",
-    "ERR_PROXY_AUTH_UNSUPPORTED",
-)
+async def _open_context(browser, **kwargs):
+    """
+    Open a browser context dressed for the active provider. Spoofing providers
+    get a fixed locale and the stealth patches; native-fingerprint providers
+    pass through untouched, because both changes make Cloudflare reject them.
+    """
+    if browser.native_fingerprint:
+        return await browser.new_context(**kwargs)
+    context = await browser.new_context(locale="en-US", **kwargs)
+    await _inject_stealth(context)
+    return context
 
 
 async def _context_navigate_with_proxy_fallback(
@@ -127,8 +87,8 @@ async def _context_navigate_with_proxy_fallback(
 ) -> tuple:
     """
     Called only after a CF captcha fires on the initial direct (no-proxy) load.
-    Tries up to `max_proxy_tries` random proxies, skipping any that fail with a
-    proxy-level error.  Falls back to a direct connection on the final attempt so
+    Tries up to `max_proxy_tries` random proxies, skipping any whose navigation
+    fails.  Falls back to a direct connection on the final attempt so
     the job never hard-fails solely because of a bad proxy.
     Returns (context, page).
     """
@@ -155,8 +115,7 @@ async def _context_navigate_with_proxy_fallback(
         if proxy_cfg:
             kwargs["proxy"] = proxy_cfg
 
-        ctx = await browser.new_context(**kwargs)
-        await _inject_stealth(ctx)
+        ctx = await _open_context(browser, **kwargs)
         pg = await ctx.new_page()
 
         try:
@@ -164,7 +123,10 @@ async def _context_navigate_with_proxy_fallback(
             return ctx, pg
         except Exception as e:
             last_exc = e
-            if not is_last and any(sig in str(e) for sig in _PROXY_ERR_SIGNALS):
+            # goto only raises on network failures, so through a proxy any
+            # error (refused, tunnel, ERR_TIMED_OUT from a dead proxy) means
+            # this route is unusable — rotate instead of aborting the job.
+            if not is_last and proxy_cfg:
                 logger.warning(f"Proxy error, trying next ({str(e)[:80]})…")
                 try:
                     await ctx.close()
@@ -254,6 +216,11 @@ async def run_extraction(
                 user_agent,
                 HEADLESS_OPTIONS,
             )
+            # From here on, every browser context and media download must claim
+            # the engine's real user agent; a mismatched one fails bot checks and
+            # invalidates clearance cookies, which are bound to the user agent.
+            user_agent = await browser.native_user_agent()
+            logger.debug(f"Browser user agent: {user_agent}")
 
             # ─────────────────────────────────────────
             # FAST PASS  (metadata + network sniff)
@@ -266,15 +233,13 @@ async def run_extraction(
             # looks like a returning human visitor that has already accepted consent
             # banners, passed bot checks, and has a browsing history.
             _storage_state = state_file if os.path.exists(state_file) else None
-            context = await browser.new_context(
+            context = await _open_context(
+                browser,
                 user_agent=user_agent,
-                locale="en-US",
                 timezone_id="America/New_York",
                 viewport={"width": 1920, "height": 1080},
                 storage_state=_storage_state,
             )
-            # Inject stealth patches on the context so all pages + frames are covered
-            await _inject_stealth(context)
             page = await context.new_page()
 
             video_urls: set[str] = set()
@@ -347,7 +312,6 @@ async def run_extraction(
                     proxy_pool,
                     {
                         "user_agent": user_agent,
-                        "locale": "en-US",
                         "timezone_id": "America/New_York",
                         "viewport": {"width": 1920, "height": 1080},
                     },
@@ -368,10 +332,15 @@ async def run_extraction(
 
             html = await page.content()
             soup = BeautifulSoup(html, "html.parser")
-            html_video_duration = _extract_html_duration(soup)
-            if html_video_duration:
-                dom_video_duration = html_video_duration
+            page_facts = extract_page_facts(soup, url)
+            if page_facts.duration:
+                dom_video_duration = page_facts.duration
                 logger.info(f"HTML video duration metadata: {dom_video_duration:.1f}s")
+            if page_facts.content_urls or page_facts.video_id:
+                logger.info(
+                    f"Page video facts: id={page_facts.video_id} "
+                    f"contentUrl={[u[:80] for u in page_facts.content_urls]}"
+                )
 
             # ── Stage 1: LLM vision navigation analysis ──
             play_selector: str | None = None
@@ -430,38 +399,20 @@ async def run_extraction(
                         break
                 await asyncio.sleep(3.0)
 
-            # ── Read DOM <video> src + duration ──
+            # ── Read every DOM <video> with the evidence used to spot ads ──
+            dom_elements: list[VideoElement] = []
             main_dom_url: str | None = None
             try:
-                dom_result = await page.evaluate('''() => {
-                    const videos = Array.from(document.querySelectorAll('video'));
-                    if (!videos.length) return { mainSrc: null, srcs: [], duration: null };
-                    const sorted = videos.slice().sort((a, b) =>
-                        (b.offsetWidth * b.offsetHeight) - (a.offsetWidth * a.offsetHeight));
-                    const main = sorted[0];
-                    const rawMain = main.currentSrc || main.getAttribute('src') || '';
-                    const mainSrc = rawMain && !rawMain.startsWith('blob:') && rawMain.startsWith('http')
-                        ? rawMain : null;
-                    const allSrcs = videos.map(v =>
-                        v.currentSrc || v.getAttribute('src') ||
-                        (v.querySelector('source') ? v.querySelector('source').getAttribute('src') : null)
-                    ).filter(s => s && !s.startsWith('blob:'));
-                    return { mainSrc, srcs: allSrcs, duration: main.duration || null };
-                }''')
-                main_dom_url = dom_result.get("mainSrc")
-                if main_dom_url:
-                    logger.info(f"Main video DOM src (largest): {main_dom_url[:100]}")
-                    video_urls.add(main_dom_url)
-                for dom_src in dom_result.get("srcs", []):
-                    if dom_src.startswith("/"):
-                        dom_src = urljoin(url, dom_src)
-                    if dom_src.startswith("http"):
-                        logger.debug(f"DOM video src: {dom_src}")
-                        video_urls.add(dom_src)
-                raw_dur = dom_result.get("duration")
-                if raw_dur and isinstance(raw_dur, (int, float)) and 0 < raw_dur < float('inf'):
-                    dom_video_duration = float(raw_dur)
-                    logger.info(f"DOM video duration: {dom_video_duration:.1f}s")
+                dom_elements = parse_video_elements(await page.evaluate(VIDEO_ELEMENTS_JS), url)
+                video_urls.update(el.src for el in dom_elements if el.src.startswith("http"))
+                main = main_element(dom_elements)
+                if main:
+                    if main.src.startswith("http"):
+                        main_dom_url = main.src
+                        logger.info(f"Main video DOM src (largest non-ad): {main_dom_url[:100]}")
+                    if main.duration and main.duration > 0:
+                        dom_video_duration = float(main.duration)
+                        logger.info(f"DOM video duration: {dom_video_duration:.1f}s")
             except Exception as e:
                 logger.debug(f"DOM video query failed: {e}")
             # Also check iframes (some players embed inside iframes)
@@ -469,6 +420,12 @@ async def run_extraction(
                 main_dom_url = await _get_main_playing_video_url(page)
                 if main_dom_url:
                     video_urls.add(main_dom_url)
+                    if main_element(dom_elements) is None:
+                        # No player in the top frame, so the iframe's is the main one.
+                        dom_elements.append(VideoElement(
+                            src=main_dom_url, area=0, duration=None,
+                            muted=False, loop=False, controls=True, container="",
+                        ))
 
             cu = ComputerUse(page)
             await cu.mouse_move(random.randint(100, 500), random.randint(100, 500))
@@ -484,50 +441,51 @@ async def run_extraction(
                 pass
 
             # ── Identify main video URL and try direct download ──
-            raw_urls = list(video_urls)
-            clean_urls = [u for u in raw_urls if not _is_ad_video_url(u)]
-            logger.info(f"Video URLs: {len(raw_urls)} raw → {len(clean_urls)} after ad filter")
+            ranked, rejected = rank_candidates(list(video_urls), dom_elements, page_facts)
+            for rejected_url, reason in rejected:
+                logger.info(f"Skipping ad ({reason}): {rejected_url[:80]}")
+            trusted = [c for c in ranked if c.trusted]
+            # Once the page identifies its video, unrelated URLs are never a
+            # substitute: if the real one is blocked, the agent pass records it.
+            ordered = trusted or ranked
+            logger.info(
+                f"Video URLs: {len(video_urls)} seen, {len(rejected)} ads, "
+                f"{len(trusted)} trusted; trying {len(ordered[:8])}"
+            )
 
-            if main_dom_url and main_dom_url in clean_urls:
-                ordered = [main_dom_url] + [u for u in clean_urls if u != main_dom_url]
-            elif main_dom_url:
-                ordered = [main_dom_url] + clean_urls
-            else:
-                ordered = clean_urls
-
-            for cand_url in ordered[:8]:
-                if await _is_forbidden(cand_url, user_agent):
+            # Media often sits behind the same Cloudflare clearance as the page,
+            # so probes and downloads reuse the browser session's cookies.
+            session_cookies = _ffmpeg_cookies(await context.cookies())
+            for candidate in ordered[:8]:
+                cand_url = candidate.url
+                if await _is_forbidden(cand_url, context.request, url):
                     logger.warning(f"Forbidden URL (skipped): {cand_url[:80]}")
                     continue
 
-                logger.info(f"Trying candidate: {cand_url[:100]}")
+                evidence = ", ".join(candidate.reasons) or "no page evidence"
+                logger.info(f"Trying candidate (score {candidate.score}: {evidence}): {cand_url[:100]}")
                 dl_url = await _download_video_direct(
                     cand_url, url, user_agent,
                     total_duration_s=dom_video_duration,
                     progress_callback=progress_callback,
+                    cookies=session_cookies,
                 )
                 if not dl_url:
                     logger.info("ffmpeg failed for candidate, trying next.")
                     continue
 
-                # Duration guard: reject downloaded file if it looks like a pre-roll ad.
-                # A candidate whose duration is less than half the page-reported duration
-                # is almost certainly an ad that loaded before the main video stream.
-                if dom_video_duration and dom_video_duration > 30:
-                    filename = dl_url.rstrip("/").split("/")[-1]
-                    local_path = os.path.join(storage, filename)
-                    if os.path.exists(local_path):
-                        dl_duration = _probe_file_duration(local_path)
-                        if dl_duration is not None and dl_duration < dom_video_duration * 0.5:
-                            logger.warning(
-                                f"Duration mismatch: downloaded {dl_duration:.0f}s but page"
-                                f" reports ~{dom_video_duration:.0f}s — likely a pre-roll ad, discarding"
-                            )
-                            try:
-                                os.remove(local_path)
-                            except Exception:
-                                pass
-                            continue
+                # Length guard: pre-rolls and sliders download fine but are short.
+                local_path = os.path.join(storage, dl_url.rstrip("/").split("/")[-1])
+                accepted, reason = is_acceptable_download(
+                    candidate.trusted, _probe_file_duration(local_path), dom_video_duration
+                )
+                if not accepted:
+                    logger.warning(f"Discarding download, likely an ad: {reason}")
+                    try:
+                        os.remove(local_path)
+                    except Exception:
+                        pass
+                    continue
 
                 temp_video_url = dl_url
                 network_video_urls = [cand_url]
@@ -579,15 +537,14 @@ async def run_extraction(
 
                 logger.warning(f"Starting MediaRecorder Heavy Pass ({actual_record_seconds}s)…")
                 _storage_state_heavy = state_file if os.path.exists(state_file) else None
-                heavy_context = await browser.new_context(
+                heavy_context = await _open_context(
+                    browser,
                     accept_downloads=True,
                     user_agent=user_agent,
-                    locale="en-US",
                     timezone_id="America/New_York",
                     viewport={"width": 1920, "height": 1080},
                     storage_state=_storage_state_heavy,
                 )
-                await _inject_stealth(heavy_context)
                 heavy_page = await heavy_context.new_page()
 
                 await _safe_goto(heavy_page, url)
@@ -618,7 +575,6 @@ async def run_extraction(
                         {
                             "accept_downloads": True,
                             "user_agent": user_agent,
-                            "locale": "en-US",
                             "timezone_id": "America/New_York",
                             "viewport": {"width": 1920, "height": 1080},
                         },

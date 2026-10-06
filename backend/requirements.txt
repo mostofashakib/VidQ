@@ -6,6 +6,7 @@ openai
 anthropic
 python-dotenv
 playwright
+patchright
 httpx
 imageio
 imageio-ffmpeg

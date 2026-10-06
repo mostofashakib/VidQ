@@ -24,6 +24,7 @@ _AD_DOMAINS = frozenset([
     'adcolony.com', 'inmobi.com', 'rubiconproject.com',
     'pubmatic.com', 'openx.net', 'triplelift.com',
     'moatads.com', 'scorecardresearch.com',
+    'exosrv.com', 'exoclick.com', 'trafficjunky.net', 'juicyads.com',
 ])
 # Matches ad-size dimension patterns in URL paths: 440x250, 320x240, 160x90, etc.
 _AD_SIZE_RE = re.compile(r'\b\d{2,3}x\d{2,3}\b')
@@ -43,15 +44,27 @@ def _is_ad_video_url(url: str) -> bool:
     return False
 
 
-async def _is_forbidden(url: str, user_agent: str) -> bool:
+async def _is_forbidden(url: str, request, referer: str) -> bool:
+    """
+    Probe url through the browser context's request API (`context.request`).
+    It carries the session's cookies, so media behind the same Cloudflare
+    clearance as the page is not misreported as forbidden.
+    """
     if not url or url.startswith("blob:"):
         return True
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.head(url, headers={"User-Agent": user_agent}, follow_redirects=True)
-            return resp.status_code in (401, 403, 404)
+        resp = await request.head(url, headers={"Referer": referer}, timeout=5000)
+        return resp.status in (401, 403, 404)
     except Exception:
         return False
+
+
+def _ffmpeg_cookies(cookies: list[dict]) -> str:
+    """Render browser cookies as ffmpeg's newline-separated Set-Cookie lines."""
+    return "\n".join(
+        f"{c['name']}={c['value']}; path={c['path']}; domain={c['domain']};"
+        for c in cookies
+    )
 
 
 async def _get_main_playing_video_url(page) -> str | None:
@@ -348,6 +361,15 @@ async def _download_embed_video(
     return None
 
 
+def _download_budget_s(base_s: float, total_duration_s: float | None) -> float:
+    """
+    Seconds allowed for a download. CDNs that pace delivery to the playback
+    bitrate still send a playable stream at least in real time, so the video's
+    duration is added on top of the base budget.
+    """
+    return base_s + (total_duration_s or 0)
+
+
 async def _download_video_direct(
     video_url: str,
     referer: str,
@@ -355,12 +377,15 @@ async def _download_video_direct(
     timeout_s: int = 120,
     total_duration_s: float | None = None,
     progress_callback=None,
+    cookies: str = "",
 ) -> str | None:
     """
     Download video_url. Tries ffmpeg first (fast stream-copy); falls back to
     yt-dlp for m3u8/DASH URLs where ffmpeg fails due to token refresh or
-    segment encryption.
+    segment encryption. `cookies` (from `_ffmpeg_cookies`) lets ffmpeg reuse
+    the browser session's Cloudflare clearance.
     """
+    timeout_s = _download_budget_s(timeout_s, total_duration_s)
     try:
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
         storage = _settings.temp_storage_dir
@@ -371,6 +396,7 @@ async def _download_video_direct(
             ffmpeg_exe, "-y",
             "-user_agent", user_agent,
             "-headers", f"Referer: {referer}\r\n",
+            *(["-cookies", cookies] if cookies else []),
             "-i", video_url,
             "-c", "copy",
             "-progress", "pipe:1",

@@ -8,6 +8,8 @@ from app.config import Settings
 from app.services.scraper.browser_adapter import (
     AgentBrowserAdapter,
     BrowserLaunchOptions,
+    ManagedBrowser,
+    PatchrightBrowserAdapter,
     _extract_cdp_url,
     launch_browser,
 )
@@ -22,11 +24,31 @@ class FakeBrowser:
         self.context_kwargs = kwargs
         return "context"
 
+    async def new_browser_cdp_session(self):
+        return FakeCDPSession()
+
     def is_connected(self):
         return not self.closed
 
     async def close(self):
         self.closed = True
+
+
+class FakeCDPSession:
+    def __init__(self):
+        self.detached = False
+
+    async def send(self, method):
+        assert method == "Browser.getVersion"
+        return {
+            "userAgent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) HeadlessChrome/154.0.0.0 Safari/537.36"
+            )
+        }
+
+    async def detach(self):
+        self.detached = True
 
 
 class FakeChromium:
@@ -141,3 +163,103 @@ async def test_playwright_provider_can_be_selected_explicitly():
 
     assert browser.provider_name == "playwright"
     assert chromium.launch_kwargs == {"headless": True, "args": []}
+
+
+@pytest.mark.asyncio
+async def test_native_user_agent_reports_the_real_engine_without_headless_marker():
+    browser = ManagedBrowser(FakeBrowser(), provider_name="playwright")
+
+    assert await browser.native_user_agent() == (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
+    )
+
+
+class FakeDriver:
+    def __init__(self):
+        self.chromium = FakeChromium()
+        self.stopped = False
+
+    async def stop(self):
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_patchright_provider_drives_installed_chrome_off_screen():
+    driver = FakeDriver()
+
+    async def start_driver():
+        return driver
+
+    options = BrowserLaunchOptions(
+        headless=False,
+        user_agent="VidQ Test",
+        chromium_args=("--window-size=1920,1080",),
+    )
+
+    browser = await PatchrightBrowserAdapter(start_driver).launch(None, options)
+
+    assert browser.provider_name == "patchright"
+    assert browser.native_fingerprint is True
+    assert driver.chromium.launch_kwargs == {
+        "channel": "chrome",
+        "headless": False,
+        "args": ["--window-size=1920,1080", "--window-position=-32000,-32000"],
+    }
+    await browser.close()
+    assert driver.chromium.browser.closed is True
+    assert driver.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_patchright_provider_adds_no_window_args_when_headless():
+    driver = FakeDriver()
+
+    async def start_driver():
+        return driver
+
+    options = BrowserLaunchOptions(headless=True, user_agent="VidQ Test", chromium_args=())
+
+    await PatchrightBrowserAdapter(start_driver).launch(None, options)
+
+    assert driver.chromium.launch_kwargs["args"] == []
+
+
+@pytest.mark.asyncio
+async def test_patchright_provider_stops_driver_when_chrome_fails_to_launch():
+    driver = FakeDriver()
+
+    async def failing_launch(**kwargs):
+        raise RuntimeError("Chrome is not installed")
+
+    driver.chromium.launch = failing_launch
+
+    async def start_driver():
+        return driver
+
+    options = BrowserLaunchOptions(headless=False, user_agent="VidQ Test", chromium_args=())
+
+    with pytest.raises(RuntimeError, match="Chrome is not installed"):
+        await PatchrightBrowserAdapter(start_driver).launch(None, options)
+    assert driver.stopped is True
+
+
+@pytest.mark.asyncio
+async def test_launch_browser_selects_patchright_and_falls_back_to_playwright(monkeypatch):
+    chromium = FakeChromium()
+    playwright = SimpleNamespace(chromium=chromium)
+    settings = SimpleNamespace(
+        browser_provider="patchright",
+        browser_headless=False,
+        agent_browser_command="agent-browser",
+    )
+
+    async def failing_launch(self, playwright, options):
+        raise RuntimeError("Chrome is not installed")
+
+    monkeypatch.setattr(PatchrightBrowserAdapter, "launch", failing_launch)
+
+    browser = await launch_browser(playwright, settings, "VidQ Test", [])
+
+    assert browser.provider_name == "playwright"
+    assert browser.native_fingerprint is False

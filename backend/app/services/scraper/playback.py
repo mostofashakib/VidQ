@@ -7,6 +7,7 @@ from app.config import get_settings
 from app.services.prompts import Prompts
 from app.services.scraper.html import _clean_for_interaction
 from app.services.scraper.computer_use import ComputerUse
+from app.services.scraper.candidates import VIDEO_ELEMENTS_JS, main_element, parse_video_elements
 from app.services.scraper.playback_graph import (
     PlaybackGraph,
     PlaybackState,
@@ -432,7 +433,7 @@ async def _interruptible_sleep(seconds: float, cancel_event=None) -> bool:
 
 
 async def _get_main_video_selector(page, llm_selector: str | None = None) -> str:
-    """Return a CSS selector for the largest (main) video element."""
+    """Return a CSS selector for the largest video outside any ad container."""
     if llm_selector:
         try:
             exists = await page.evaluate(f"() => !!document.querySelector({repr(llm_selector)})")
@@ -442,19 +443,11 @@ async def _get_main_video_selector(page, llm_selector: str | None = None) -> str
         except Exception:
             pass
 
-    return await page.evaluate('''() => {
-        const videos = Array.from(document.querySelectorAll('video'));
-        if (videos.length === 0) return 'video';
-        if (videos.length === 1) return 'video';
-        const sorted = videos.sort((a, b) => {
-            const areaA = (a.offsetWidth || 0) * (a.offsetHeight || 0);
-            const areaB = (b.offsetWidth || 0) * (b.offsetHeight || 0);
-            return areaB - areaA;
-        });
-        const main = sorted[0];
-        if (!main.id) main.id = 'vsearch-main-video-' + Math.random().toString(36).slice(2, 11);
-        return '#' + main.id;
-    }''')
+    elements = parse_video_elements(await page.evaluate(VIDEO_ELEMENTS_JS), page.url)
+    main = main_element(elements)
+    if len(elements) <= 1 or not main:
+        return 'video'
+    return f'video[data-vidq-index="{main.index}"]'
 
 
 async def _pre_pass_unblock(page) -> int:

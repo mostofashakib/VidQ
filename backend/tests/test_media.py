@@ -2,7 +2,18 @@
 import os
 from types import SimpleNamespace
 
-from app.services.scraper.media import _convert_to_mp4, _is_ad_video_url, _validate_video_file
+import pytest
+
+from app.services.scraper import media
+from app.services.scraper.media import (
+    _convert_to_mp4,
+    _download_budget_s,
+    _download_video_direct,
+    _ffmpeg_cookies,
+    _is_ad_video_url,
+    _is_forbidden,
+    _validate_video_file,
+)
 
 
 # ── Ad domain filtering ───────────────────────────────────────────────────────
@@ -114,3 +125,88 @@ def test_convert_to_mp4_accepts_durationless_mediarecorder_webm(tmp_path, monkey
     assert os.path.exists(final_path)
     assert not webm_path.exists()
     assert any(cmd[-1] == str(mp4_path) for cmd in calls)
+
+
+# ── Browser session reuse for Cloudflare-protected media ──────────────────────
+
+class FakeRequest:
+    """Stands in for a browser context's request API, which carries its cookies."""
+
+    def __init__(self, status=200, error=None):
+        self.status = status
+        self.error = error
+        self.calls = []
+
+    async def head(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        if self.error:
+            raise self.error
+        return SimpleNamespace(status=self.status)
+
+
+@pytest.mark.asyncio
+async def test_forbidden_check_goes_through_the_browser_session():
+    request = FakeRequest(status=403)
+
+    assert await _is_forbidden("https://cdn.example.com/v.mp4", request, "https://example.com/p") is True
+    assert request.calls[0][0] == "https://cdn.example.com/v.mp4"
+    assert request.calls[0][1]["headers"] == {"Referer": "https://example.com/p"}
+
+
+@pytest.mark.asyncio
+async def test_forbidden_check_allows_reachable_media_and_network_errors():
+    assert await _is_forbidden("https://cdn.example.com/v.mp4", FakeRequest(status=206), "") is False
+    assert await _is_forbidden(
+        "https://cdn.example.com/v.mp4", FakeRequest(error=RuntimeError("timeout")), ""
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_forbidden_check_rejects_blob_urls_without_a_request():
+    request = FakeRequest()
+
+    assert await _is_forbidden("blob:https://example.com/abc", request, "") is True
+    assert request.calls == []
+
+
+def test_ffmpeg_cookies_keep_each_cookie_scoped_to_its_domain():
+    cookies = [
+        {"name": "cf_clearance", "value": "abc", "domain": ".example.com", "path": "/"},
+        {"name": "PHPSESSID", "value": "x1", "domain": "www.example.com", "path": "/app"},
+    ]
+
+    assert _ffmpeg_cookies(cookies) == (
+        "cf_clearance=abc; path=/; domain=.example.com;\n"
+        "PHPSESSID=x1; path=/app; domain=www.example.com;"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_download_hands_browser_cookies_to_ffmpeg(monkeypatch):
+    commands = []
+
+    async def fake_exec(*cmd, **kwargs):
+        commands.append(list(cmd))
+        raise RuntimeError("stop after capturing the command")
+
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await _download_video_direct(
+        "https://cdn.example.com/v.mp4",
+        "https://example.com/p",
+        "UA",
+        cookies="cf_clearance=abc; path=/; domain=.example.com;",
+    )
+
+    assert result is None
+    ffmpeg_cmd = commands[0]
+    assert ffmpeg_cmd[ffmpeg_cmd.index("-cookies") + 1] == "cf_clearance=abc; path=/; domain=.example.com;"
+    assert ffmpeg_cmd.index("-cookies") < ffmpeg_cmd.index("-i")
+
+
+def test_download_budget_grows_with_video_length_for_paced_cdns():
+    # A playable stream arrives at least in real time, so a paced CDN needs
+    # up to the video's duration on top of the base budget.
+    assert _download_budget_s(120, 482.0) == 602.0
+    assert _download_budget_s(120, None) == 120
+    assert _download_budget_s(120, 0.0) == 120

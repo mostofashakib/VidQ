@@ -2,8 +2,10 @@
 
 Agent Browser owns the default Chrome process. Playwright connects to that
 process over CDP so the existing extraction pipeline can keep using its mature
-network interception and MediaRecorder code. The direct Playwright launcher is
-retained as a transparent fallback.
+network interception and MediaRecorder code. The Patchright provider drives the
+installed Chrome with automation leaks patched, for sites behind interactive
+Cloudflare checks. The direct Playwright launcher is retained as a transparent
+fallback.
 """
 
 from __future__ import annotations
@@ -21,6 +23,10 @@ from typing import Any, Protocol
 logger = logging.getLogger("BrowserAdapter")
 
 CommandRunner = Callable[[Sequence[str]], Awaitable[str]]
+DriverStarter = Callable[[], Awaitable[Any]]
+
+# A headed Chrome (BROWSER_HEADLESS=false) opens off-screen, out of view.
+_OFF_SCREEN_WINDOW_ARG = "--window-position=-32000,-32000"
 
 
 class BrowserAdapter(Protocol):
@@ -45,14 +51,31 @@ class ManagedBrowser:
         browser: Any,
         provider_name: str,
         close_callback: Callable[[], Awaitable[None]] | None = None,
+        native_fingerprint: bool = False,
     ) -> None:
         self._browser = browser
         self.provider_name = provider_name
         self._close_callback = close_callback
+        # True when the provider's own fingerprint must reach sites untouched:
+        # locale overrides and stealth patches make Cloudflare reject it.
+        self.native_fingerprint = native_fingerprint
         self._closed = False
 
     async def new_context(self, **kwargs: Any) -> Any:
         return await self._browser.new_context(**kwargs)
+
+    async def native_user_agent(self) -> str:
+        """Return the launched engine's own user agent, minus the headless marker.
+
+        Bot checks such as Cloudflare compare the claimed user agent with the
+        engine's real version and platform, so a hardcoded string gets blocked.
+        """
+        session = await self._browser.new_browser_cdp_session()
+        try:
+            version = await session.send("Browser.getVersion")
+        finally:
+            await session.detach()
+        return version["userAgent"].replace("HeadlessChrome/", "Chrome/")
 
     async def close(self) -> None:
         if self._closed:
@@ -73,6 +96,42 @@ class PlaywrightBrowserAdapter:
             args=list(options.chromium_args),
         )
         return ManagedBrowser(browser, provider_name="playwright")
+
+
+class PatchrightBrowserAdapter:
+    """Drive the installed Chrome through Patchright's leak-patched driver."""
+
+    def __init__(self, start_driver: DriverStarter | None = None) -> None:
+        self._start_driver = start_driver or _start_patchright
+
+    async def launch(self, playwright: Any, options: BrowserLaunchOptions) -> ManagedBrowser:
+        args = list(options.chromium_args)
+        if not options.headless:
+            args.append(_OFF_SCREEN_WINDOW_ARG)
+
+        driver = await self._start_driver()
+        try:
+            browser = await driver.chromium.launch(
+                channel="chrome",
+                headless=options.headless,
+                args=args,
+            )
+        except Exception:
+            await driver.stop()
+            raise
+
+        async def close_patchright() -> None:
+            try:
+                await browser.close()
+            finally:
+                await driver.stop()
+
+        return ManagedBrowser(
+            browser,
+            provider_name="patchright",
+            close_callback=close_patchright,
+            native_fingerprint=True,
+        )
 
 
 class AgentBrowserAdapter:
@@ -159,6 +218,18 @@ async def launch_browser(
         logger.info("Browser provider: playwright (configured)")
         return await playwright_adapter.launch(playwright, options)
 
+    if provider == "patchright":
+        try:
+            browser = await PatchrightBrowserAdapter().launch(playwright, options)
+            logger.info("Browser provider: patchright")
+            return browser
+        except Exception as exc:
+            logger.warning(
+                "patchright unavailable (%s); falling back to bundled Playwright Chromium",
+                exc,
+            )
+            return await playwright_adapter.launch(playwright, options)
+
     if provider != "agent-browser":
         logger.warning(
             "Unknown BROWSER_PROVIDER=%r; using agent-browser with Playwright fallback",
@@ -177,6 +248,12 @@ async def launch_browser(
             exc,
         )
         return await playwright_adapter.launch(playwright, options)
+
+
+async def _start_patchright() -> Any:
+    from patchright.async_api import async_playwright
+
+    return await async_playwright().start()
 
 
 async def _run_command(command: Sequence[str]) -> str:
