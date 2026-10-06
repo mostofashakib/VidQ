@@ -12,6 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 from app.services.llm_manager import FallbackLLMManager
 from app.services.scraper import USER_AGENTS, clean_html
+from app.services.scraper.album import fetch_album
 from app.services.prompts import Prompts
 import random
 from app.config import get_settings
@@ -214,6 +215,51 @@ async def call_llm_with_html_and_screenshot(llm_manager: FallbackLLMManager, htm
         logger.error(f"LLM Manager execution failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"LLM extraction failed: {e}")
 
+def _enqueue_link(url: str, category: str, token: str) -> list:
+    """
+    Enqueue one job for a regular link, or one job per video for an album
+    page. Album videos keep the page as Referer, plus a title and poster.
+    """
+    queue = _get_queue()
+    album = fetch_album(url, random.choice(USER_AGENTS))
+    items = [item for item in album.items if is_safe_url(item.url)] if album else []
+    if album and len(items) < len(album.items):
+        logger.warning(f"Skipped {len(album.items) - len(items)} album videos on unsafe hosts: {url}")
+    if not items:
+        return [queue.enqueue(url=url, category=category, token=token)]
+
+    logger.info(f"Album link expanded into {len(items)} video jobs: {url}")
+    return [
+        queue.enqueue(
+            url=item.url, category=category, token=token, referer=album.page_url,
+            title_hint=item.title, thumbnail_hint=item.thumbnail or None,
+        )
+        for item in items
+    ]
+
+
+def _queued_jobs_payload(jobs: list) -> dict:
+    """The first job's fields (for older clients) plus every queued job."""
+    queue = _get_queue()
+    listed = [
+        {
+            "job_id": job.job_id,
+            "status": job.status,
+            "queue_position": queue.position(job.job_id),
+            "title": job.title_hint,
+            "url": job.url,
+        }
+        for job in jobs
+    ]
+    first = listed[0]
+    return {
+        "job_id": first["job_id"],
+        "status": first["status"],
+        "queue_position": first["queue_position"],
+        "jobs": listed,
+    }
+
+
 @router.post("/extract-video")
 def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_token)):
     """
@@ -229,16 +275,8 @@ def extract_video_llm(data: dict = Body(...), token: str = Depends(verify_token)
     if not is_safe_url(url):
         raise HTTPException(status_code=400, detail=FORBIDDEN_URL_MSG)
 
-    queue = _get_queue()
-    job = queue.enqueue(url=url, category=category, token=token)
-    position = queue.position(job.job_id)
-
-    return {
-        "job_id": job.job_id,
-        "status": job.status,
-        "message": "Video queued for processing.",
-        "queue_position": position,
-    }
+    jobs = _enqueue_link(url, category, token)
+    return {"message": "Video queued for processing.", **_queued_jobs_payload(jobs)}
 
 
 @router.post("/queue", status_code=200)
@@ -251,15 +289,10 @@ def enqueue_video(data: dict = Body(...), token: str = Depends(verify_token)):
     if not is_safe_url(url):
         raise HTTPException(status_code=400, detail=FORBIDDEN_URL_MSG)
 
-    queue = _get_queue()
-    job = queue.enqueue(url=url, category=category, token=token)
-    position = queue.position(job.job_id)
-
+    jobs = _enqueue_link(url, category, token)
     return {
         "message": "Video queued for processing. It will be available once recording is complete.",
-        "job_id": job.job_id,
-        "queue_position": position,
-        "status": job.status,
+        **_queued_jobs_payload(jobs),
     }
 
 

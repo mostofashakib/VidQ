@@ -14,6 +14,7 @@ import {
   getQueueStatus,
   cancelJob,
   downloadVideo,
+  type QueuedJob,
 } from "./api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -318,16 +319,20 @@ export default function HomePage() {
         }
 
         if (res.job_id) {
+          // Album links queue one job per video: give each its own row.
+          const queuedJobs: QueuedJob[] = res.jobs ?? [{ job_id: res.job_id }];
           setDownloads((prev) =>
-            prev.map((d) =>
+            prev.flatMap((d) =>
               d.localId === localId
-                ? {
+                ? queuedJobs.map((job, i) => ({
                     ...d,
-                    status: "queued",
+                    localId: i === 0 ? localId : `${localId}-${i}`,
+                    title: job.title || d.title,
+                    status: "queued" as const,
                     message: res.message || "Video queued for processing.",
-                    jobId: res.job_id,
-                  }
-                : d
+                    jobId: job.job_id,
+                  }))
+                : [d]
             )
           );
           return;

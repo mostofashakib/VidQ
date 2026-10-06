@@ -4,13 +4,16 @@ import pytest
 from bs4 import BeautifulSoup
 
 from app.services.scraper.candidates import (
+    Candidate,
     PageVideoFacts,
     VideoElement,
     extract_page_facts,
+    has_trailer_cue,
     is_acceptable_download,
     main_element,
     parse_video_elements,
     rank_candidates,
+    vet_candidates,
 )
 
 PAGE = "https://site.example/video/90563/some-title/?__vs=1"
@@ -219,3 +222,71 @@ async def test_agent_pass_selects_the_largest_non_ad_player():
             ]
 
     assert await _get_main_video_selector(FakePage()) == 'video[data-vidq-index="1"]'
+
+
+# ── Trailers ──────────────────────────────────────────────────────────────────
+
+
+
+def test_trailer_cues_come_from_path_label_and_container_words():
+    assert has_trailer_cue("https://v.example/videos/90563_trailer.mp4")
+    assert has_trailer_cue("https://v.example/clip/90563.mp4")
+    assert has_trailer_cue("https://v.example/v.mp4", label="Watch Trailer")
+    assert has_trailer_cue("https://v.example/v.mp4", container="video-teaser-box")
+    assert not has_trailer_cue("https://v.example/clips/90563_1080p.mp4")
+    assert not has_trailer_cue("https://v.example/v.mp4", label="HD", container="player video-js")
+
+
+def test_ranking_marks_trailer_suspects_from_element_labels():
+    facts = PageVideoFacts(content_urls=(), duration=None, video_id="90563")
+    trailer = VideoElement(src="https://v.example/90563_a.mp4", area=10, duration=None, muted=False,
+                           loop=False, controls=True, container="player", label="Trailer")
+
+    ranked, _ = rank_candidates([MAIN, trailer.src], [trailer], facts)
+
+    by_url = {c.url: c for c in ranked}
+    assert by_url[trailer.src].trailer_suspected is True
+    assert by_url[MAIN].trailer_suspected is False
+
+
+def cand(url, trailer=False, score=40):
+    return Candidate(url=url, score=score, trusted=True, reasons=(), trailer_suspected=trailer)
+
+
+def test_vetting_skips_files_much_shorter_than_the_declared_length():
+    full, short = cand("https://v.example/full.mp4"), cand("https://v.example/short.mp4", score=100)
+
+    result = vet_candidates([short, full], {short.url: 60.0, full.url: 845.0}, declared_s=845.0)
+
+    assert [c.url for c in result.kept] == [full.url]
+    assert result.skipped == [(short.url, "60s file but the page declares ~845s")]
+    assert result.only_trailers is False
+
+
+def test_vetting_reports_when_every_candidate_is_a_trailer():
+    short = cand("https://v.example/short.mp4")
+
+    result = vet_candidates([short], {short.url: 60.0}, declared_s=845.0)
+
+    assert result.kept == []
+    assert result.only_trailers is True
+
+
+def test_named_trailers_are_dropped_only_when_another_candidate_remains():
+    named, plain = cand("https://v.example/t.mp4", trailer=True), cand("https://v.example/p.mp4")
+
+    both = vet_candidates([named, plain], {}, declared_s=None)
+    alone = vet_candidates([named], {}, declared_s=None)
+
+    assert [c.url for c in both.kept] == [plain.url]
+    assert both.skipped == [(named.url, "named like a trailer")]
+    assert [c.url for c in alone.kept] == [named.url]
+    assert alone.only_trailers is False
+
+
+def test_vetting_prefers_the_longest_probed_file_and_keeps_unprobed_ones_last():
+    a, b, c = cand("https://v.example/a.mp4", score=90), cand("https://v.example/b.mp4"), cand("https://v.example/c.mp4")
+
+    result = vet_candidates([a, b, c], {a.url: 120.0, b.url: 845.0, c.url: None}, declared_s=None)
+
+    assert [x.url for x in result.kept] == [b.url, a.url, c.url]

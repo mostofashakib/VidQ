@@ -12,6 +12,11 @@ scored against evidence from the page itself:
 
 A candidate is trusted when at least one positive signal backs it. Untrusted
 URLs are only worth trying when nothing on the page is trusted.
+
+Trailers are the same content as the real video, only shorter, so ad rules
+miss them. `vet_candidates` drops files whose probed length is well below the
+page's declared length, drops trailer-named files when a plain one remains,
+and prefers the longest probed file.
 """
 
 from __future__ import annotations
@@ -32,6 +37,8 @@ _AD_MARKERS = frozenset({
 })
 # Class/id words of non-ad clips that are still not the main video.
 _PREVIEW_MARKERS = frozenset({"related", "thumb", "thumbnail", "preview", "trailer", "teaser"})
+# Words that name a trailer in a path, label or container (whole words).
+_TRAILER_WORDS = frozenset({"trailer", "preview", "teaser", "sample", "clip"})
 _PREVIEW_PATH_RE = re.compile(r"(?<![a-z])(preview|trailer|teaser|thumb|tmb|sample)(?![a-z])")
 _VIDEO_ID_RE = re.compile(r"^\d{4,}$")
 _WORD_RE = re.compile(r"[a-z0-9]+")
@@ -59,6 +66,7 @@ class VideoElement:
     controls: bool
     container: str  # class and id names of the element and its ancestors
     index: int = -1  # position in the page, tagged as data-vidq-index
+    label: str = ""  # <source label>, title and aria-label text
 
 
 # Reads every <video> with the evidence used to spot ads, and tags each with
@@ -70,6 +78,8 @@ VIDEO_ELEMENTS_JS = """() => Array.from(document.querySelectorAll('video')).map(
         names.push(typeof n.className === 'string' ? n.className : '', n.id || '');
     }
     const source = v.querySelector('source');
+    const labels = [v.getAttribute('title'), v.getAttribute('aria-label'),
+        ...Array.from(v.querySelectorAll('source')).map(s => s.getAttribute('label'))];
     return {
         index,
         src: v.currentSrc || v.getAttribute('src') || (source ? source.getAttribute('src') : '') || '',
@@ -77,6 +87,7 @@ VIDEO_ELEMENTS_JS = """() => Array.from(document.querySelectorAll('video')).map(
         duration: Number.isFinite(v.duration) ? v.duration : null,
         muted: v.muted, loop: v.loop, controls: v.controls,
         container: names.join(' '),
+        label: labels.filter(Boolean).join(' '),
     };
 })"""
 
@@ -95,7 +106,7 @@ def parse_video_elements(raw_elements: list[dict], page_url: str) -> list[VideoE
             src=src, area=int(raw.get("area") or 0), duration=raw.get("duration"),
             muted=bool(raw.get("muted")), loop=bool(raw.get("loop")),
             controls=bool(raw.get("controls")), container=raw.get("container") or "",
-            index=int(raw.get("index", -1)),
+            index=int(raw.get("index", -1)), label=raw.get("label") or "",
         ))
     return elements
 
@@ -113,6 +124,14 @@ class Candidate:
     score: int
     trusted: bool
     reasons: tuple[str, ...]
+    trailer_suspected: bool = False
+
+
+@dataclass(frozen=True)
+class Vetting:
+    kept: list[Candidate]
+    skipped: list[tuple[str, str]]
+    only_trailers: bool  # every candidate was shorter than the declared length
 
 
 def _parse_duration_seconds(raw_value) -> float | None:
@@ -231,6 +250,12 @@ def _has_video_id(url: str, video_id: str | None) -> bool:
     return re.search(rf"(?<!\d){re.escape(video_id)}(?!\d)", urlparse(url).path) is not None
 
 
+def has_trailer_cue(url: str, label: str = "", container: str = "") -> bool:
+    """A naming hint that url is a trailer. A suspicion, never proof on its own."""
+    words = _words(urlparse(url).path) | _words(label) | _words(container)
+    return bool(words & _TRAILER_WORDS)
+
+
 def _is_ad_element(el: VideoElement) -> bool:
     return bool(_words(el.container) & _AD_MARKERS)
 
@@ -289,10 +314,48 @@ def rank_candidates(
             score += _SCORE_PREVIEW_PATH
             reasons.append("preview-style path")
 
-        ranked.append(Candidate(url=url, score=score, trusted=trusted, reasons=tuple(reasons)))
+        trailer_suspected = (
+            has_trailer_cue(url, element.label, element.container) if element else has_trailer_cue(url)
+        )
+        ranked.append(Candidate(
+            url=url, score=score, trusted=trusted, reasons=tuple(reasons),
+            trailer_suspected=trailer_suspected,
+        ))
 
     ranked.sort(key=lambda c: c.score, reverse=True)
     return ranked, rejected
+
+
+def is_trailer_length(length_s: float | None, declared_s: float | None) -> bool:
+    """True when a file is well below the length the page declares."""
+    return bool(declared_s) and length_s is not None and length_s < declared_s * _MIN_EXPECTED_SHARE
+
+
+def vet_candidates(
+    candidates: list[Candidate],
+    probed: dict[str, float | None],
+    declared_s: float | None,
+) -> Vetting:
+    """
+    Skip trailers before downloading. `probed` maps URLs to their remote
+    length (None when the probe failed); `declared_s` is the page's stated
+    length. Kept candidates are ordered longest probed first, unprobed last.
+    """
+    kept: list[Candidate] = []
+    skipped: list[tuple[str, str]] = []
+    for c in candidates:
+        length = probed.get(c.url)
+        if is_trailer_length(length, declared_s):
+            skipped.append((c.url, f"{length:.0f}s file but the page declares ~{declared_s:.0f}s"))
+        else:
+            kept.append(c)
+
+    if any(not c.trailer_suspected for c in kept):
+        skipped.extend((c.url, "named like a trailer") for c in kept if c.trailer_suspected)
+        kept = [c for c in kept if not c.trailer_suspected]
+
+    kept.sort(key=lambda c: -(probed.get(c.url) or -1))
+    return Vetting(kept=kept, skipped=skipped, only_trailers=bool(candidates) and not kept)
 
 
 def is_acceptable_download(
@@ -303,7 +366,7 @@ def is_acceptable_download(
     """Return (accepted, reason) for a finished download."""
     if downloaded_s is None:
         return (True, "") if trusted else (False, "unreadable length from an untrusted source")
-    if expected_s and downloaded_s < expected_s * _MIN_EXPECTED_SHARE:
+    if is_trailer_length(downloaded_s, expected_s):
         return False, f"{downloaded_s:.0f}s but the page expected ~{expected_s:.0f}s"
     if not expected_s and not trusted and downloaded_s < _AD_MAX_SECONDS:
         return False, f"{downloaded_s:.0f}s ad-length clip from an untrusted source"

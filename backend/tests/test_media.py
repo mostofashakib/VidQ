@@ -12,6 +12,7 @@ from app.services.scraper.media import (
     _ffmpeg_cookies,
     _is_ad_video_url,
     _is_forbidden,
+    probe_remote_duration,
     _validate_video_file,
 )
 
@@ -210,3 +211,46 @@ def test_download_budget_grows_with_video_length_for_paced_cdns():
     assert _download_budget_s(120, 482.0) == 602.0
     assert _download_budget_s(120, None) == 120
     assert _download_budget_s(120, 0.0) == 120
+
+
+# ── Remote length probe ───────────────────────────────────────────────────────
+
+def test_probe_reads_remote_length_with_referer_cookies_and_user_agent(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1, stdout="", stderr="  Duration: 00:01:51.22, start: 0.000000, bitrate: 2 kb/s")
+
+    monkeypatch.setattr(media.subprocess, "run", fake_run)
+
+    length = probe_remote_duration(
+        "https://v.example/one.mp4", "https://albums.example/a/1", user_agent="UA", cookies="c=1; domain=.v.example;"
+    )
+
+    assert length == pytest.approx(111.22)
+    cmd = calls[0]
+    assert cmd[cmd.index("-headers") + 1] == "Referer: https://albums.example/a/1\r\n"
+    assert cmd[cmd.index("-user_agent") + 1] == "UA"
+    assert cmd[cmd.index("-cookies") + 1] == "c=1; domain=.v.example;"
+    assert cmd[-1] == "https://v.example/one.mp4"
+
+
+def test_probe_returns_none_when_the_length_is_unknown(monkeypatch):
+    results = iter([
+        SimpleNamespace(returncode=1, stdout="", stderr="Server returned 403 Forbidden (access denied)"),
+        SimpleNamespace(returncode=1, stdout="", stderr="  Duration: N/A, start: 0.000000, bitrate: N/A"),
+    ])
+    monkeypatch.setattr(media.subprocess, "run", lambda cmd, **kwargs: next(results))
+
+    assert probe_remote_duration("https://v.example/a.mp4", "https://p.example") is None
+    assert probe_remote_duration("https://v.example/live.m3u8", "https://p.example") is None
+
+
+def test_probe_gives_up_after_its_timeout(monkeypatch):
+    def slow(cmd, **kwargs):
+        raise media.subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+
+    monkeypatch.setattr(media.subprocess, "run", slow)
+
+    assert probe_remote_duration("https://v.example/a.mp4", "https://p.example") is None

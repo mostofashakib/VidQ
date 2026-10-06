@@ -33,6 +33,12 @@ export async function deleteVideo(token: string, id: number) {
   });
 }
 
+/** One queued job. Album links return one per video. */
+export interface QueuedJob {
+  job_id: string;
+  title?: string | null;
+}
+
 export async function extractVideo(token: string, url: string, signal?: AbortSignal) {
   const res = await axios.post(
     `${API_URL}/extract-video`,

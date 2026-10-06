@@ -57,6 +57,11 @@ class RecordingJob:
     recording_started_at: Optional[float] = None  # time.time() when MediaRecorder fired
     download_progress: int = 0                # 0-100, ffmpeg download percentage
     recording_duration: Optional[int] = None  # progress target; detected video duration or recording cap
+    # Set for videos expanded from an album page: the page (sent as Referer)
+    # and the album's title and poster for this video.
+    referer: Optional[str] = None
+    title_hint: Optional[str] = None
+    thumbnail_hint: Optional[str] = None
     # Per-job cancellation flag checked during the recording sleep
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
 
@@ -132,8 +137,19 @@ class VideoQueue:
     # Public API
     # ------------------------------------------------------------------
 
-    def enqueue(self, url: str, category: str, token: str) -> RecordingJob:
-        job = RecordingJob(job_id=uuid.uuid4().hex, url=url, category=category, token=token)
+    def enqueue(
+        self,
+        url: str,
+        category: str,
+        token: str,
+        referer: Optional[str] = None,
+        title_hint: Optional[str] = None,
+        thumbnail_hint: Optional[str] = None,
+    ) -> RecordingJob:
+        job = RecordingJob(
+            job_id=uuid.uuid4().hex, url=url, category=category, token=token,
+            referer=referer, title_hint=title_hint, thumbnail_hint=thumbnail_hint,
+        )
         with self._lock:
             self._jobs[job.job_id] = job
             self._queue.append(job.job_id)
@@ -275,6 +291,7 @@ class VideoQueue:
                 cancel_event=job.cancel_event,
                 phase_callback=_set_phase,
                 progress_callback=_on_progress,
+                referer=job.referer,
             )
 
             if not screenshot_b64:
@@ -307,6 +324,9 @@ class VideoQueue:
                 result["thumbnail"] = result.get("thumbnail") or thumbnail_url
                 if temp_video_url:
                     result["video_url"] = temp_video_url
+            if job.title_hint:
+                result["title"] = job.title_hint
+            result["thumbnail"] = result.get("thumbnail") or job.thumbnail_hint
             return result, temp_video_url
 
         async def _run_with_cancel_watcher():

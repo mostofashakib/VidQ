@@ -611,6 +611,15 @@ def _validate_mp4(path: str) -> bool:
     return _validate_video_file(path, label="MP4")
 
 
+def _parse_ffmpeg_duration(stderr: str) -> float | None:
+    """Read the `Duration: HH:MM:SS.xx` line that `ffmpeg -i` prints."""
+    match = re.search(r'Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)', stderr)
+    if not match:
+        return None
+    h, m, s = int(match.group(1)), int(match.group(2)), float(match.group(3))
+    return h * 3600 + m * 60 + s
+
+
 def _probe_file_duration(video_path: str) -> float | None:
     """Return video duration in seconds, or None if unable to probe."""
     try:
@@ -619,13 +628,38 @@ def _probe_file_duration(video_path: str) -> float | None:
             [ffmpeg_exe, "-i", video_path],
             capture_output=True, text=True,
         )
-        match = re.search(r'Duration:\s+(\d+):(\d+):(\d+(?:\.\d+)?)', result.stderr)
-        if match:
-            h, m, s = int(match.group(1)), int(match.group(2)), float(match.group(3))
-            return h * 3600 + m * 60 + s
+        return _parse_ffmpeg_duration(result.stderr)
     except Exception:
         pass
     return None
+
+
+_REMOTE_PROBE_TIMEOUT_S = 15
+
+
+def probe_remote_duration(
+    url: str,
+    referer: str,
+    user_agent: str = "",
+    cookies: str = "",
+) -> float | None:
+    """
+    Read a remote video's length from its header without downloading it
+    (about a second). Sends the same Referer, user agent and cookies as the
+    download would. Returns None when the length is unknown or unreachable.
+    """
+    cmd = [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-headers", f"Referer: {referer}\r\n"]
+    if user_agent:
+        cmd += ["-user_agent", user_agent]
+    if cookies:
+        cmd += ["-cookies", cookies]
+    cmd += ["-i", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_REMOTE_PROBE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        logger.info(f"Length probe timed out: {url[:100]}")
+        return None
+    return _parse_ffmpeg_duration(result.stderr)
 
 
 def _convert_to_mp4(webm_path: str) -> str | None:

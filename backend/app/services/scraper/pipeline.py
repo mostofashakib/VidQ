@@ -23,6 +23,7 @@ from app.services.scraper.media import (
     _download_embed_video,
     _download_video_direct,
     _ffmpeg_cookies,
+    probe_remote_duration,
     _convert_to_mp4,
     _probe_file_duration,
 )
@@ -54,6 +55,7 @@ from app.services.scraper.candidates import (
     main_element,
     parse_video_elements,
     rank_candidates,
+    vet_candidates,
 )
 from app.services.scraper.browser_adapter import launch_browser
 from app.services.prompts import Prompts
@@ -150,9 +152,12 @@ async def run_extraction(
     cancel_event: threading.Event | None = None,
     phase_callback=None,
     progress_callback=None,
+    referer: str | None = None,
 ) -> tuple[str, str, list[str], str, str]:
     """
     Async Playwright scraping pipeline.
+    `referer` is the page a direct video file came from (an album page);
+    its media host refuses requests without it.
     Returns: (html, screenshot_b64, network_video_urls, thumbnail_url, temp_video_url)
     """
     html = ""
@@ -161,6 +166,9 @@ async def run_extraction(
     network_video_urls: list[str] = []
     temp_video_url: str | None = None
     dom_video_duration: float | None = None
+    # The length the page states (metadata or LLM). Unlike the DOM duration,
+    # it cannot come from a trailer playing in the player.
+    declared_video_duration: float | None = None
 
     storage = _settings.temp_storage_dir
     os.makedirs(storage, exist_ok=True)
@@ -171,7 +179,7 @@ async def run_extraction(
     embed_result = await _detect_direct_video_embed(url, user_agent)
     if embed_result:
         embedded_src, embed_html = embed_result
-        dl_url = await _download_embed_video(embedded_src, referer=url)
+        dl_url = await _download_embed_video(embedded_src, referer=referer or url)
         if dl_url:
             logger.info("Embedded fast-path succeeded — skipping Playwright and LLM.")
             embed_soup = BeautifulSoup(embed_html, "html.parser")
@@ -334,7 +342,7 @@ async def run_extraction(
             soup = BeautifulSoup(html, "html.parser")
             page_facts = extract_page_facts(soup, url)
             if page_facts.duration:
-                dom_video_duration = page_facts.duration
+                dom_video_duration = declared_video_duration = page_facts.duration
                 logger.info(f"HTML video duration metadata: {dom_video_duration:.1f}s")
             if page_facts.content_urls or page_facts.video_id:
                 logger.info(
@@ -374,6 +382,7 @@ async def run_extraction(
                     llm_duration = _parse_duration_seconds(nav_map.get("duration"))
                     if llm_duration:
                         dom_video_duration = llm_duration
+                        declared_video_duration = declared_video_duration or llm_duration
                         logger.info(f"LLM navigation duration: {dom_video_duration:.1f}s")
                     logger.info(f"Nav map: play=[{play_selector}], main=[{main_video_selector}], direct=[{direct_video_url_llm}]")
                     await _set_quality(page, settings_selector, quality_selector)
@@ -456,7 +465,25 @@ async def run_extraction(
             # Media often sits behind the same Cloudflare clearance as the page,
             # so probes and downloads reuse the browser session's cookies.
             session_cookies = _ffmpeg_cookies(await context.cookies())
-            for candidate in ordered[:8]:
+            to_try = ordered[:8]
+            # Trailers share the page's video id, so lengths are probed whenever
+            # there is something to compare: a declared length or rival files.
+            probed: dict[str, float | None] = {}
+            if declared_video_duration or len(to_try) > 1:
+                lengths = await asyncio.gather(*(
+                    asyncio.to_thread(probe_remote_duration, c.url, url, user_agent, session_cookies)
+                    for c in to_try
+                ))
+                probed = dict(zip((c.url for c in to_try), lengths))
+            vetting = vet_candidates(to_try, probed, declared_video_duration)
+            for skipped_url, reason in vetting.skipped:
+                logger.info(f"Skipping trailer ({reason}): {skipped_url[:80]}")
+            if vetting.only_trailers:
+                raise RuntimeError(
+                    "Only a trailer is available on this page: every video file is far "
+                    f"shorter than the stated ~{declared_video_duration:.0f}s."
+                )
+            for candidate in vetting.kept:
                 cand_url = candidate.url
                 if await _is_forbidden(cand_url, context.request, url):
                     logger.warning(f"Forbidden URL (skipped): {cand_url[:80]}")
