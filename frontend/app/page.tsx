@@ -4,7 +4,7 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "./auth-context";
 import { useJobs, type DownloadJob } from "./jobs-context";
-import { downloadBlob, videoDownloadName } from "./job-utils";
+import { downloadBlob, queuedDownloadRows, videoDownloadName } from "./job-utils";
 import {
   addVideo,
   listVideos,
@@ -14,7 +14,6 @@ import {
   getQueueStatus,
   cancelJob,
   downloadVideo,
-  type QueuedJob,
 } from "./api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -319,21 +318,8 @@ export default function HomePage() {
         }
 
         if (res.job_id) {
-          // Album links queue one job per video: give each its own row.
-          const queuedJobs: QueuedJob[] = res.jobs ?? [{ job_id: res.job_id }];
           setDownloads((prev) =>
-            prev.flatMap((d) =>
-              d.localId === localId
-                ? queuedJobs.map((job, i) => ({
-                    ...d,
-                    localId: i === 0 ? localId : `${localId}-${i}`,
-                    title: job.title || d.title,
-                    status: "queued" as const,
-                    message: res.message || "Video queued for processing.",
-                    jobId: job.job_id,
-                  }))
-                : [d]
-            )
+            prev.flatMap((d) => (d.localId === localId ? queuedDownloadRows(d, res) : [d]))
           );
           return;
         }

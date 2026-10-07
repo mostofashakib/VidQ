@@ -115,6 +115,9 @@ class OllamaProvider(LLMProvider):
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "format": "json",
+            # Thinking models in JSON mode spend the whole budget reasoning and
+            # return nothing; non-thinking models ignore this flag.
+            "think": False,
             "options": {"temperature": 0},
         }
         logger.info(f"Ollama call_text → model={self.model_name}")

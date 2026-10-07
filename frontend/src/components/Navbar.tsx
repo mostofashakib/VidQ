@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 
 const NAV_LINKS = [
   { href: "/", label: "Download" },
+  { href: "/search", label: "Search" },
   { href: "/upload", label: "Convert" },
   { href: "/combine", label: "Combine" },
   { href: "/translate", label: "Translate" },

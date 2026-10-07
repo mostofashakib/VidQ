@@ -26,6 +26,20 @@ def _get_bool_env(name: str, default: bool) -> bool:
     return default
 
 
+def _get_choice_env(name: str, choices: tuple[str, ...], default: str) -> str:
+    """Read an env var that must be one of `choices` (case-insensitive)."""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+
+    normalized = raw_value.lower().strip()
+    if normalized in choices:
+        return normalized
+
+    logger.warning("Invalid %s=%r; using default %s", name, raw_value, default)
+    return default
+
+
 class Settings:
     def __init__(self):
         self.app_password: str = os.getenv("APP_PASSWORD", "")
@@ -90,6 +104,11 @@ class Settings:
         # to a fresh proxy + clears cookies so the site sees a new IP each attempt.
         raw_proxies = os.getenv("PROXY_URLS", "")
         self.proxy_urls: list[str] = [p.strip() for p in raw_proxies.split(",") if p.strip()]
+
+        # Safe-search level sent to the browser-driven search engines.
+        self.search_safe_search: str = _get_choice_env(
+            "SEARCH_SAFE_SEARCH", ("off", "moderate", "strict"), default="off"
+        )
 
         if not self.database_url:
             raise ValueError("Missing required environment variable: DATABASE_URL")

@@ -154,3 +154,36 @@ class Prompts:
             + "\n\nNetwork video URLs:\n"
             + str(network_video_urls)[:2000]
         )
+
+    @staticmethod
+    def search_queries(description: str) -> str:
+        """Text prompt: turn a video description into web search queries."""
+        return (
+            "You plan web searches that find videos.\n"
+            "The user describes the video they want to watch:\n"
+            f"{description}\n\n"
+            "Write 3 or 4 short search queries that find matching videos. Keep every name "
+            "and key term the user wrote. Vary the word order and use synonyms or the "
+            "wording a video title would use. Do not add a genre, format or topic the user "
+            "did not mention. Any kind of video is fine.\n\n"
+            "Return ONLY valid JSON, no markdown:\n"
+            '{"queries": ["query one", "query two", "query three"]}'
+        )
+
+    @staticmethod
+    def rank_search_results(description: str, candidate_lines: list[str]) -> str:
+        """Text prompt: score each search result against the user's description."""
+        return (
+            "You judge video search results for a user.\n"
+            f"The user wants: {description}\n\n"
+            "Each candidate line is: id | title | length | site | snippet\n"
+            "Score every candidate from 0 to 3 for how well it matches what the user wants:\n"
+            "3 = clearly the video the user describes, 2 = likely matches, "
+            "1 = loosely related, 0 = does not match.\n"
+            "A match has every name the user gave, spelled the same. Synonyms and other "
+            "wordings count. Any kind of video counts.\n"
+            "Give each candidate with a score of 2 or 3 a reason of at most 12 words.\n\n"
+            "Return ONLY valid JSON, no markdown:\n"
+            '{"scores": [{"id": 0, "score": 3, "reason": "why it matches"}]}\n\n'
+            "Candidates:\n" + "\n".join(candidate_lines)
+        )

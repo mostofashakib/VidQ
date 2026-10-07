@@ -1,11 +1,32 @@
 "use client";
 
 import { useCallback, useEffect, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
+import type { QueuedJob } from "./api";
+import type { DownloadJob } from "./jobs-context";
 
 const TERMINAL_STATUSES = ["done", "failed", "cancelled"];
 
 export function createLocalId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * Rows for the download list once a link is queued. Album links queue one
+ * job per video, so one submitted row becomes one row per job.
+ */
+export function queuedDownloadRows(
+  row: DownloadJob,
+  res: { job_id: string; jobs?: QueuedJob[]; message?: string },
+): DownloadJob[] {
+  const queuedJobs: QueuedJob[] = res.jobs ?? [{ job_id: res.job_id }];
+  return queuedJobs.map((job, i) => ({
+    ...row,
+    localId: i === 0 ? row.localId : `${row.localId}-${i}`,
+    title: job.title || row.title,
+    status: "queued" as const,
+    message: res.message || "Video queued for processing.",
+    jobId: job.job_id,
+  }));
 }
 
 export function isTerminalStatus(status: string): boolean {

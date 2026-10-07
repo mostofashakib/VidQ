@@ -33,6 +33,68 @@ export async function deleteVideo(token: string, id: number) {
   });
 }
 
+// ── Search ────────────────────────────────────────────────────────────────
+
+export interface SearchResultItem {
+  url: string;
+  title: string;
+  source: string;
+  duration: number | null;
+  thumbnail: string;
+  snippet: string;
+  reason: string;
+}
+
+export interface SearchData {
+  search_id: string;
+  description: string;
+  status: "running" | "done" | "failed";
+  phase: "planning" | "searching" | "ranking" | "comparing" | null;
+  queries: string[];
+  results: SearchResultItem[];
+  has_more: boolean;
+  ranked_by_llm: boolean;
+  error: string | null;
+}
+
+export async function startSearch(token: string, description: string): Promise<SearchData> {
+  const res = await axios.post(`${API_URL}/search`, { description }, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function getSearch(token: string, searchId: string): Promise<SearchData> {
+  const res = await axios.get(`${API_URL}/search/${searchId}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+export async function moreSearchResults(token: string, searchId: string): Promise<SearchData> {
+  const res = await axios.post(`${API_URL}/search/${searchId}/more`, {}, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+/** How to play a search result: relayed through the backend, or in the site's own player. */
+export type PlayData =
+  | { mode: "stream"; stream_id: string; kind: "file" | "hls"; path: string }
+  | { mode: "embed"; embed_url: string };
+
+export async function playSearchResult(token: string, url: string): Promise<PlayData> {
+  const res = await axios.post(`${API_URL}/search/play`, { url }, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
+/** Absolute URL of a relayed stream path. Stream IDs are the access key, so no token is sent. */
+export function streamUrl(path: string): string {
+  return `${API_URL}${path}`;
+}
+
 /** One queued job. Album links return one per video. */
 export interface QueuedJob {
   job_id: string;
