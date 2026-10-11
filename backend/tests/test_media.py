@@ -1,4 +1,5 @@
 """Unit tests for ad URL filtering and video URL utilities."""
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from app.services.scraper.media import (
     _is_forbidden,
     probe_remote_duration,
     _validate_video_file,
+    browser_referer,
 )
 
 
@@ -254,3 +256,53 @@ def test_probe_gives_up_after_its_timeout(monkeypatch):
     monkeypatch.setattr(media.subprocess, "run", slow)
 
     assert probe_remote_duration("https://v.example/a.mp4", "https://p.example") is None
+
+
+# ── Referer ───────────────────────────────────────────────────────────────────
+
+def test_browser_referer_sends_only_the_origin_across_origins():
+    # Chrome's default policy (strict-origin-when-cross-origin); media hosts check for it.
+    page = "https://www.albums.example/a/AbC123?x=1#top"
+
+    assert browser_referer(page, "https://v81.albums.example/1/one.mp4") == "https://www.albums.example/"
+    assert browser_referer(page, "https://www.albums.example/media/one.mp4") == "https://www.albums.example/a/AbC123?x=1"
+    assert browser_referer("https://albums.example:8443/a/1", "https://cdn.example/1.mp4") == "https://albums.example:8443/"
+    assert browser_referer(page, "http://www.albums.example/one.mp4") == ""  # https page to http: no Referer
+
+
+@pytest.mark.asyncio
+async def test_embed_download_time_limit_grows_with_the_videos_length(monkeypatch):
+    # A 32-minute file from a CDN paced near playback speed needs more than the base budget.
+    from app.services.scraper.media import _download_embed_video
+
+    probes, timeouts = [], []
+
+    def fake_probe(url, referer, user_agent="", cookies=""):
+        probes.append((url, referer, user_agent))
+        return 1917.0
+
+    class FakeProc:
+        returncode = None
+
+        def kill(self):
+            pass
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*cmd, **kwargs):
+        return FakeProc()
+
+    async def fake_wait_for(awaitable, timeout):
+        awaitable.close()
+        timeouts.append(timeout)
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr(media, "probe_remote_duration", fake_probe)
+    monkeypatch.setattr(media.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(media.asyncio, "wait_for", fake_wait_for)
+
+    assert await _download_embed_video("https://cdn.example/v.mp4", "https://example.com/", "UA") is None
+
+    assert probes == [("https://cdn.example/v.mp4", "https://example.com/", "UA")]
+    assert timeouts and set(timeouts) == {300 + 1917.0}

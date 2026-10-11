@@ -44,6 +44,26 @@ def _is_ad_video_url(url: str) -> bool:
     return False
 
 
+def _origin(url: str) -> str:
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def browser_referer(page_url: str, media_url: str) -> str:
+    """
+    The Referer Chrome sends from page_url when it loads media_url, under its
+    default policy (strict-origin-when-cross-origin): the page without its
+    fragment on the same origin, only the page's origin across origins, and
+    nothing from https to http. Media hosts that check Referer expect exactly
+    this, and some refuse a full page URL from another origin.
+    """
+    if page_url.startswith("https:") and media_url.startswith("http:"):
+        return ""
+    if _origin(page_url) == _origin(media_url):
+        return page_url.split("#")[0]
+    return _origin(page_url) + "/"
+
+
 async def _is_forbidden(url: str, request, referer: str) -> bool:
     """
     Probe url through the browser context's request API (`context.request`).
@@ -261,10 +281,14 @@ async def _download_embed_video(
     """
     Download a direct embed video using ffmpeg (mp4/webm/m3u8) with curl as
     fallback for plain files.  Resizes to 720p if needed.
+    Each attempt gets timeout_s plus the video's length, read from its header
+    first, so a long video from a CDN paced near playback speed is not cut off.
     Returns a localhost URL or None on failure.
     """
     storage = _settings.temp_storage_dir
     os.makedirs(storage, exist_ok=True)
+    length = await asyncio.to_thread(probe_remote_duration, video_url, referer, user_agent)
+    budget_s = _download_budget_s(timeout_s, length)
 
     v_lower = video_url.lower()
     is_m3u8 = ".m3u8" in v_lower or "m3u8" in urlparse(video_url).path.lower()
@@ -296,10 +320,10 @@ async def _download_embed_video(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
         except asyncio.TimeoutError:
             proc.kill()
-            logger.warning(f"ffmpeg embed download timed out ({timeout_s}s)")
+            logger.warning(f"ffmpeg embed download timed out ({budget_s:.0f}s)")
             stderr_bytes = b""
         if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
             final_path = ensure_min_quality(out_path)
@@ -337,10 +361,10 @@ async def _download_embed_video(
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+            _, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
         except asyncio.TimeoutError:
             proc.kill()
-            logger.warning(f"yt-dlp embed fallback timed out ({timeout_s}s)")
+            logger.warning(f"yt-dlp embed fallback timed out ({budget_s:.0f}s)")
             return None
         if proc.returncode == 0 and os.path.exists(out_path) and os.path.getsize(out_path) > 10_000:
             final_path = ensure_min_quality(out_path)

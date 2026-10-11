@@ -25,6 +25,7 @@ from app.services.scraper.media import (
     _ffmpeg_cookies,
     probe_remote_duration,
     _convert_to_mp4,
+    browser_referer,
     _probe_file_duration,
 )
 from app.services.scraper.playback import (
@@ -179,7 +180,7 @@ async def run_extraction(
     embed_result = await _detect_direct_video_embed(url, user_agent)
     if embed_result:
         embedded_src, embed_html = embed_result
-        dl_url = await _download_embed_video(embedded_src, referer=referer or url)
+        dl_url = await _download_embed_video(embedded_src, referer=browser_referer(referer or url, embedded_src))
         if dl_url:
             logger.info("Embedded fast-path succeeded — skipping Playwright and LLM.")
             embed_soup = BeautifulSoup(embed_html, "html.parser")

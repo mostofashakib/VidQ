@@ -29,7 +29,7 @@ from app.services.scraper.candidates import (
     has_trailer_cue,
     is_trailer_length,
 )
-from app.services.scraper.media import _DIRECT_VIDEO_EXTENSIONS, _is_ad_video_url, probe_remote_duration
+from app.services.scraper.media import _DIRECT_VIDEO_EXTENSIONS, _is_ad_video_url, browser_referer, probe_remote_duration
 from app.services.url_safety import is_safe_url
 
 logger = logging.getLogger("VideoScraper")
@@ -152,7 +152,7 @@ def _vet_album(album: Album, user_agent: str, probe: LengthProbe) -> Album | Non
 
     def length(url: str) -> float | None:
         if url not in lengths:
-            lengths[url] = probe(url, album.page_url, user_agent=user_agent)
+            lengths[url] = probe(url, browser_referer(album.page_url, url), user_agent=user_agent)
         return lengths[url]
 
     items = album.items

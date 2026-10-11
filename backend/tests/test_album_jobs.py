@@ -36,10 +36,11 @@ def direct_file_download(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_direct_file_is_downloaded_with_the_album_page_as_referer(direct_file_download):
+async def test_direct_file_is_downloaded_with_the_referer_a_browser_sends_from_the_album_page(direct_file_download):
     result = await pipeline.run_extraction("https://v.example/one.mp4", "UA", referer=PAGE)
 
-    assert direct_file_download == {"src": "https://v.example/one.mp4", "referer": PAGE}
+    # The file is on another origin, so a browser sends only the page's origin.
+    assert direct_file_download == {"src": "https://v.example/one.mp4", "referer": "https://albums.example/"}
     assert result[4] == "http://testserver/temp_storage/one.mp4"
 
 

@@ -140,7 +140,7 @@ def test_multi_video_album_without_declared_length_is_not_probed():
     assert len(album.items) == 2
 
 
-def test_single_video_must_be_reachable_with_the_page_as_referer():
+def test_single_video_must_be_reachable_with_the_referer_a_browser_sends():
     html = page(player("https://v.example/one.mp4"))
     probes = []
 
@@ -149,7 +149,7 @@ def test_single_video_must_be_reachable_with_the_page_as_referer():
         return 678.0
 
     assert fetch_album(PAGE, "UA", client=client_for(None, html), probe=reachable).items[0].title == "Beach Trip"
-    assert probes == [("https://v.example/one.mp4", PAGE, "UA")]
+    assert probes == [("https://v.example/one.mp4", "https://albums.example/", "UA")]
     assert fetch_album(PAGE, "UA", client=client_for(None, html), probe=lambda *a, **k: None) is None
 
 
