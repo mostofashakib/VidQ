@@ -51,6 +51,7 @@ from app.services.scraper.candidates import (
     VIDEO_ELEMENTS_JS,
     VideoElement,
     _parse_duration_seconds,
+    choose_candidates,
     extract_page_facts,
     is_acceptable_download,
     main_element,
@@ -451,31 +452,35 @@ async def run_extraction(
                 pass
 
             # ── Identify main video URL and try direct download ──
-            ranked, rejected = rank_candidates(list(video_urls), dom_elements, page_facts)
+            # The page's declared video is a candidate even when the player
+            # never requested it (an ad was playing, or playback never began).
+            ranked, rejected = rank_candidates(
+                list(video_urls) + list(page_facts.content_urls), dom_elements, page_facts
+            )
             for rejected_url, reason in rejected:
                 logger.info(f"Skipping ad ({reason}): {rejected_url[:80]}")
-            trusted = [c for c in ranked if c.trusted]
-            # Once the page identifies its video, unrelated URLs are never a
-            # substitute: if the real one is blocked, the agent pass records it.
-            ordered = trusted or ranked
-            logger.info(
-                f"Video URLs: {len(video_urls)} seen, {len(rejected)} ads, "
-                f"{len(trusted)} trusted; trying {len(ordered[:8])}"
-            )
 
             # Media often sits behind the same Cloudflare clearance as the page,
             # so probes and downloads reuse the browser session's cookies.
             session_cookies = _ffmpeg_cookies(await context.cookies())
-            to_try = ordered[:8]
-            # Trailers share the page's video id, so lengths are probed whenever
-            # there is something to compare: a declared length or rival files.
+            pool = ranked[:8]
+            # Lengths are probed whenever there is something to compare: a
+            # declared length (which also confirms the real file) or rival files.
             probed: dict[str, float | None] = {}
-            if declared_video_duration or len(to_try) > 1:
+            if declared_video_duration or len(pool) > 1:
                 lengths = await asyncio.gather(*(
                     asyncio.to_thread(probe_remote_duration, c.url, url, user_agent, session_cookies)
-                    for c in to_try
+                    for c in pool
                 ))
-                probed = dict(zip((c.url for c in to_try), lengths))
+                probed = dict(zip((c.url for c in pool), lengths))
+            # Once the page identifies its video, unrelated URLs are never a
+            # substitute: if the real one is blocked, the agent pass records it.
+            to_try = choose_candidates(pool, probed, declared_video_duration)
+            logger.info(
+                f"Video URLs: {len(video_urls)} seen, {len(page_facts.content_urls)} declared, "
+                f"{len(rejected)} ads; trying {len(to_try)}"
+                f"{' trusted' if to_try and to_try[0].trusted else ''}"
+            )
             vetting = vet_candidates(to_try, probed, declared_video_duration)
             for skipped_url, reason in vetting.skipped:
                 logger.info(f"Skipping trailer ({reason}): {skipped_url[:80]}")
@@ -492,9 +497,11 @@ async def run_extraction(
 
                 evidence = ", ".join(candidate.reasons) or "no page evidence"
                 logger.info(f"Trying candidate (score {candidate.score}: {evidence}): {cand_url[:100]}")
+                # The page's stated length beats the player's, which may be an ad.
+                expected_length = declared_video_duration or dom_video_duration
                 dl_url = await _download_video_direct(
                     cand_url, url, user_agent,
-                    total_duration_s=dom_video_duration,
+                    total_duration_s=expected_length,
                     progress_callback=progress_callback,
                     cookies=session_cookies,
                 )
@@ -505,7 +512,7 @@ async def run_extraction(
                 # Length guard: pre-rolls and sliders download fine but are short.
                 local_path = os.path.join(storage, dl_url.rstrip("/").split("/")[-1])
                 accepted, reason = is_acceptable_download(
-                    candidate.trusted, _probe_file_duration(local_path), dom_video_duration
+                    candidate.trusted, _probe_file_duration(local_path), expected_length
                 )
                 if not accepted:
                     logger.warning(f"Discarding download, likely an ad: {reason}")

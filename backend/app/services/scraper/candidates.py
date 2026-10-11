@@ -5,12 +5,15 @@ A page loads many videos: the player, pre-rolls, floating ad sliders, looping
 hover previews and trailers. The scraper sees all of them, so every URL is
 scored against evidence from the page itself:
 
-- JSON-LD VideoObject `contentUrl` names the real file.
+- The page's declared video names the real file: a schema.org VideoObject
+  `contentUrl` in JSON-LD or microdata, or an OpenGraph/Twitter video file.
 - The largest player outside any ad container is the main element.
 - The page's numeric video ID (/video/90563/...) reappears in its media paths.
 - Ad containers, looping muted previews and preview/trailer paths count against.
 
-A candidate is trusted when at least one positive signal backs it. Untrusted
+A candidate is trusted when at least one positive signal backs it. A file
+whose length matches the page's declared length is trusted too, which keeps
+a pre-roll playing in the main player from hiding the real stream. Untrusted
 URLs are only worth trying when nothing on the page is trusted.
 
 Trailers are the same content as the real video, only shorter, so ad rules
@@ -28,7 +31,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from app.services.scraper.media import _is_ad_video_url
+from app.services.scraper.media import _DIRECT_VIDEO_EXTENSIONS, _is_ad_video_url
 
 # Class/id words that mark ad containers (matched as whole words).
 _AD_MARKERS = frozenset({
@@ -47,6 +50,10 @@ _WORD_RE = re.compile(r"[a-z0-9]+")
 _AD_MAX_SECONDS = 60
 # A download shorter than this share of the expected length is not the video.
 _MIN_EXPECTED_SHARE = 0.5
+# A file within this share of the declared length is the declared video.
+_LENGTH_MATCH_SHARE = 0.1
+_MEDIA_PATH_SUFFIXES = tuple(_DIRECT_VIDEO_EXTENSIONS | {".mpd"})
+_OPEN_GRAPH_VIDEO_PROPS = ("og:video:secure_url", "og:video:url", "og:video")
 
 _SCORE_CONTENT_URL = 100
 _SCORE_MAIN_ELEMENT = 60
@@ -152,12 +159,13 @@ def _parse_duration_seconds(raw_value) -> float | None:
             return parts[0] * 60 + parts[1]
         return parts[0] * 3600 + parts[1] * 60 + parts[2]
     iso_match = re.fullmatch(
-        r"P(?:T)?(?:(?P<hours>\d+(?:\.\d+)?)H)?(?:(?P<minutes>\d+(?:\.\d+)?)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?",
+        r"P(?:(?P<days>\d+)D)?(?:T)?(?:(?P<hours>\d+(?:\.\d+)?)H)?(?:(?P<minutes>\d+(?:\.\d+)?)M)?(?:(?P<seconds>\d+(?:\.\d+)?)S)?",
         raw.upper(),
     )
     if iso_match:
         duration = (
-            float(iso_match.group("hours") or 0) * 3600
+            float(iso_match.group("days") or 0) * 86400
+            + float(iso_match.group("hours") or 0) * 3600
             + float(iso_match.group("minutes") or 0) * 60
             + float(iso_match.group("seconds") or 0)
         )
@@ -220,12 +228,54 @@ def _page_video_id(page_url: str) -> str | None:
     return None
 
 
+def _is_video_object(tag) -> bool:
+    return "videoobject" in (tag.get("itemtype") or "").lower()
+
+
+def _microdata_content_urls(soup: BeautifulSoup) -> list[str]:
+    """`contentUrl` of every microdata VideoObject, ignoring nested items' properties."""
+    urls = []
+    for item in soup.find_all(attrs={"itemscope": True}):
+        if not _is_video_object(item):
+            continue
+        for prop in item.find_all(attrs={"itemprop": "contentUrl"}):
+            if prop.find_parent(attrs={"itemscope": True}) is not item:
+                continue
+            urls.append(prop.get("content") or prop.get("href") or prop.get("src") or "")
+    return urls
+
+
+def _is_media_file(url: str, declared_type: str = "") -> bool:
+    declared_type = declared_type.lower()
+    return (
+        declared_type.startswith("video/") or "mpegurl" in declared_type
+        or urlparse(url).path.lower().endswith(_MEDIA_PATH_SUFFIXES)
+    )
+
+
+def _social_video_urls(soup: BeautifulSoup) -> list[str]:
+    """OpenGraph and Twitter video tags that point at a media file, not an embed page."""
+    def meta(key: str) -> str:
+        tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
+        return (tag.get("content") or "").strip() if tag else ""
+
+    declared_type = meta("og:video:type")
+    if declared_type and not _is_media_file("", declared_type):
+        open_graph = []
+    else:
+        open_graph = [u for u in (meta(p) for p in _OPEN_GRAPH_VIDEO_PROPS) if u and _is_media_file(u, declared_type)]
+    stream = meta("twitter:player:stream")
+    return open_graph[:1] + ([stream] if stream else [])
+
+
 def extract_page_facts(soup: BeautifulSoup | None, page_url: str) -> PageVideoFacts:
     objects = _json_ld_video_objects(soup) if soup else []
-    content_urls = tuple(
-        obj["contentUrl"] for obj in objects
-        if isinstance(obj.get("contentUrl"), str) and obj["contentUrl"].startswith("http")
-    )
+    declared = [obj.get("contentUrl") for obj in objects]
+    if soup:
+        declared += _microdata_content_urls(soup) + _social_video_urls(soup)
+    content_urls = tuple(dict.fromkeys(
+        url.strip() for url in declared if isinstance(url, str) and url.strip().startswith("http")
+    ))
     duration = next(
         (d for d in (_parse_duration_seconds(obj.get("duration")) for obj in objects) if d),
         None,
@@ -297,7 +347,7 @@ def rank_candidates(
         score, reasons = 0, []
         if any(_same_file(url, content) for content in facts.content_urls):
             score += _SCORE_CONTENT_URL
-            reasons.append("matches JSON-LD contentUrl")
+            reasons.append("matches the page's declared video")
         if url == main_src:
             score += _SCORE_MAIN_ELEMENT
             reasons.append("main player element")
@@ -329,6 +379,31 @@ def rank_candidates(
 def is_trailer_length(length_s: float | None, declared_s: float | None) -> bool:
     """True when a file is well below the length the page declares."""
     return bool(declared_s) and length_s is not None and length_s < declared_s * _MIN_EXPECTED_SHARE
+
+
+def _matches_declared_length(length_s: float | None, declared_s: float | None) -> bool:
+    return bool(declared_s) and length_s is not None and abs(length_s - declared_s) <= declared_s * _LENGTH_MATCH_SHARE
+
+
+def choose_candidates(
+    ranked: list[Candidate],
+    probed: dict[str, float | None],
+    declared_s: float | None,
+) -> list[Candidate]:
+    """
+    The candidates worth trying, best first. A file whose probed length
+    matches the page's declared length becomes trusted. Trusted candidates
+    are tried alone when there are any, otherwise every candidate is.
+    """
+    confirmed = [
+        Candidate(
+            url=c.url, score=c.score, trusted=True,
+            reasons=c.reasons + (f"length matches the page's ~{declared_s:.0f}s",),
+            trailer_suspected=c.trailer_suspected,
+        ) if not c.trusted and _matches_declared_length(probed.get(c.url), declared_s) else c
+        for c in ranked
+    ]
+    return [c for c in confirmed if c.trusted] or confirmed
 
 
 def vet_candidates(

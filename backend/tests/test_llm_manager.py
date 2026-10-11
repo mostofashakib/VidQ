@@ -21,3 +21,19 @@ async def test_text_calls_turn_thinking_off_so_json_answers_are_not_starved():
     assert await provider.call_text("plan") == {"queries": ["a"]}
     assert sent["think"] is False
     assert sent["format"] == "json"
+
+
+
+@pytest.mark.asyncio
+async def test_vision_calls_turn_thinking_off_too():
+    provider = OllamaProvider(model_name="gemma4:26b", host="http://ollama.local")
+    sent = {}
+
+    async def fake_post(payload):
+        sent.update(payload)
+        return {"message": {"content": '{"play_selector": null}'}}
+
+    provider._post = fake_post
+
+    assert await provider.call_vision("find the player", "aGVsbG8=") == {"play_selector": None}
+    assert sent["think"] is False

@@ -157,6 +157,7 @@ class OllamaProvider(LLMProvider):
             ],
             "stream": False,
             "format": "json",
+            "think": False,  # same reason as call_text
             "options": {"temperature": 0},
         }
         logger.info(f"Ollama call_vision → model={self.model_name}")

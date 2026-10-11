@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 from app.services.scraper.candidates import (
     Candidate,
     PageVideoFacts,
+    choose_candidates,
     VideoElement,
     extract_page_facts,
     has_trailer_cue,
@@ -290,3 +291,89 @@ def test_vetting_prefers_the_longest_probed_file_and_keeps_unprobed_ones_last():
     result = vet_candidates([a, b, c], {a.url: 120.0, b.url: 845.0, c.url: None}, declared_s=None)
 
     assert [x.url for x in result.kept] == [b.url, a.url, c.url]
+
+
+
+# ── Declared videos and length evidence ───────────────────────────────────────
+
+MICRODATA = """
+<article itemscope itemtype="https://schema.org/VideoObject">
+  <span itemprop="author" itemscope itemtype="https://schema.org/Person">
+    <meta itemprop="contentUrl" content="https://people.example/avatar.mp4" />
+  </span>
+  <meta itemprop="duration" content="P0DT0H20M18S" />
+  <meta itemprop="contentUrl" content="https://media.example/videos/Some%20Title_converted.m3u8" />
+</article>
+<div itemscope itemtype="https://schema.org/ImageObject">
+  <meta itemprop="contentUrl" content="https://site.example/poster.png" />
+</div>
+"""
+
+
+def test_page_facts_read_microdata_video_objects_scoped_to_the_item():
+    facts = extract_page_facts(BeautifulSoup(MICRODATA, "html.parser"), "https://site.example/some-title/")
+
+    assert facts.content_urls == ("https://media.example/videos/Some%20Title_converted.m3u8",)
+    assert facts.duration == 1218.0
+
+
+@pytest.mark.parametrize("meta, expected", [
+    ('<meta property="og:video:secure_url" content="https://media.example/v/1080.mp4">',
+     ("https://media.example/v/1080.mp4",)),
+    ('<meta property="og:video" content="https://media.example/v/master.m3u8">',
+     ("https://media.example/v/master.m3u8",)),
+    ('<meta property="og:video:url" content="https://media.example/play?id=7">'
+     '<meta property="og:video:type" content="video/mp4">',
+     ("https://media.example/play?id=7",)),
+    ('<meta name="twitter:player:stream" content="https://media.example/v/7.mp4">',
+     ("https://media.example/v/7.mp4",)),
+    # An embed player page is not the media file itself.
+    ('<meta property="og:video" content="https://site.example/embed/7">'
+     '<meta property="og:video:type" content="text/html">', ()),
+])
+def test_page_facts_read_open_graph_and_twitter_video_files(meta, expected):
+    facts = extract_page_facts(BeautifulSoup(f"<head>{meta}</head>", "html.parser"), "https://site.example/p/")
+
+    assert facts.content_urls == expected
+
+
+def test_declared_urls_rank_as_trusted_page_evidence():
+    facts = PageVideoFacts(content_urls=("https://media.example/videos/a.m3u8",), duration=1218.0, video_id=None)
+
+    ranked, _ = rank_candidates(["https://media.example/videos/a.m3u8"], [], facts)
+
+    assert ranked[0].trusted is True
+    assert "matches the page's declared video" in ranked[0].reasons
+
+
+def test_a_file_matching_the_declared_length_is_trusted_over_a_wrongly_trusted_ad():
+    # A pre-roll plays in the main player, so its URL looks trusted; the real
+    # stream has no other evidence but its length matches the page.
+    ad = Candidate(url="https://ads.example/preroll.mp4", score=60, trusted=True, reasons=("main player element",))
+    real = Candidate(url="https://media.example/v.m3u8", score=0, trusted=False, reasons=())
+    other = Candidate(url="https://media.example/related.mp4", score=0, trusted=False, reasons=())
+    probed = {ad.url: 2.0, real.url: 1217.6, other.url: 300.0}
+
+    chosen = choose_candidates([ad, real, other], probed, declared_s=1218.0)
+    vetting = vet_candidates(chosen, probed, declared_s=1218.0)
+
+    assert [c.url for c in chosen] == [ad.url, real.url]
+    assert chosen[1].trusted and "length matches the page's ~1218s" in chosen[1].reasons
+    assert [c.url for c in vetting.kept] == [real.url]
+
+
+def test_without_a_declared_length_only_page_evidence_decides_trust():
+    trusted = Candidate(url="https://media.example/a.mp4", score=40, trusted=True, reasons=("x",))
+    loose = Candidate(url="https://media.example/b.mp4", score=0, trusted=False, reasons=())
+
+    assert choose_candidates([trusted, loose], {}, declared_s=None) == [trusted]
+    assert choose_candidates([loose], {}, declared_s=None) == [loose]
+
+
+@pytest.mark.parametrize("raw, seconds", [
+    ("P0DT0H20M18S", 1218.0), ("P1DT2H", 93600.0), ("PT14M5S", 845.0), ("PT1H", 3600.0),
+])
+def test_iso_8601_durations_with_a_day_part_are_read(raw, seconds):
+    from app.services.scraper.candidates import _parse_duration_seconds
+
+    assert _parse_duration_seconds(raw) == seconds
