@@ -60,6 +60,7 @@ from app.services.scraper.candidates import (
     vet_candidates,
 )
 from app.services.scraper.browser_adapter import launch_browser
+from app.services.scraper.player_config import find_player_streams
 from app.services.prompts import Prompts
 
 logger = logging.getLogger("VideoScraper")
@@ -67,6 +68,7 @@ logger = logging.getLogger("VideoScraper")
 _settings = get_settings()
 
 _RECORD_DURATION_PAD_SECONDS = 2
+_MAX_PLAYER_STREAMS = 4  # player-config streams tried before the browser
 
 
 async def _open_context(browser, **kwargs):
@@ -206,6 +208,28 @@ async def run_extraction(
         logger.info("yt-dlp page fast-path succeeded — skipping Playwright.")
         return "", "", [url], "", ytdlp_pre
     logger.debug("yt-dlp page fast-path: no result, proceeding to Playwright.")
+
+    # ── Player-config fast path (no browser) ──────────────────────────────────
+    # Video hosts write the stream into their player's script, often packed,
+    # and article pages embed those players in iframes.
+    player = await find_player_streams(url, user_agent)
+    for stream in player.streams[:_MAX_PLAYER_STREAMS]:
+        logger.info(f"Player config stream from {stream.player_page[:80]}: {stream.url[:100]}")
+        dl_url = await _download_embed_video(
+            stream.url, referer=browser_referer(stream.player_page, stream.url), user_agent=user_agent
+        )
+        if not dl_url:
+            continue
+        local_path = os.path.join(storage, dl_url.rstrip("/").split("/")[-1])
+        accepted, reason = is_acceptable_download(True, _probe_file_duration(local_path), player.declared_duration)
+        if accepted:
+            logger.info("Player-config fast path succeeded — skipping Playwright.")
+            return "", "", [stream.url], "", dl_url
+        logger.info(f"Discarding player config stream: {reason}")
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
 
     # Resolve persistent cookie storage path
     profile_dir = _settings.browser_profile_dir
