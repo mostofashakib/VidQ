@@ -11,6 +11,7 @@ from app.services.scraper.media import (
     _download_budget_s,
     _download_video_direct,
     _ffmpeg_cookies,
+    _get_main_playing_video_url,
     _is_ad_video_url,
     _is_forbidden,
     probe_remote_duration,
@@ -170,6 +171,26 @@ async def test_forbidden_check_rejects_blob_urls_without_a_request():
 
     assert await _is_forbidden("blob:https://example.com/abc", request, "") is True
     assert request.calls == []
+
+
+class FakeFrame:
+    def __init__(self, url, playing=None):
+        self.url = url
+        self.playing = playing
+
+    async def evaluate(self, js):
+        return self.playing
+
+
+@pytest.mark.asyncio
+async def test_main_playing_video_reports_the_frame_that_plays_it():
+    player = FakeFrame("https://player.example/embed/9", playing="https://player.example/get_file/9.mp4")
+    page = FakeFrame("https://watch.example/v/9")
+    page.frames = [page, FakeFrame("https://ads.example/frame"), player]
+
+    assert await _get_main_playing_video_url(page) == (
+        "https://player.example/get_file/9.mp4", "https://player.example/embed/9",
+    )
 
 
 def test_ffmpeg_cookies_keep_each_cookie_scoped_to_its_domain():

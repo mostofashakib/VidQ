@@ -87,9 +87,9 @@ def _ffmpeg_cookies(cookies: list[dict]) -> str:
     )
 
 
-async def _get_main_playing_video_url(page) -> str | None:
+async def _get_main_playing_video_url(page) -> tuple[str, str] | None:
     """
-    Return the HTTP URL currently loaded by the largest (main) video element,
+    Return (HTTP URL, frame URL) of the largest (main) video element,
     checking the main frame and all child iframes.
     Prefers currentSrc (what's actually playing) over the src attribute.
     """
@@ -109,7 +109,7 @@ async def _get_main_playing_video_url(page) -> str | None:
             result = await target.evaluate(_js)
             if result:
                 logger.info(f"Main video DOM currentSrc: {result[:100]}")
-                return result
+                return result, target.url
         except Exception:
             pass
     return None

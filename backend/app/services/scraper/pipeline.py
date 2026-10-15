@@ -65,6 +65,7 @@ from app.services.scraper.candidates import (
 )
 from app.services.scraper.browser_adapter import launch_browser
 from app.services.scraper.player_config import api_media_urls, find_player_streams, is_api_answer
+from app.services.scraper.media_sources import MediaSources
 from app.services.prompts import Prompts
 
 logger = logging.getLogger("VideoScraper")
@@ -75,6 +76,14 @@ _RECORD_DURATION_PAD_SECONDS = 2
 _MAX_PLAYER_STREAMS = 4  # player-config streams tried before the browser
 _MAX_CANDIDATES = 8  # media URLs probed per page
 _MAX_API_BODY_BYTES = 1_000_000  # player API answers are small; skip anything larger
+
+
+def _document_url(request) -> str | None:
+    """URL of the frame that made a request; None for requests without one (service workers)."""
+    try:
+        return request.frame.url
+    except Exception:
+        return None
 
 
 async def _vet_media_urls(
@@ -327,7 +336,8 @@ async def run_extraction(
             )
             page = await context.new_page()
 
-            video_urls: set[str] = set()
+            # Each media URL with the document that requested it, for its Referer.
+            seen_media = MediaSources(url)
 
             def handle_request(request):
                 r_url = request.url
@@ -344,7 +354,7 @@ async def run_extraction(
                         is_fragment = True
                     if not is_fragment:
                         logger.debug(f"Network intercept: {r_url}")
-                        video_urls.add(r_url)
+                        seen_media.add(r_url, _document_url(request))
 
             def handle_response(response):
                 # Catch video URLs by content-type — covers HLS manifests and direct
@@ -357,12 +367,12 @@ async def run_extraction(
                     if ct in ("application/x-mpegurl", "application/vnd.apple.mpegurl",
                               "application/dash+xml"):
                         logger.debug(f"Manifest (content-type={ct}): {r_url[:80]}")
-                        video_urls.add(r_url)
+                        seen_media.add(r_url, _document_url(response.request))
                     elif ct.startswith("video/"):
                         cl = int(response.headers.get("content-length") or 0)
                         if cl > 100_000:
                             logger.debug(f"Video response ({ct}, {cl // 1024}KB): {r_url[:80]}")
-                            video_urls.add(r_url)
+                            seen_media.add(r_url, _document_url(response.request))
                 except Exception:
                     pass
 
@@ -383,7 +393,7 @@ async def run_extraction(
                     return
                 for api_url in api_media_urls(response.request.resource_type, content_type, body, response.url):
                     logger.info(f"Player API named a stream: {api_url[:100]}")
-                    video_urls.add(api_url)
+                    seen_media.add(api_url, _document_url(response.request))
 
             page.on("request", handle_request)
             page.on("response", handle_response)
@@ -488,7 +498,7 @@ async def run_extraction(
                     logger.warning(f"LLM navigation mapper failed: {e}")
 
             if direct_video_url_llm:
-                video_urls.add(direct_video_url_llm)
+                seen_media.add(direct_video_url_llm)
 
             # ── Try to trigger playback (agentic if LLM available) ──
             if llm_manager:
@@ -498,7 +508,7 @@ async def run_extraction(
                     await _agentic_interact(page, llm_manager, max_attempts=5)
                 # Give the player time to request the video stream after clicking play.
                 # HLS/DASH manifests triggered by the click will appear in network_urls
-                # only if we wait for the XHR to complete before reading video_urls.
+                # only if we wait for the XHR to complete before reading seen_media.
                 await asyncio.sleep(3.0)
             else:
                 for sel in [play_selector, 'button[aria-label*="play" i]', '.vjs-big-play-button', 'video']:
@@ -511,7 +521,9 @@ async def run_extraction(
             main_dom_url: str | None = None
             try:
                 dom_elements = parse_video_elements(await page.evaluate(VIDEO_ELEMENTS_JS), url)
-                video_urls.update(el.src for el in dom_elements if el.src.startswith("http"))
+                for el in dom_elements:
+                    if el.src.startswith("http"):
+                        seen_media.add(el.src)
                 main = main_element(dom_elements)
                 if main:
                     if main.src.startswith("http"):
@@ -524,9 +536,10 @@ async def run_extraction(
                 logger.debug(f"DOM video query failed: {e}")
             # Also check iframes (some players embed inside iframes)
             if not main_dom_url:
-                main_dom_url = await _get_main_playing_video_url(page)
-                if main_dom_url:
-                    video_urls.add(main_dom_url)
+                playing = await _get_main_playing_video_url(page)
+                if playing:
+                    main_dom_url, player_document = playing
+                    seen_media.add(main_dom_url, player_document)
                     if main_element(dom_elements) is None:
                         # No player in the top frame, so the iframe's is the main one.
                         dom_elements.append(VideoElement(
@@ -555,12 +568,12 @@ async def run_extraction(
             # never requested it (an ad was playing, or playback never began).
             # If the real one is blocked, the agent pass records it.
             rejected, to_try, vetting = await _vet_media_urls(
-                list(video_urls) + list(page_facts.content_urls), dom_elements, page_facts,
+                seen_media.urls() + list(page_facts.content_urls), dom_elements, page_facts,
                 declared_video_duration,
-                lambda u: probe_remote_duration(u, url, user_agent, session_cookies),
+                lambda u: probe_remote_duration(u, seen_media.referer(u), user_agent, session_cookies),
             )
             logger.info(
-                f"Video URLs: {len(video_urls)} seen, {len(page_facts.content_urls)} declared, "
+                f"Video URLs: {len(seen_media)} seen, {len(page_facts.content_urls)} declared, "
                 f"{len(rejected)} ads; trying {len(to_try)}"
                 f"{' trusted' if to_try and to_try[0].trusted else ''}"
             )
@@ -571,7 +584,7 @@ async def run_extraction(
                 )
             for candidate in vetting.kept:
                 cand_url = candidate.url
-                if await _is_forbidden(cand_url, context.request, url):
+                if await _is_forbidden(cand_url, context.request, seen_media.referer(cand_url)):
                     logger.warning(f"Forbidden URL (skipped): {cand_url[:80]}")
                     continue
 
@@ -580,7 +593,7 @@ async def run_extraction(
                 # The page's stated length beats the player's, which may be an ad.
                 expected_length = declared_video_duration or dom_video_duration
                 dl_url = await _download_video_direct(
-                    cand_url, url, user_agent,
+                    cand_url, seen_media.referer(cand_url), user_agent,
                     total_duration_s=expected_length,
                     progress_callback=progress_callback,
                     cookies=session_cookies,
