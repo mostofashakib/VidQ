@@ -54,6 +54,9 @@ _MIN_EXPECTED_SHARE = 0.5
 _LENGTH_MATCH_SHARE = 0.1
 _MEDIA_PATH_SUFFIXES = tuple(_DIRECT_VIDEO_EXTENSIONS | {".mpd"})
 _OPEN_GRAPH_VIDEO_PROPS = ("og:video:secure_url", "og:video:url", "og:video")
+_ADAPTIVE_SUFFIXES = (".m3u8", ".mpd")
+_ADAPTIVE_QUALITY = 100_000  # an adaptive stream carries every rendition, so it beats any single file
+_RESOLUTION_RE = re.compile(r"(?<!\d)(\d{3,4})p(?![a-z])")
 
 _SCORE_CONTENT_URL = 100
 _SCORE_MAIN_ELEMENT = 60
@@ -406,22 +409,37 @@ def choose_candidates(
     return [c for c in confirmed if c.trusted] or confirmed
 
 
+def _quality(url: str) -> int:
+    """Rank renditions of one video: an adaptive stream first, then the resolution in its name."""
+    path = urlparse(url).path.lower()
+    if path.endswith(_ADAPTIVE_SUFFIXES):
+        return _ADAPTIVE_QUALITY
+    match = _RESOLUTION_RE.search(path)
+    return int(match.group(1)) if match else 0
+
+
 def vet_candidates(
     candidates: list[Candidate],
     probed: dict[str, float | None],
     declared_s: float | None,
 ) -> Vetting:
     """
-    Skip trailers before downloading. `probed` maps URLs to their remote
-    length (None when the probe failed); `declared_s` is the page's stated
-    length. Kept candidates are ordered longest probed first, unprobed last.
+    Skip trailers, previews and ads before downloading. `probed` maps URLs to
+    their remote length (None when the probe failed); `declared_s` is the
+    page's stated length. Without one, the longest probed file is the
+    reference: previews and pre-rolls sit next to the real file and are far
+    shorter. Kept candidates come longest first (renditions of the same
+    length best quality first), unprobed last.
     """
+    longest = max((probed[c.url] for c in candidates if probed.get(c.url)), default=None)
     kept: list[Candidate] = []
     skipped: list[tuple[str, str]] = []
     for c in candidates:
         length = probed.get(c.url)
         if is_trailer_length(length, declared_s):
             skipped.append((c.url, f"{length:.0f}s file but the page declares ~{declared_s:.0f}s"))
+        elif not declared_s and is_trailer_length(length, longest):
+            skipped.append((c.url, f"{length:.0f}s file next to a {longest:.0f}s one"))
         else:
             kept.append(c)
 
@@ -429,7 +447,14 @@ def vet_candidates(
         skipped.extend((c.url, "named like a trailer") for c in kept if c.trailer_suspected)
         kept = [c for c in kept if not c.trailer_suspected]
 
-    kept.sort(key=lambda c: -(probed.get(c.url) or -1))
+    def order(c: Candidate) -> tuple:
+        length = probed.get(c.url)
+        if length is None:
+            return (2, 0, 0.0)
+        near_longest = longest is not None and length >= longest * (1 - _LENGTH_MATCH_SHARE)
+        return (0 if near_longest else 1, -_quality(c.url), -length)
+
+    kept.sort(key=order)
     return Vetting(kept=kept, skipped=skipped, only_trailers=bool(candidates) and not kept)
 
 

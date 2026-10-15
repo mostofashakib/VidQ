@@ -288,7 +288,7 @@ def test_named_trailers_are_dropped_only_when_another_candidate_remains():
 def test_vetting_prefers_the_longest_probed_file_and_keeps_unprobed_ones_last():
     a, b, c = cand("https://v.example/a.mp4", score=90), cand("https://v.example/b.mp4"), cand("https://v.example/c.mp4")
 
-    result = vet_candidates([a, b, c], {a.url: 120.0, b.url: 845.0, c.url: None}, declared_s=None)
+    result = vet_candidates([a, b, c], {a.url: 600.0, b.url: 845.0, c.url: None}, declared_s=None)
 
     assert [x.url for x in result.kept] == [b.url, a.url, c.url]
 
@@ -377,3 +377,32 @@ def test_iso_8601_durations_with_a_day_part_are_read(raw, seconds):
     from app.services.scraper.candidates import _parse_duration_seconds
 
     assert _parse_duration_seconds(raw) == seconds
+
+
+# ── Vetting without a declared length ────────────────────────────────────────
+
+def untrusted(url):
+    return Candidate(url=url, score=0, trusted=False, reasons=())
+
+
+def test_without_a_declared_length_files_far_shorter_than_the_longest_are_skipped():
+    # A hover preview or pre-roll sits next to the real file and is far shorter.
+    teaser, full = untrusted("https://cdn.example/0/teaser_a.mp4"), untrusted("https://cdn.example/0/main_a.mp4")
+
+    result = vet_candidates([teaser, full], {teaser.url: 5.0, full.url: 612.0}, declared_s=None)
+
+    assert [c.url for c in result.kept] == [full.url]
+    assert result.skipped == [(teaser.url, "5s file next to a 612s one")]
+    assert result.only_trailers is False
+
+
+def test_equal_length_files_prefer_an_adaptive_stream_then_the_highest_resolution():
+    low, mid, hls = (untrusted("https://cdn.example/v/video_240p.mp4"), untrusted("https://cdn.example/v/video_360p.mp4"),
+                     untrusted("https://cdn.example/v/hls.m3u8"))
+    hd = untrusted("https://cdn.example/v/video_1080p.mp4")
+
+    with_hls = vet_candidates([low, mid, hls], {low.url: 612.0, mid.url: 612.4, hls.url: 611.9}, declared_s=None)
+    files_only = vet_candidates([low, hd, mid], {low.url: 612.0, hd.url: 611.8, mid.url: 612.4}, declared_s=None)
+
+    assert [c.url for c in with_hls.kept] == [hls.url, mid.url, low.url]
+    assert [c.url for c in files_only.kept] == [hd.url, mid.url, low.url]

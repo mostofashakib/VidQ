@@ -29,7 +29,7 @@ import httpx
 from bs4 import BeautifulSoup
 from yt_dlp.utils import decode_packed_codes
 
-from app.services.scraper.candidates import extract_page_facts
+from app.services.scraper.candidates import PageVideoFacts, extract_page_facts
 from app.services.scraper.media import _is_ad_video_url, browser_referer
 from app.services.url_safety import is_safe_url
 
@@ -54,7 +54,11 @@ class PlayerStream:
 @dataclass(frozen=True)
 class PlayerPage:
     streams: list[PlayerStream]
-    declared_duration: float | None  # the length the page states, to catch trailers and ads
+    facts: PageVideoFacts  # what the page states about its video, to vet the streams
+
+    @classmethod
+    def empty(cls) -> "PlayerPage":
+        return cls(streams=[], facts=PageVideoFacts(content_urls=(), duration=None, video_id=None))
 
 
 def _scripts(html: str) -> list[str]:
@@ -141,9 +145,9 @@ async def find_player_streams(
     try:
         page = await _get_html(client, page_url, {"User-Agent": user_agent})
         if page is None:
-            return PlayerPage(streams=[], declared_duration=None)
+            return PlayerPage.empty()
         final_url, html = page
-        declared = extract_page_facts(BeautifulSoup(html, "html.parser"), final_url).duration
+        facts = extract_page_facts(BeautifulSoup(html, "html.parser"), final_url)
         streams = [PlayerStream(url=u, player_page=final_url) for u in player_sources(html, final_url)]
         if not streams:
             for frame_url in player_frames(html, final_url)[:_MAX_FRAMES]:
@@ -153,10 +157,10 @@ async def find_player_streams(
                     frame_final, frame_html = frame
                     streams += [PlayerStream(url=u, player_page=frame_final)
                                 for u in player_sources(frame_html, frame_final)]
-        return PlayerPage(streams=streams, declared_duration=declared)
+        return PlayerPage(streams=streams, facts=facts)
     except httpx.HTTPError as exc:
         logger.info(f"Player config fetch failed for {page_url[:100]}: {exc}")
-        return PlayerPage(streams=[], declared_duration=None)
+        return PlayerPage.empty()
     finally:
         if owns_client:
             await client.aclose()

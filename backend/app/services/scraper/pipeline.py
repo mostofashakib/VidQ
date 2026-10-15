@@ -7,6 +7,7 @@ import random
 import re
 import threading
 import uuid
+from collections.abc import Callable
 from urllib.parse import urlparse
 
 from bs4 import BeautifulSoup
@@ -49,7 +50,10 @@ from app.services.scraper.playback import (
 from app.services.scraper.computer_use import ComputerUse
 from app.services.scraper.candidates import (
     VIDEO_ELEMENTS_JS,
+    Candidate,
+    PageVideoFacts,
     VideoElement,
+    Vetting,
     _parse_duration_seconds,
     choose_candidates,
     extract_page_facts,
@@ -69,7 +73,39 @@ _settings = get_settings()
 
 _RECORD_DURATION_PAD_SECONDS = 2
 _MAX_PLAYER_STREAMS = 4  # player-config streams tried before the browser
+_MAX_CANDIDATES = 8  # media URLs probed per page
 _MAX_API_BODY_BYTES = 1_000_000  # player API answers are small; skip anything larger
+
+
+async def _vet_media_urls(
+    urls: list[str],
+    elements: list[VideoElement],
+    facts: PageVideoFacts,
+    declared_s: float | None,
+    probe: Callable[[str], float | None],
+) -> tuple[list[tuple[str, str]], list[Candidate], Vetting]:
+    """
+    The ad, preview and trailer checks every stage applies to the media URLs
+    it finds: rank them by page evidence (rejecting ads), probe their lengths
+    with `probe`, let a length matching the page confirm trust, then vet.
+    Returns (rejected ads, candidates considered, vetting).
+    """
+    ranked, rejected = rank_candidates(urls, elements, facts)
+    for rejected_url, reason in rejected:
+        logger.info(f"Skipping ad ({reason}): {rejected_url[:80]}")
+    pool = ranked[:_MAX_CANDIDATES]
+    # Lengths are probed whenever there is something to compare: a declared
+    # length (which also confirms the real file) or rival files.
+    probed: dict[str, float | None] = {}
+    if declared_s or len(pool) > 1:
+        lengths = await asyncio.gather(*(asyncio.to_thread(probe, c.url) for c in pool))
+        probed = dict(zip((c.url for c in pool), lengths))
+    # Once the page identifies its video, unrelated URLs are never a substitute.
+    to_try = choose_candidates(pool, probed, declared_s)
+    vetting = vet_candidates(to_try, probed, declared_s)
+    for skipped_url, reason in vetting.skipped:
+        logger.info(f"Skipping trailer or preview ({reason}): {skipped_url[:80]}")
+    return rejected, to_try, vetting
 
 
 async def _open_context(browser, **kwargs):
@@ -213,24 +249,38 @@ async def run_extraction(
     # ── Player-config fast path (no browser) ──────────────────────────────────
     # Video hosts write the stream into their player's script, often packed,
     # and article pages embed those players in iframes.
+    # Players list previews and ads next to the video, so their streams go
+    # through the same checks as everything the browser finds.
     player = await find_player_streams(url, user_agent)
-    for stream in player.streams[:_MAX_PLAYER_STREAMS]:
-        logger.info(f"Player config stream from {stream.player_page[:80]}: {stream.url[:100]}")
-        dl_url = await _download_embed_video(
-            stream.url, referer=browser_referer(stream.player_page, stream.url), user_agent=user_agent
+    player_pages = {s.url: s.player_page for s in player.streams}
+
+    def player_referer(media_url: str) -> str:
+        return browser_referer(player_pages[media_url], media_url)
+
+    if player_pages:
+        _, _, vetting = await _vet_media_urls(
+            list(player_pages), [], player.facts, player.facts.duration,
+            lambda u: probe_remote_duration(u, player_referer(u), user_agent),
         )
-        if not dl_url:
-            continue
-        local_path = os.path.join(storage, dl_url.rstrip("/").split("/")[-1])
-        accepted, reason = is_acceptable_download(True, _probe_file_duration(local_path), player.declared_duration)
-        if accepted:
-            logger.info("Player-config fast path succeeded — skipping Playwright.")
-            return "", "", [stream.url], "", dl_url
-        logger.info(f"Discarding player config stream: {reason}")
-        try:
-            os.remove(local_path)
-        except OSError:
-            pass
+        for candidate in vetting.kept[:_MAX_PLAYER_STREAMS]:
+            logger.info(f"Player config stream from {player_pages[candidate.url][:80]}: {candidate.url[:100]}")
+            dl_url = await _download_embed_video(
+                candidate.url, referer=player_referer(candidate.url), user_agent=user_agent
+            )
+            if not dl_url:
+                continue
+            local_path = os.path.join(storage, dl_url.rstrip("/").split("/")[-1])
+            accepted, reason = is_acceptable_download(
+                candidate.trusted, _probe_file_duration(local_path), player.facts.duration
+            )
+            if accepted:
+                logger.info("Player-config fast path succeeded — skipping Playwright.")
+                return "", "", [candidate.url], "", dl_url
+            logger.info(f"Discarding player config stream: {reason}")
+            try:
+                os.remove(local_path)
+            except OSError:
+                pass
 
     # Resolve persistent cookie storage path
     profile_dir = _settings.browser_profile_dir
@@ -498,38 +548,22 @@ async def run_extraction(
                 pass
 
             # ── Identify main video URL and try direct download ──
-            # The page's declared video is a candidate even when the player
-            # never requested it (an ad was playing, or playback never began).
-            ranked, rejected = rank_candidates(
-                list(video_urls) + list(page_facts.content_urls), dom_elements, page_facts
-            )
-            for rejected_url, reason in rejected:
-                logger.info(f"Skipping ad ({reason}): {rejected_url[:80]}")
-
             # Media often sits behind the same Cloudflare clearance as the page,
             # so probes and downloads reuse the browser session's cookies.
             session_cookies = _ffmpeg_cookies(await context.cookies())
-            pool = ranked[:8]
-            # Lengths are probed whenever there is something to compare: a
-            # declared length (which also confirms the real file) or rival files.
-            probed: dict[str, float | None] = {}
-            if declared_video_duration or len(pool) > 1:
-                lengths = await asyncio.gather(*(
-                    asyncio.to_thread(probe_remote_duration, c.url, url, user_agent, session_cookies)
-                    for c in pool
-                ))
-                probed = dict(zip((c.url for c in pool), lengths))
-            # Once the page identifies its video, unrelated URLs are never a
-            # substitute: if the real one is blocked, the agent pass records it.
-            to_try = choose_candidates(pool, probed, declared_video_duration)
+            # The page's declared video is a candidate even when the player
+            # never requested it (an ad was playing, or playback never began).
+            # If the real one is blocked, the agent pass records it.
+            rejected, to_try, vetting = await _vet_media_urls(
+                list(video_urls) + list(page_facts.content_urls), dom_elements, page_facts,
+                declared_video_duration,
+                lambda u: probe_remote_duration(u, url, user_agent, session_cookies),
+            )
             logger.info(
                 f"Video URLs: {len(video_urls)} seen, {len(page_facts.content_urls)} declared, "
                 f"{len(rejected)} ads; trying {len(to_try)}"
                 f"{' trusted' if to_try and to_try[0].trusted else ''}"
             )
-            vetting = vet_candidates(to_try, probed, declared_video_duration)
-            for skipped_url, reason in vetting.skipped:
-                logger.info(f"Skipping trailer ({reason}): {skipped_url[:80]}")
             if vetting.only_trailers:
                 raise RuntimeError(
                     "Only a trailer is available on this page: every video file is far "

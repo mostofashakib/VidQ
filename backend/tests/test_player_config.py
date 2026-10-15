@@ -81,7 +81,7 @@ async def test_find_player_streams_reads_the_page_first():
         found = await find_player_streams(PAGE, "UA", client=client)
 
     assert [(s.url, s.player_page) for s in found.streams] == [("https://cdn.example/hls/abc/master.m3u8?t=x", PAGE)]
-    assert found.declared_duration == 1086.0
+    assert found.facts.duration == 1086.0
     assert len(seen) == 1
 
 
@@ -113,6 +113,7 @@ async def test_find_player_streams_never_follow_redirects_into_private_networks(
 import os  # noqa: E402
 
 from app.services.scraper import pipeline  # noqa: E402
+from app.services.scraper.candidates import PageVideoFacts  # noqa: E402
 from app.services.scraper.player_config import PlayerPage, PlayerStream  # noqa: E402
 
 TRAILER = PlayerStream(url="https://cdn.example/hls/trailer.m3u8", player_page="https://player.example/e/abc123")
@@ -121,7 +122,8 @@ FULL = PlayerStream(url="https://cdn.example/hls/full.m3u8", player_page="https:
 
 @pytest.fixture
 def player_stage(monkeypatch):
-    downloads, lengths = [], {}
+    # `lengths` maps a stream URL to its length, both before (probe) and after download.
+    downloads, lengths, probes = [], {}, []
 
     async def nothing(*args, **kwargs):
         return None
@@ -136,14 +138,23 @@ def player_stage(monkeypatch):
     monkeypatch.setattr(pipeline, "_detect_direct_video_embed", nothing)
     monkeypatch.setattr(pipeline, "_try_ytdlp_on_page", nothing)
     monkeypatch.setattr(pipeline, "_download_embed_video", download)
-    monkeypatch.setattr(pipeline, "_probe_file_duration", lambda path: lengths[path.rsplit("/", 1)[-1]])
+    downloaded_from = {}
 
-    def use(streams, declared, file_lengths):
+    def probe(url, referer, user_agent="", cookies=""):
+        probes.append((url, referer, user_agent))
+        return lengths[url]
+
+    monkeypatch.setattr(pipeline, "probe_remote_duration", probe)
+    monkeypatch.setattr(pipeline, "_probe_file_duration",
+                        lambda path: lengths[downloaded_from[path.rsplit("/", 1)[-1]]])
+
+    def use(streams, declared, stream_lengths):
         async def find(url, user_agent):
-            return PlayerPage(streams=streams, declared_duration=declared)
+            return PlayerPage(streams=streams, facts=PageVideoFacts(content_urls=(), duration=declared, video_id=None))
 
         monkeypatch.setattr(pipeline, "find_player_streams", find)
-        lengths.update(file_lengths)
+        lengths.update(stream_lengths)
+        downloaded_from.update({f"{u.rsplit('/', 1)[-1]}.mp4": u for u in stream_lengths})
         return downloads
 
     return use
@@ -151,7 +162,7 @@ def player_stage(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_player_config_streams_download_without_a_browser(player_stage):
-    downloads = player_stage([FULL], 1086.0, {"full.m3u8.mp4": 1085.0})
+    downloads = player_stage([FULL], 1086.0, {FULL.url: 1085.0})
 
     result = await pipeline.run_extraction(PAGE, "UA")
 
@@ -161,12 +172,28 @@ async def test_player_config_streams_download_without_a_browser(player_stage):
 
 
 @pytest.mark.asyncio
-async def test_player_config_streams_far_shorter_than_the_page_are_skipped(player_stage):
-    player_stage([TRAILER, FULL], 1086.0, {"trailer.m3u8.mp4": 60.0, "full.m3u8.mp4": 1085.0})
+async def test_player_config_streams_far_shorter_than_the_page_are_never_downloaded(player_stage):
+    downloads = player_stage([TRAILER, FULL], 1086.0, {TRAILER.url: 60.0, FULL.url: 1085.0})
 
     result = await pipeline.run_extraction(PAGE, "UA")
 
     assert result[4] == "http://testserver/temp_storage/full.m3u8.mp4"
+    assert [src for src, _, _ in downloads] == [FULL.url]
+
+
+@pytest.mark.asyncio
+async def test_a_hover_preview_is_skipped_and_the_best_rendition_wins_without_a_stated_length(player_stage):
+    # An embedded player lists its hover preview first, then 240p, 360p and HLS.
+    page = "https://player.example/embedframe/abc"
+    preview, low, mid, hls = (PlayerStream(url=f"https://cdn.example/0/{name}", player_page=page)
+                              for name in ("preview.mp4", "video_240p.mp4", "video_360p.mp4", "hls.m3u8"))
+    downloads = player_stage([preview, low, mid, hls], None,
+                             {preview.url: 5.0, low.url: 612.0, mid.url: 612.4, hls.url: 611.9})
+
+    result = await pipeline.run_extraction(PAGE, "UA")
+
+    assert result[2] == [hls.url]
+    assert [src for src, _, _ in downloads] == [hls.url]
 
 
 
