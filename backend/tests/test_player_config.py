@@ -3,7 +3,12 @@
 import httpx
 import pytest
 
-from app.services.scraper.player_config import find_player_streams, player_frames, player_sources
+from app.services.scraper.player_config import (
+    api_media_urls,
+    find_player_streams,
+    player_frames,
+    player_sources,
+)
 
 PAGE = "https://watch.example/v/abc123"
 
@@ -162,3 +167,29 @@ async def test_player_config_streams_far_shorter_than_the_page_are_skipped(playe
     result = await pipeline.run_extraction(PAGE, "UA")
 
     assert result[4] == "http://testserver/temp_storage/full.m3u8.mp4"
+
+
+
+# ── Player API responses ──────────────────────────────────────────────────────
+
+API = "https://player.example/api/stream"
+
+
+def test_api_responses_that_name_a_stream_are_read():
+    body = ('{"filecode": "abc", "streaming_url": "https:\\/\\/cdn.example\\/hls2\\/abc\\/master.m3u8",'
+            ' "thumbnail": "https://cdn.example/t.jpg", "subtitles": "None"}')
+
+    assert api_media_urls("fetch", "application/json", body, API) == ["https://cdn.example/hls2/abc/master.m3u8"]
+    assert api_media_urls("xhr", "text/plain", body, API) == ["https://cdn.example/hls2/abc/master.m3u8"]
+
+
+@pytest.mark.parametrize("resource_type, content_type", [
+    ("script", "application/javascript"),  # libraries, not answers
+    ("document", "text/html"),
+    ("fetch", "image/jpeg"),
+    ("media", "video/mp4"),
+])
+def test_only_api_answers_are_read(resource_type, content_type):
+    body = '{"file": "https://cdn.example/v.m3u8"}'
+
+    assert api_media_urls(resource_type, content_type, body, API) == []

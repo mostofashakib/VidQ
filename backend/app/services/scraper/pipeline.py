@@ -60,7 +60,7 @@ from app.services.scraper.candidates import (
     vet_candidates,
 )
 from app.services.scraper.browser_adapter import launch_browser
-from app.services.scraper.player_config import find_player_streams
+from app.services.scraper.player_config import api_media_urls, find_player_streams, is_api_answer
 from app.services.prompts import Prompts
 
 logger = logging.getLogger("VideoScraper")
@@ -69,6 +69,7 @@ _settings = get_settings()
 
 _RECORD_DURATION_PAD_SECONDS = 2
 _MAX_PLAYER_STREAMS = 4  # player-config streams tried before the browser
+_MAX_API_BODY_BYTES = 1_000_000  # player API answers are small; skip anything larger
 
 
 async def _open_context(browser, **kwargs):
@@ -315,8 +316,28 @@ async def run_extraction(
                 except Exception:
                     pass
 
+            async def handle_api_response(response):
+                # Players that fetch their source from an API name the stream in
+                # the answer, whether or not playback ever starts.
+                try:
+                    content_type = (response.headers.get("content-type") or "").split(";")[0].strip()
+                    if not is_api_answer(response.request.resource_type, content_type):
+                        return
+                    if int(response.headers.get("content-length") or 0) > _MAX_API_BODY_BYTES:
+                        return
+                    body = await response.text()
+                except Exception as exc:
+                    logger.debug(f"API response unreadable: {exc}")
+                    return
+                if len(body) > _MAX_API_BODY_BYTES:
+                    return
+                for api_url in api_media_urls(response.request.resource_type, content_type, body, response.url):
+                    logger.info(f"Player API named a stream: {api_url[:100]}")
+                    video_urls.add(api_url)
+
             page.on("request", handle_request)
             page.on("response", handle_response)
+            page.on("response", handle_api_response)
 
             logger.debug("Navigating (Fast Pass)…")
             await _safe_goto(page, url)
@@ -352,6 +373,7 @@ async def run_extraction(
                 )
                 page.on("request", handle_request)
                 page.on("response", handle_response)
+                page.on("response", handle_api_response)
                 await asyncio.sleep(random.uniform(1.5, 2.5))
 
                 # 3. Run click-based bypass steps (auto-wait → DOM click → LLM → heuristics)

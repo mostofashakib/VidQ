@@ -8,8 +8,14 @@ decoder unpacks. Article pages often hold no player of their own but embed a
 host's player page in an iframe, so when the page has no sources its iframes
 are read the same way, with the Referer a browser would send.
 
-Every quoted URL in a script whose path ends in a media extension counts as a
-source. Known ad URLs are dropped; the caller checks lengths against the page.
+Other players fetch their source from an API when the page loads and only
+request the stream once playback starts. The browser stage reads those small
+fetch/XHR answers with `api_media_urls`, so the stream is known even when
+playback never starts.
+
+Every quoted URL in a script or API answer whose path ends in a media
+extension counts as a source. Known ad URLs are dropped; the caller checks
+lengths against the page.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ _MEDIA_SUFFIXES = (".m3u8", ".mp4", ".mpd", ".webm")
 _QUOTED_RE = re.compile(r"""["']([^"'\s<>]+)["']""")
 _PACKED_MARKER = "p,a,c,k,e,"
 _MAX_FRAMES = 3
+_API_RESOURCE_TYPES = frozenset({"fetch", "xhr"})
+_API_CONTENT_TYPES = ("application/json", "text/plain", "text/json")
 _MAX_REDIRECTS = 5
 _FETCH_TIMEOUT_S = 15
 
@@ -67,15 +75,33 @@ def _is_media_path(url: str) -> bool:
     return urlparse(url).path.lower().endswith(_MEDIA_SUFFIXES)
 
 
+def _media_urls_in_text(text: str, base_url: str) -> list[str]:
+    """Quoted media URLs in script or JSON text, absolute, without ads or repeats."""
+    found: dict[str, None] = {}
+    for raw in _QUOTED_RE.findall(text.replace("\\/", "/")):
+        url = urljoin(base_url, raw)
+        if url.startswith("http") and _is_media_path(url) and not _is_ad_video_url(url):
+            found.setdefault(url)
+    return list(found)
+
+
 def player_sources(html: str, page_url: str) -> list[str]:
     """Media URLs named in the page's scripts, absolute, in page order."""
     found: dict[str, None] = {}
     for body in _scripts(html):
-        for raw in _QUOTED_RE.findall(body.replace("\\/", "/")):
-            url = urljoin(page_url, raw)
-            if url.startswith("http") and _is_media_path(url) and not _is_ad_video_url(url):
-                found.setdefault(url)
+        for url in _media_urls_in_text(body, page_url):
+            found.setdefault(url)
     return list(found)
+
+
+def is_api_answer(resource_type: str, content_type: str) -> bool:
+    """A fetch/XHR response with JSON or text: what a player's source API returns."""
+    return resource_type in _API_RESOURCE_TYPES and content_type.lower().startswith(_API_CONTENT_TYPES)
+
+
+def api_media_urls(resource_type: str, content_type: str, body: str, url: str) -> list[str]:
+    """Media URLs in a player's API answer, or [] for any other response."""
+    return _media_urls_in_text(body, url) if is_api_answer(resource_type, content_type) else []
 
 
 def player_frames(html: str, page_url: str) -> list[str]:
