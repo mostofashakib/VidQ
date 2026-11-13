@@ -105,18 +105,19 @@ def test_queue_falls_back_when_llm_metadata_fails(monkeypatch, db_session):
 
     async def fake_run_extraction(**kwargs):
         return (
-            "<html><title>Ignored</title></html>",
+            "<html><body><p>A page that states no title</p></body></html>",
             "screenshot",
             [],
             "thumb.jpg",
             "http://testserver/temp_storage/recorded.mp4",
         )
 
-    async def fake_llm_metadata(*args, **kwargs):
-        raise RuntimeError("LLM unavailable")
+    class DownLLM:
+        async def execute_text(self, *args, **kwargs):
+            raise RuntimeError("LLM unavailable")
 
     monkeypatch.setattr("app.services.scraper.run_extraction", fake_run_extraction)
-    monkeypatch.setattr("app.routers.video.call_llm_with_html_and_screenshot", fake_llm_metadata)
+    monkeypatch.setattr("app.state.llm_manager", DownLLM())
 
     video_queue = queue_module.VideoQueue(max_workers=1)
     job = queue_module.RecordingJob(

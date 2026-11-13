@@ -229,3 +229,36 @@ async def test_playback_graph_exhausted_attempts_returns_false():
         result = await graph.run(state)
 
         assert result is False
+
+
+@pytest.mark.asyncio
+async def test_the_llm_reasons_only_after_a_click_failed_to_start_playback():
+    mock_page = MagicMock()
+    mock_page.viewport_size = {"width": 1920, "height": 1080}
+    mock_page.frames = [mock_page]
+    mock_page.content = AsyncMock(return_value="<html><body><video></video></body></html>")
+    mock_llm = MagicMock()
+    mock_llm.execute = AsyncMock(return_value={"action_selector": "#play", "pixel_x": None, "pixel_y": None})
+
+    graph = PlaybackGraph(
+        is_playing_fn=AsyncMock(return_value=False),
+        pre_pass_fn=AsyncMock(return_value=0),
+        force_play_js_fn=AsyncMock(return_value=False),
+        try_direct_play_fn=AsyncMock(return_value=False),
+        media_session_fn=AsyncMock(return_value=False),
+        request_fullscreen_fn=AsyncMock(),
+    )
+
+    with patch("app.services.scraper.playback_graph.ComputerUse") as mock_cu_cls, \
+            patch("app.services.scraper.playback_graph.asyncio.sleep", new=AsyncMock()):
+        mock_cu = MagicMock()
+        mock_cu.screenshot = AsyncMock(return_value=b"fake-jpeg")
+        mock_cu.aria_snapshot = AsyncMock(return_value="")
+        mock_cu.aria_snapshot_for_frame = AsyncMock(return_value="")
+        mock_cu.click_by_selector = AsyncMock(return_value=True)
+        mock_cu_cls.return_value = mock_cu
+
+        # Cycle 2 replays the cached click; cycle 3 asks the LLM again.
+        await graph.run(PlaybackState(page=mock_page, llm_manager=mock_llm, max_attempts=3))
+
+    assert [call.kwargs.get("think") for call in mock_llm.execute.call_args_list] == [False, True]

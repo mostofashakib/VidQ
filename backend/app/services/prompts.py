@@ -4,10 +4,10 @@ Centralized prompt templates for all LLM calls in the pipeline.
 
 class Prompts:
     @staticmethod
-    def navigation_selectors_vision(html: str) -> str:
+    def navigation_selectors_vision(player_context: str) -> str:
         """
         Vision+HTML prompt → CSS selectors for the main player.
-        Called once at the start of each extraction pass.
+        `player_context` is the page's player region from `player_html`.
         """
         return (
             "You are a web automation expert. Using the HTML (and screenshot if visible), "
@@ -26,8 +26,8 @@ class Prompts:
             '  "direct_video_url": "direct stream URL found in HTML, or null",\n'
             '  "duration": "main video duration in seconds if visible in HTML/text, or null"\n'
             "}\n\n"
-            "HTML (truncated):\n"
-            + html[:12000]
+            "Player HTML (the page's player region, with page chrome removed):\n"
+            + player_context
         )
 
     @staticmethod
@@ -135,24 +135,16 @@ class Prompts:
         )
 
     @staticmethod
-    def video_metadata(cleaned_html: str, network_video_urls: list) -> str:
-        """Vision prompt for final metadata extraction."""
+    def video_metadata(page_summary: str) -> str:
+        """Text prompt: name a video from a short summary of its page."""
         return (
-            "You are an expert at extracting video metadata. Identify the MAIN video on the page.\n"
-            "Heuristics:\n"
-            "- The main video is typically standalone and prominent.\n"
-            "- Ignore 'related videos' or 'clusters' in sidebars.\n\n"
-            "Extract:\n"
-            "- video_url: the direct or main embedded URL\n"
-            "- title: the main video title\n"
-            "- duration: seconds (integer)\n"
-            "- description: 2-sentence summary\n"
-            "- thumbnail: the primary thumbnail URL\n\n"
-            "Return ONLY valid JSON with keys: video_url, title, description, duration, thumbnail.\n\n"
-            "HTML:\n"
-            + cleaned_html
-            + "\n\nNetwork video URLs:\n"
-            + str(network_video_urls)[:2000]
+            "You name videos for a media library. Below is a summary of the page a video "
+            "was downloaded from: what the page states, its headings and its opening text.\n"
+            "Write the video's title as the page presents it, and a description of at most "
+            "2 sentences. Ignore site names, menus and related videos.\n\n"
+            "Return ONLY valid JSON, no markdown:\n"
+            '{"title": "the video title", "description": "what the video shows"}\n\n'
+            "Page summary:\n" + page_summary
         )
 
     @staticmethod

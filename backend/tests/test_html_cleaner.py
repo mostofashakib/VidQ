@@ -77,3 +77,66 @@ def test_interaction_does_not_strip_consent_elements():
     result = _clean_for_interaction(html)
     assert "cookie-consent" in result
     assert "Accept All" in result
+
+
+# ── player_html ───────────────────────────────────────────────────────────────
+
+from app.services.scraper.html import player_html  # noqa: E402
+
+PLAYER_PAGE = """<html><head><title>Deep Sea Creatures - Tube</title>
+<meta property="og:video:duration" content="3130"><script>var big = "x".repeat(9)</script>
+<style>.a{}</style></head><body>
+<header><a href="/">Home</a><a href="/categories">Categories</a></header>
+<nav>""" + "".join(f'<a href="/c/{n}">Category {n}</a>' for n in range(200)) + """</nav>
+<main>
+  <div class="content"><div id="player-wrap" class="video-player" data-tracking="x" style="width:100%">
+    <video id="main" class="vjs-tech" src="https://cdn.example/v/main.mp4"></video>
+    <button class="vjs-big-play-button" aria-label="Play">Play</button>
+    <div class="vjs-control-bar"><button class="vjs-fullscreen-control">Fullscreen</button>
+      <span class="vjs-duration">52:10</span></div>
+  </div></div>
+  <h1>Deep Sea Creatures</h1>
+  <section class="related">""" + "".join(
+    f'<a href="/v/{n}"><img src="/t/{n}.jpg"><span>Related video {n} with a long title</span></a>' for n in range(300)
+) + """</section>
+  <iframe src="https://ads.doubleclick.net/banner"></iframe>
+</main>
+<footer>""" + "Footer links " * 300 + """</footer>
+</body></html>"""
+
+
+def test_player_html_keeps_the_player_and_its_controls_and_little_else():
+    context = player_html(PLAYER_PAGE)
+
+    for kept in ('id="main"', "https://cdn.example/v/main.mp4", "vjs-big-play-button", 'aria-label="Play"',
+                 "vjs-fullscreen-control", "52:10", "Deep Sea Creatures - Tube", "3130"):
+        assert kept in context
+    for dropped in ("Category 1", "Related video", "Footer links", "doubleclick", "<script", "repeat(9)",
+                    "data-tracking", "style="):
+        assert dropped not in context
+    assert len(context) < len(PLAYER_PAGE) // 20
+
+
+def test_player_html_keeps_an_embedded_player_frame():
+    html = ('<html><body><nav>' + "menu " * 500 + '</nav><div class="video-container">'
+            '<iframe src="https://player.example/embed/30163/" allowfullscreen></iframe></div></body></html>')
+
+    context = player_html(html)
+
+    assert 'src="https://player.example/embed/30163/"' in context
+    assert "menu" not in context
+
+
+def test_player_html_stays_within_its_budget():
+    html = "<html><body>" + "".join(
+        f'<div class="player-{n}"><video src="https://cdn.example/{n}.mp4"></video><p>{"words " * 200}</p></div>'
+        for n in range(20)
+    ) + "</body></html>"
+
+    assert len(player_html(html, max_len=1500)) <= 1500
+
+
+def test_player_html_falls_back_to_the_interactive_page_when_no_player_is_found():
+    html = '<html><body><div class="consent"><button id="accept">Accept</button></div><p>Loading</p></body></html>'
+
+    assert 'id="accept"' in player_html(html)

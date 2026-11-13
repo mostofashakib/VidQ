@@ -36,6 +36,8 @@ _pool_state = WorkerPoolState()
 # Approximate chars per token; used for chunking
 _CHARS_PER_TOKEN = 4
 _CHUNK_TOKEN_BUDGET = 2000
+_LINE_NUMBER_TOKENS = 3  # "12| " before each segment's text
+_NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)\s*\|\s?(.*)$")
 
 
 class TranslateJob:
@@ -141,7 +143,7 @@ def _chunk_segments(segments: list[dict]) -> list[list[dict]]:
     current: list[dict] = []
     current_tokens = 0
     for seg in segments:
-        seg_tokens = len(seg.get("text", "")) // _CHARS_PER_TOKEN + 20  # +20 for SRT overhead
+        seg_tokens = len(seg.get("text", "")) // _CHARS_PER_TOKEN + _LINE_NUMBER_TOKENS
         if current and current_tokens + seg_tokens > _CHUNK_TOKEN_BUDGET:
             chunks.append(current)
             current = []
@@ -153,57 +155,47 @@ def _chunk_segments(segments: list[dict]) -> list[list[dict]]:
     return chunks if chunks else [[]]
 
 
-def _build_translation_prompt(segments: list[dict], chunk_index: int, total_chunks: int) -> str:
-    srt_block = _segments_to_srt(segments)
-    return f"""You are a professional subtitle translator working on chunk {chunk_index} of {total_chunks}.
+def _build_translation_prompt(segments: list[dict]) -> str:
+    """
+    The chunk's text as numbered lines. Timings stay out: the model would
+    only have to copy them back, and copying is most of its output.
+    """
+    numbered = "\n".join(f"{i}| {seg['text'].strip()}" for i, seg in enumerate(segments, 1))
+    return f"""You are a professional subtitle translator.
 
-Translate each subtitle segment below to English exactly as spoken.
-Do NOT summarize, condense, or omit any segment.
+Translate each numbered subtitle line below to English exactly as spoken.
+Do NOT summarize, condense, merge or omit any line.
 Do NOT add explanations or commentary.
-Translate every line individually and return ONLY the translated SRT text in exactly the same format.
-Preserve all segment numbers and timing markers exactly — only translate the text lines.
+Return ONLY the translated lines, each with its number, in the same "N| text" format.
 
-{srt_block}"""
+{numbered}"""
 
 
-def _merge_translated_chunks(original_segments: list[dict], translated_chunks: list[str]) -> str:
-    """Reassemble all translated chunk SRT texts into one coherent SRT with corrected indices."""
-    all_blocks: list[tuple[str, str, str]] = []  # (start, end, text)
+def _numbered_lines(text: str) -> dict[int, str]:
+    """The model's 'N| text' answers by line number, ignoring anything else it wrote."""
+    lines: dict[int, str] = {}
+    for line in text.splitlines():
+        match = _NUMBERED_LINE_RE.match(line)
+        if match and match.group(2).strip():
+            lines.setdefault(int(match.group(1)), match.group(2).strip())
+    return lines
 
-    for chunk_srt in translated_chunks:
-        # Parse the SRT blocks produced by the LLM
-        # Pattern: index\nHH:MM:SS,mmm --> HH:MM:SS,mmm\ntext
-        blocks = re.split(r'\n\s*\n', chunk_srt.strip())
-        for block in blocks:
-            block = block.strip()
-            if not block:
-                continue
-            lines = block.splitlines()
-            if len(lines) < 3:
-                continue
-            # lines[0] = index (may be off if LLM reindexed), lines[1] = timing, lines[2+] = text
-            timing_line = None
-            text_lines = []
-            for j, line in enumerate(lines):
-                if '-->' in line:
-                    timing_line = line.strip()
-                    text_lines = [l.strip() for l in lines[j+1:] if l.strip()]
-                    break
-            if timing_line and text_lines:
-                parts = timing_line.split('-->')
-                if len(parts) == 2:
-                    all_blocks.append((parts[0].strip(), parts[1].strip(), " ".join(text_lines)))
 
-    # If LLM output is unusable, fall back to original text with original timings
-    if not all_blocks:
-        logger.warning("Translation parse failed; using original transcript")
-        return _segments_to_srt(original_segments)
-
-    # Rebuild with sequential indices
-    srt_lines = []
-    for i, (start, end, text) in enumerate(all_blocks, 1):
-        srt_lines.append(f"{i}\n{start} --> {end}\n{text}\n")
-    return "\n".join(srt_lines)
+def _merge_translated_chunks(chunks: list[list[dict]], translated_chunks: list[str]) -> str:
+    """
+    One SRT from every chunk's answer, keeping the original timings. A line
+    the model skipped keeps its original text.
+    """
+    merged: list[dict] = []
+    missing = 0
+    for segments, answer in zip(chunks, translated_chunks):
+        lines = _numbered_lines(answer)
+        for i, seg in enumerate(segments, 1):
+            missing += i not in lines
+            merged.append({**seg, "text": lines.get(i, seg["text"])})
+    if missing:
+        logger.warning(f"Translation skipped {missing} of {len(merged)} lines; they keep their original text")
+    return _segments_to_srt(merged)
 
 
 def _burn_subtitles(
@@ -333,7 +325,7 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
                 job.chunk_index = i + 1
                 job.overall_progress = 30 + int((i / total_chunks) * 50)
 
-            prompt = _build_translation_prompt(chunk, i + 1, total_chunks)
+            prompt = _build_translation_prompt(chunk)
             try:
                 result = asyncio.run(translate_llm_manager.execute_translate(prompt))
                 translated_chunks.append(result)
@@ -344,7 +336,7 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
                     job.error = f"Translation failed: {e}"
                 return
 
-        final_srt = _merge_translated_chunks(segments, translated_chunks)
+        final_srt = _merge_translated_chunks(chunks, translated_chunks)
         with open(srt_path, "w", encoding="utf-8") as f:
             f.write(final_srt)
 

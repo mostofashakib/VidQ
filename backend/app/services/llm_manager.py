@@ -10,6 +10,7 @@ from app.logging_utils import get_logger
 logger = get_logger(__name__)
 
 OPENROUTER_MAX_RETRIES = 4  # exponential backoff: 1s, 2s, 4s before final raise
+ANTHROPIC_THINKING_BUDGET = 2048  # reasoning tokens for calls that ask to think
 
 def _parse_json(text: str) -> dict:
     """Extract the first JSON object from an LLM response string."""
@@ -50,13 +51,20 @@ def _get_media_type(image_b64: str) -> str:
 
 
 class LLMProvider(abc.ABC):
+    """
+    `think` asks a reasoning model to reason before it answers. Most calls
+    are lookups (pick a selector, score a title, write queries) where
+    reasoning costs many seconds and changes nothing, so it is off unless a
+    call asks for it. Providers without a reasoning switch ignore it.
+    """
+
     @abc.abstractmethod
-    async def call_text(self, prompt: str) -> dict:
+    async def call_text(self, prompt: str, think: bool = False) -> dict:
         """Text-only call — no image. Used for HTML-based navigation analysis."""
         pass
 
     @abc.abstractmethod
-    async def call_vision(self, prompt: str, image_b64: str) -> dict:
+    async def call_vision(self, prompt: str, image_b64: str, think: bool = False) -> dict:
         """Vision call — prompt + screenshot. Used for metadata extraction."""
         pass
 
@@ -109,15 +117,15 @@ class OllamaProvider(LLMProvider):
         # Extract first {...} block
         return _parse_json(content)
 
-    async def call_text(self, prompt: str) -> dict:
+    async def call_text(self, prompt: str, think: bool = False) -> dict:
         payload = {
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
             "format": "json",
-            # Thinking models in JSON mode spend the whole budget reasoning and
-            # return nothing; non-thinking models ignore this flag.
-            "think": False,
+            # Thinking models think by default, which costs many seconds per
+            # call; non-thinking models ignore this flag.
+            "think": think,
             "options": {"temperature": 0},
         }
         logger.info(f"Ollama call_text → model={self.model_name}")
@@ -136,6 +144,7 @@ class OllamaProvider(LLMProvider):
             "model": self.model_name,
             "messages": [{"role": "user", "content": prompt}],
             "stream": False,
+            "think": False,  # translation gains nothing from reasoning
             "options": {"temperature": 0.1},
         }
         logger.info(f"Ollama call_translate_text → model={self.model_name}")
@@ -145,7 +154,7 @@ class OllamaProvider(LLMProvider):
         content = _re.sub(r'<think>.*?</think>', '', content, flags=_re.DOTALL).strip()
         return content
 
-    async def call_vision(self, prompt: str, image_b64: str) -> dict:
+    async def call_vision(self, prompt: str, image_b64: str, think: bool = False) -> dict:
         payload = {
             "model": self.model_name,
             "messages": [
@@ -157,7 +166,7 @@ class OllamaProvider(LLMProvider):
             ],
             "stream": False,
             "format": "json",
-            "think": False,  # same reason as call_text
+            "think": think,
             "options": {"temperature": 0},
         }
         logger.info(f"Ollama call_vision → model={self.model_name}")
@@ -172,7 +181,7 @@ class OpenAIProvider(LLMProvider):
         self.client = AsyncOpenAI(api_key=api_key)
         self.model_name = model
 
-    async def call_text(self, prompt: str) -> dict:
+    async def call_text(self, prompt: str, think: bool = False) -> dict:
         response = await self.client.chat.completions.create(
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -190,7 +199,7 @@ class OpenAIProvider(LLMProvider):
         )
         return response.choices[0].message.content.strip()
 
-    async def call_vision(self, prompt: str, image_b64: str) -> dict:
+    async def call_vision(self, prompt: str, image_b64: str, think: bool = False) -> dict:
         response = await self.client.chat.completions.create(
             model=self.model_name,
             messages=[
@@ -235,7 +244,7 @@ class OpenRouterProvider(LLMProvider):
                 )
                 await asyncio.sleep(wait)
 
-    async def call_text(self, prompt: str) -> dict:
+    async def call_text(self, prompt: str, think: bool = False) -> dict:
         content = await self._create(
             model=self.model_name,
             messages=[{"role": "user", "content": prompt}],
@@ -252,7 +261,7 @@ class OpenRouterProvider(LLMProvider):
             temperature=0.1,
         )
 
-    async def call_vision(self, prompt: str, image_b64: str) -> dict:
+    async def call_vision(self, prompt: str, image_b64: str, think: bool = False) -> dict:
         content = await self._create(
             model=self.model_name,
             messages=[
@@ -275,13 +284,28 @@ class AnthropicProvider(LLMProvider):
         self.client = AsyncAnthropic(api_key=api_key)
         self.model_name = model
 
-    async def call_text(self, prompt: str) -> dict:
+    @staticmethod
+    def _thinking(think: bool) -> dict:
+        """max_tokens, plus a reasoning budget it must exceed when the call thinks."""
+        if not think:
+            return {"max_tokens": 1000}
+        return {
+            "max_tokens": ANTHROPIC_THINKING_BUDGET + 1000,
+            "thinking": {"type": "enabled", "budget_tokens": ANTHROPIC_THINKING_BUDGET},
+        }
+
+    @staticmethod
+    def _answer(response) -> str:
+        """The text answer, after any reasoning blocks."""
+        return next(block.text for block in response.content if block.type == "text").strip()
+
+    async def call_text(self, prompt: str, think: bool = False) -> dict:
         response = await self.client.messages.create(
             model=self.model_name,
-            max_tokens=1000,
             messages=[{"role": "user", "content": prompt}],
+            **self._thinking(think),
         )
-        return _parse_json(response.content[0].text.strip())
+        return _parse_json(self._answer(response))
 
     async def call_translate_text(self, prompt: str) -> str:
         response = await self.client.messages.create(
@@ -291,10 +315,10 @@ class AnthropicProvider(LLMProvider):
         )
         return response.content[0].text.strip()
 
-    async def call_vision(self, prompt: str, image_b64: str) -> dict:
+    async def call_vision(self, prompt: str, image_b64: str, think: bool = False) -> dict:
         response = await self.client.messages.create(
             model=self.model_name,
-            max_tokens=1000,
+            **self._thinking(think),
             messages=[
                 {
                     "role": "user",
@@ -312,7 +336,7 @@ class AnthropicProvider(LLMProvider):
                 }
             ],
         )
-        return _parse_json(response.content[0].text.strip())
+        return _parse_json(self._answer(response))
 
 
 class FallbackLLMManager:
@@ -354,14 +378,14 @@ class FallbackLLMManager:
             return f"{name}({provider.model_name})"
         return name
 
-    async def _run(self, method_name: str, *args) -> dict:
+    async def _run(self, method_name: str, *args, **kwargs) -> dict:
         last_error = None
         for original_idx, provider in self._ordered_providers():
             provider_label = self._provider_label(provider)
             method = getattr(provider, method_name)
             try:
                 logger.info(f"[{method_name}] Using {provider_label}")
-                result = await method(*args)
+                result = await method(*args, **kwargs)
                 if self._working_provider_index != original_idx:
                     logger.info(f"Promoting {provider_label} as preferred provider.")
                     self._working_provider_index = original_idx
@@ -371,13 +395,13 @@ class FallbackLLMManager:
                 last_error = e
         raise Exception(f"All LLM providers failed. Last error: {last_error}")
 
-    async def execute_text(self, prompt: str) -> dict:
-        """Text-only call through the fallback chain."""
-        return await self._run("call_text", prompt)
+    async def execute_text(self, prompt: str, think: bool = False) -> dict:
+        """Text-only call through the fallback chain. `think` turns on reasoning (see LLMProvider)."""
+        return await self._run("call_text", prompt, think=think)
 
-    async def execute(self, prompt: str, image_b64: str) -> dict:
+    async def execute(self, prompt: str, image_b64: str, think: bool = False) -> dict:
         """Vision call through the fallback chain (backwards compat entry point)."""
-        return await self._run("call_vision", prompt, image_b64)
+        return await self._run("call_vision", prompt, image_b64, think=think)
 
     async def execute_translate(self, prompt: str) -> str:
         """Plain-text translation call through the fallback chain. Returns raw string."""

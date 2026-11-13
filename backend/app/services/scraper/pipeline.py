@@ -14,7 +14,7 @@ from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 from app.config import get_settings
-from app.services.scraper.html import clean_html
+from app.services.scraper.html import player_html
 from app.services.scraper.media import (
     _is_ad_video_url,
     _is_forbidden,
@@ -476,11 +476,10 @@ async def run_extraction(
                 except Exception:
                     pass
 
-                raw_html = await page.content()
-                pre_html = clean_html(raw_html)
+                player_context = player_html(await page.content())
                 try:
-                    logger.info("Invoking LLM for navigation selectors…")
-                    nav_map = await llm_manager.execute(Prompts.navigation_selectors_vision(pre_html), nav_b64)
+                    logger.info(f"Invoking LLM for navigation selectors ({len(player_context)} chars of player HTML)…")
+                    nav_map = await llm_manager.execute(Prompts.navigation_selectors_vision(player_context), nav_b64)
                     play_selector = nav_map.get("play_selector")
                     fullscreen_selector = nav_map.get("fullscreen_selector")
                     settings_selector = nav_map.get("settings_selector")
@@ -729,16 +728,16 @@ async def run_extraction(
                 main_selector = await _get_main_video_selector(heavy_page, main_video_selector)
                 logger.debug(f"Targeting main video: {main_selector}")
 
-                # After page has settled, take HTML → LLM for fresh selectors
-                if llm_manager:
+                # The fast pass already mapped this page's player; ask again
+                # only when it found nothing.
+                if llm_manager and not (main_video_selector or play_selector):
                     try:
                         logger.info("Heavy Pass: capturing HTML for LLM navigation analysis…")
-                        raw_html = await heavy_page.content()
-                        pre_html = clean_html(raw_html)
+                        player_context = player_html(await heavy_page.content())
                         heavy_nav_bytes = await ComputerUse(heavy_page).screenshot(quality=80)
                         heavy_nav_b64 = base64.b64encode(heavy_nav_bytes).decode()
                         heavy_nav_map = await llm_manager.execute(
-                            Prompts.navigation_selectors_vision(pre_html), heavy_nav_b64
+                            Prompts.navigation_selectors_vision(player_context), heavy_nav_b64
                         )
                         if heavy_nav_map.get("play_selector"):
                             play_selector = heavy_nav_map["play_selector"]

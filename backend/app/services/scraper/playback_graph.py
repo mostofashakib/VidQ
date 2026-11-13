@@ -437,6 +437,9 @@ class PlaybackGraph:
                     viewport_height=inspection["vp_h"],
                 ),
                 inspection["screenshot_b64"],
+                # A first pick is a lookup. Once a click has failed, reasoning
+                # about what blocks playback is worth its extra seconds.
+                think=state.attempt > 1,
             )
             selector = result.get("action_selector")
             pixel_x = result.get("pixel_x")

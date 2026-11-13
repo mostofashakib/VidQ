@@ -278,12 +278,11 @@ class VideoQueue:
         async def _actual_work():
             from app.services.scraper import run_extraction, USER_AGENTS
             from app.state import llm_manager
-            from app.routers.video import call_llm_with_html_and_screenshot
-            from bs4 import BeautifulSoup
+            from app.services.scraper.metadata import video_metadata
             import random
 
             user_agent = random.choice(USER_AGENTS)
-            html, screenshot_b64, network_video_urls, thumbnail_url, temp_video_url = await run_extraction(
+            html, _screenshot, network_video_urls, thumbnail_url, temp_video_url = await run_extraction(
                 url=job.url,
                 user_agent=user_agent,
                 llm_manager=llm_manager,
@@ -294,36 +293,10 @@ class VideoQueue:
                 referer=job.referer,
             )
 
-            if not screenshot_b64:
-                # Embed fast-path: extract metadata from HTML directly, skip LLM
-                embed_soup = BeautifulSoup(html, "html.parser") if html else None
-                title = None
-                if embed_soup:
-                    og_title = embed_soup.find("meta", property="og:title", content=True)
-                    title = og_title["content"] if og_title else (
-                        embed_soup.title.text.strip() if embed_soup.title else None
-                    )
-                result = {"title": title or job.url, "thumbnail": thumbnail_url, "video_url": temp_video_url or ""}
-            else:
-                try:
-                    result = await call_llm_with_html_and_screenshot(
-                        llm_manager, html, screenshot_b64, network_video_urls, thumbnail_url
-                    )
-                except Exception as metadata_error:
-                    logger.warning(
-                        f"Job {job.job_id}: LLM metadata extraction failed; "
-                        f"using fallback metadata. Error: {metadata_error}"
-                    )
-                    result = {
-                        "title": _fallback_title(job.url),
-                        "description": "",
-                        "duration": None,
-                        "thumbnail": thumbnail_url,
-                        "video_url": temp_video_url or (network_video_urls[0] if network_video_urls else job.url),
-                    }
-                result["thumbnail"] = result.get("thumbnail") or thumbnail_url
-                if temp_video_url:
-                    result["video_url"] = temp_video_url
+            fallback_url = network_video_urls[0] if network_video_urls else job.url
+            result = await video_metadata(llm_manager, html, job.url, temp_video_url or fallback_url)
+            result["title"] = result["title"] or _fallback_title(job.url)
+            result["thumbnail"] = result["thumbnail"] or thumbnail_url
             if job.title_hint:
                 result["title"] = job.title_hint
             result["thumbnail"] = result.get("thumbnail") or job.thumbnail_hint

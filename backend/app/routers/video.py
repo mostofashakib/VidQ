@@ -11,9 +11,8 @@ import os
 import requests
 from bs4 import BeautifulSoup
 from app.services.llm_manager import FallbackLLMManager
-from app.services.scraper import USER_AGENTS, clean_html
+from app.services.scraper import USER_AGENTS
 from app.services.scraper.album import fetch_album
-from app.services.prompts import Prompts
 import random
 from app.config import get_settings
 from urllib.parse import urlparse
@@ -203,17 +202,6 @@ def delete_all_videos(db: Session = Depends(get_db), token: str = Depends(verify
     db.query(Video).filter(Video.source == "url").delete(synchronize_session=False)
     db.commit()
     return None
-
-async def call_llm_with_html_and_screenshot(llm_manager: FallbackLLMManager, html: str, screenshot_b64: str, network_video_urls: list[str], thumbnail_url: str) -> dict:
-    prompt = Prompts.video_metadata(clean_html(html), network_video_urls)
-    try:
-        logger.debug(f"Passing payload to LLM (vision): HTML={len(html)}chars, URLs={len(network_video_urls)}")
-        result = await llm_manager.execute(prompt, screenshot_b64)
-        logger.debug(f"LLM Metadata Result: {result}")
-        return result
-    except Exception as e:
-        logger.error(f"LLM Manager execution failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"LLM extraction failed: {e}")
 
 def _enqueue_link(url: str, category: str, token: str) -> list:
     """

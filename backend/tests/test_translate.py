@@ -11,10 +11,7 @@ FAKE_SEGMENTS = [
     {"start": 2.5, "end": 5.0, "text": "반갑습니다"},
 ]
 
-FAKE_TRANSLATED_SRT = (
-    "1\n00:00:00,000 --> 00:00:02,500\nHello\n\n"
-    "2\n00:00:02,500 --> 00:00:05,000\nNice to meet you\n"
-)
+FAKE_TRANSLATED_SRT = "1| Hello\n2| Nice to meet you\n"
 
 
 def _fake_mp4() -> bytes:
