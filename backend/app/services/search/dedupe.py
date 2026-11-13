@@ -135,14 +135,15 @@ def _merge(kept: SearchResult, duplicate: SearchResult) -> SearchResult:
         duration=kept.duration if kept.duration is not None else duplicate.duration,
         thumbnail=kept.thumbnail or duplicate.thumbnail,
         snippet=kept.snippet or duplicate.snippet,
-        hits=kept.hits + duplicate.hits,
+        votes=kept.votes + duplicate.votes,
+        is_video=kept.is_video or duplicate.is_video,
     )
 
 
 def dedupe(results: list[SearchResult], seen: SeenIndex | None = None) -> list[SearchResult]:
     """
     Keep the first of each set of duplicates, in order, filling its missing
-    fields from the others and counting them in `hits`. Results matching
+    fields from the others and adding up their `votes`. Results matching
     `seen` (earlier pages) are dropped.
     """
     local = SeenIndex()

@@ -118,20 +118,28 @@ def player_frames(html: str, page_url: str) -> list[str]:
     return list(frames)
 
 
-async def _get_html(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> tuple[str, str] | None:
-    """(final URL, HTML) of a page, checking every redirect hop; None on failure."""
+async def fetch_page(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> httpx.Response | None:
+    """
+    The final response for url, checking every redirect hop against private
+    networks. None when a hop is unsafe or there are too many redirects.
+    """
     for _ in range(_MAX_REDIRECTS + 1):
         if not is_safe_url(url):
-            logger.warning(f"Player config fetch refused unsafe URL: {url[:100]}")
+            logger.warning(f"Page fetch refused unsafe URL: {url[:100]}")
             return None
         response = await client.get(url, headers=headers, follow_redirects=False)
-        if response.is_redirect:
-            url = urljoin(url, response.headers["location"])
-            continue
-        if response.status_code != 200 or "html" not in response.headers.get("content-type", ""):
-            return None
-        return url, response.text
+        if not response.is_redirect:
+            return response
+        url = urljoin(url, response.headers["location"])
     return None
+
+
+async def _get_html(client: httpx.AsyncClient, url: str, headers: dict[str, str]) -> tuple[str, str] | None:
+    """(final URL, HTML) of a page; None on failure."""
+    response = await fetch_page(client, url, headers)
+    if response is None or response.status_code != 200 or "html" not in response.headers.get("content-type", ""):
+        return None
+    return str(response.url), response.text
 
 
 async def find_player_streams(

@@ -14,7 +14,9 @@ class SearchResult:
     thumbnail: str = ""
     snippet: str = ""
     reason: str = ""  # why the ranker picked it
-    hits: int = 1  # how many source/query results were this same video
+    score: int = 0  # the ranker's 0-3 relevance score
+    votes: float = 0.0  # position votes from every result list that found it (see relevance.py)
+    is_video: bool = False  # a source confirmed it is a video, so it needs no page check
 
     def to_dict(self) -> dict:
         return {

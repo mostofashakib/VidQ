@@ -30,6 +30,8 @@ const PHASE_LABELS: Record<string, string> = {
   planning: "Planning search queries…",
   searching: "Searching the web…",
   ranking: "Ranking results against your description…",
+  verifying: "Checking that each match is a video page…",
+  refining: "Searching again with what the best matches are called…",
   comparing: "Checking results for the same video on other sites…",
 };
 

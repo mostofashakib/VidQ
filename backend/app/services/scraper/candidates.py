@@ -256,18 +256,20 @@ def _is_media_file(url: str, declared_type: str = "") -> bool:
     )
 
 
+def meta_content(soup: BeautifulSoup, key: str) -> str:
+    """Content of the <meta> tag whose property or name is key, or ""."""
+    tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
+    return (tag.get("content") or "").strip() if tag else ""
+
+
 def _social_video_urls(soup: BeautifulSoup) -> list[str]:
     """OpenGraph and Twitter video tags that point at a media file, not an embed page."""
-    def meta(key: str) -> str:
-        tag = soup.find("meta", attrs={"property": key}) or soup.find("meta", attrs={"name": key})
-        return (tag.get("content") or "").strip() if tag else ""
-
-    declared_type = meta("og:video:type")
+    declared_type = meta_content(soup, "og:video:type")
     if declared_type and not _is_media_file("", declared_type):
         open_graph = []
     else:
-        open_graph = [u for u in (meta(p) for p in _OPEN_GRAPH_VIDEO_PROPS) if u and _is_media_file(u, declared_type)]
-    stream = meta("twitter:player:stream")
+        open_graph = [u for u in (meta_content(soup, p) for p in _OPEN_GRAPH_VIDEO_PROPS) if u and _is_media_file(u, declared_type)]
+    stream = meta_content(soup, "twitter:player:stream")
     return open_graph[:1] + ([stream] if stream else [])
 
 

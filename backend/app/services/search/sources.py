@@ -4,7 +4,8 @@ SearchResults in the source's own order.
 
 - YtDlpSource runs yt-dlp's built-in site search (ytsearch, bilisearch).
 - BrowserEngineSource loads a search engine's video results in the browser
-  and harvests the outbound links, so it does not depend on engine markup.
+  and reads them with a parser: by default it harvests the outbound links,
+  so it does not depend on engine markup.
   Engines page either by URL (an offset parameter) or by loading more
   results as the page scrolls.
 """
@@ -26,12 +27,13 @@ from app.services.scraper.browser_adapter import launch_browser
 from app.services.scraper.pipeline import _open_context
 from app.services.scraper.playback import HEADLESS_OPTIONS, USER_AGENTS
 from app.services.search.models import SearchResult
-from app.services.search.page_reader import harvest_results
+from app.services.search.page_reader import bing_results, harvest_results
 
 logger = logging.getLogger("VideoSearch")
 
 Runner = Callable[[list[str]], Awaitable[str]]
 UrlBuilder = Callable[[str, str, int], str]  # (query, safe_search, page) -> URL
+PageParser = Callable[[str, str, str], list[SearchResult]]  # (html, page URL, source) -> results
 
 _YTDLP_TIMEOUT_S = 60
 _DDG_SAFE_SEARCH = {"off": "-2", "moderate": "-1", "strict": "1"}
@@ -83,6 +85,7 @@ def _ytdlp_result(entry: dict, source: str) -> SearchResult | None:
         duration=float(duration) if isinstance(duration, (int, float)) else None,
         thumbnail=thumbnail,
         snippet=(entry.get("description") or entry.get("channel") or "").strip(),
+        is_video=True,  # yt-dlp search only returns videos
     )
 
 
@@ -125,6 +128,11 @@ def brave_videos_url(query: str, safe_search: str, page: int) -> str:
     return f"https://search.brave.com/videos?{urlencode(params)}"
 
 
+def bing_videos_url(query: str, safe_search: str, page: int) -> str:
+    """Bing loads later pages on scroll, so the URL ignores page."""
+    return f"https://www.bing.com/videos/search?{urlencode({'q': query, 'adlt': safe_search})}"
+
+
 class BrowserEngineSource:
     """
     A search engine's video tab, loaded in the browser. Only results that show
@@ -138,18 +146,20 @@ class BrowserEngineSource:
         safe_search: str,
         fetcher: PageFetcher,
         scroll_paging: bool = False,
+        parser: PageParser = harvest_results,
     ) -> None:
         self.name = name
         self._url_builder = url_builder
         self._safe_search = safe_search
         self._fetcher = fetcher
         self._scroll_paging = scroll_paging
+        self._parser = parser
 
     async def search(self, query: str, page: int) -> list[SearchResult]:
         url = self._url_builder(query, self._safe_search, page)
         scrolls = page - 1 if self._scroll_paging else 0
         html = await self._fetcher.fetch(url, scrolls=scrolls)
-        return [r for r in harvest_results(html, url, self.name) if r.duration]
+        return [r for r in self._parser(html, url, self.name) if r.duration]
 
 
 class BrowserPageFetcher:
@@ -202,7 +212,7 @@ class BrowserPageFetcher:
 def default_sources(settings) -> Callable[[], AsyncIterator[list[SearchSource]]]:
     """
     Opener for the standard sources: yt-dlp search for YouTube and Bilibili,
-    plus DuckDuckGo and Brave video search in one shared browser. When the
+    plus DuckDuckGo, Brave and Bing video search in one shared browser. When the
     browser fails to start, the search runs on the yt-dlp sources alone.
     """
 
@@ -220,6 +230,7 @@ def default_sources(settings) -> Callable[[], AsyncIterator[list[SearchSource]]]
             yield ytdlp + [
                 BrowserEngineSource("duckduckgo", duckduckgo_videos_url, safe, fetcher, scroll_paging=True),
                 BrowserEngineSource("brave", brave_videos_url, safe, fetcher),
+                BrowserEngineSource("bing", bing_videos_url, safe, fetcher, scroll_paging=True, parser=bing_results),
             ]
 
     return open_sources

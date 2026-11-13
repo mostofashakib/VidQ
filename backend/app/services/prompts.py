@@ -171,6 +171,24 @@ class Prompts:
         )
 
     @staticmethod
+    def follow_up_search_queries(description: str, tried: list[str], match_titles: list[str], count: int) -> str:
+        """Text prompt: new search queries learned from the matches found so far."""
+        matches = "\n".join(f"- {t}" for t in match_titles) or "- none yet"
+        return (
+            "You refine a video search. Read what it found so far and search again.\n"
+            f"The user wants: {description}\n\n"
+            "Queries already searched:\n" + "\n".join(f"- {q}" for q in tried) + "\n\n"
+            "Titles of videos that matched, best first:\n" + matches + "\n\n"
+            f"Write {count} new short search queries that find more videos the user wants. "
+            "Use the exact names, series, channels and spellings that appear in the matching "
+            "titles. Keep every name the user wrote. Do not repeat a query already searched "
+            "and do not add a genre, format or topic the user did not mention. "
+            "With no matches yet, word the search differently.\n\n"
+            "Return ONLY valid JSON, no markdown:\n"
+            '{"queries": ["query one", "query two"]}'
+        )
+
+    @staticmethod
     def rank_search_results(description: str, candidate_lines: list[str]) -> str:
         """Text prompt: score each search result against the user's description."""
         return (

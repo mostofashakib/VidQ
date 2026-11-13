@@ -113,3 +113,30 @@ def test_titles_prefer_title_attributes_and_headings_over_card_text():
         ("Ocean Giants", 720.0),
     ]
     assert results[0].thumbnail == "https://thumbs.example/1.jpg"
+
+
+# ── Engines that keep results in JSON attributes ──────────────────────────────
+
+from app.services.search.page_reader import bing_results  # noqa: E402
+
+BING = "https://www.bing.com/videos/search?q=ocean"
+BING_PAGE = """<body>
+  <div class="mc_vtvc" mmeta='{"pgurl":"https://videos.example.org/v/42","turl":"https://ts1.mm.bing.net/th?id=1"}'
+       vrhm='{"vt":"Deep Sea Creatures","du":"52:10","pgurl":"https://videos.example.org/v/42",
+              "murl":"https://videos.example.org/v/42"}'>card</div>
+  <div vrhm='{"vt":"The Coral Triangle","du":"1:12:46","murl":"https://www.youtube.com/watch?v=2pTGdH0A4Qs",
+              "smturl":"https://th.bing.com/th/id/OMB.2"}'>card</div>
+  <div vrhm='{"vt":"No page link","du":"1:00"}'>card</div>
+  <div vrhm='not json'>card</div>
+  <div vrhm='{"vt":"Deep Sea Creatures","du":"52:10","pgurl":"https://videos.example.org/v/42"}'>repeat</div>
+</body>"""
+
+
+def test_bing_results_read_each_cards_json_once():
+    results = bing_results(BING_PAGE, BING, "bing")
+
+    assert [(r.url, r.title, r.duration, r.thumbnail, r.source) for r in results] == [
+        ("https://videos.example.org/v/42", "Deep Sea Creatures", 3130.0, "https://ts1.mm.bing.net/th?id=1", "bing"),
+        ("https://www.youtube.com/watch?v=2pTGdH0A4Qs", "The Coral Triangle", 4366.0,
+         "https://th.bing.com/th/id/OMB.2", "bing"),
+    ]

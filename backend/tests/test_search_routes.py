@@ -112,7 +112,7 @@ async def test_default_sources_fall_back_to_ytdlp_when_the_browser_fails(monkeyp
 
 
 @pytest.mark.asyncio
-async def test_default_sources_add_both_engines_with_the_safe_search_setting(monkeypatch):
+async def test_default_sources_add_every_engine_with_the_safe_search_setting(monkeypatch):
     class Fetcher:
         def __init__(self, settings):
             pass
@@ -127,7 +127,7 @@ async def test_default_sources_add_both_engines_with_the_safe_search_setting(mon
     settings = type("S", (), {"search_safe_search": "off"})()
 
     async with sources_module.default_sources(settings)() as sources:
-        assert [s.name for s in sources] == ["youtube", "bilibili", "duckduckgo", "brave"]
+        assert [s.name for s in sources] == ["youtube", "bilibili", "duckduckgo", "brave", "bing"]
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

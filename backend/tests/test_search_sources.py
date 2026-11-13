@@ -5,8 +5,10 @@ import json
 import pytest
 
 from app.config import Settings
+from app.services.search.models import SearchResult
 from app.services.search.sources import (
     BrowserEngineSource,
+    bing_videos_url,
     SourceError,
     YtDlpSource,
     brave_videos_url,
@@ -60,6 +62,7 @@ async def test_ytdlp_source_maps_entries_and_pages_by_slicing():
     assert first.thumbnail == "https://i.example/4.jpg"
     assert first.snippet == "About video 4"
     assert first.source == "youtube"
+    assert first.is_video is True  # yt-dlp search only returns videos
 
 
 @pytest.mark.asyncio
@@ -124,3 +127,23 @@ async def test_url_paged_engines_load_the_page_url_without_scrolling():
     await BrowserEngineSource("brave", brave_videos_url, safe_search="off", fetcher=FakeFetcher()).search("q", page=2)
 
     assert fetches == [("https://search.brave.com/videos?q=q&safesearch=off&offset=1", 0)]
+
+
+def test_bing_urls_set_adult_filtering_to_the_safe_search_level():
+    assert bing_videos_url("deep sea", "off", 1) == "https://www.bing.com/videos/search?q=deep+sea&adlt=off"
+    assert bing_videos_url("deep sea", "strict", 3) == "https://www.bing.com/videos/search?q=deep+sea&adlt=strict"
+
+
+@pytest.mark.asyncio
+async def test_browser_sources_read_pages_with_their_own_parser():
+    class FakeFetcher:
+        async def fetch(self, url, scrolls):
+            return "<body>page</body>"
+
+    def parser(html, page_url, source):
+        return [SearchResult(url="https://v.example/1", title="One", source=source, duration=60.0),
+                SearchResult(url="https://v.example/2", title="No length", source=source)]
+
+    source = BrowserEngineSource("bing", bing_videos_url, safe_search="off", fetcher=FakeFetcher(), parser=parser)
+
+    assert [r.url for r in await source.search("q", page=1)] == ["https://v.example/1"]

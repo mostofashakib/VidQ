@@ -7,10 +7,12 @@ containers, and every attribute except links, titles and (on request) image
 sources.
 `harvest_results` turns an engine's result page into SearchResults by
 following its outbound links, so it does not depend on the engine's markup.
+`bing_results` reads engines that keep each result card in a JSON attribute.
 """
 
 from __future__ import annotations
 
+import json
 import re
 from urllib.parse import urljoin, urlparse
 
@@ -162,3 +164,35 @@ def harvest_results(html: str, page_url: str, source: str) -> list[SearchResult]
             snippet=text.replace(title, "", 1).strip()[:_SNIPPET_CHARS],
         ))
     return results
+
+
+def _json_attr(tag: Tag, name: str) -> dict:
+    try:
+        value = json.loads(tag.get(name) or "")
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def bing_results(html: str, page_url: str, source: str) -> list[SearchResult]:
+    """
+    One SearchResult per Bing video card, in page order. Each card holds its
+    title, length and page link in a `vrhm` JSON attribute and its thumbnail
+    in `mmeta`. Cards without a page link and repeats are skipped.
+    """
+    results: dict[str, SearchResult] = {}
+    for card in BeautifulSoup(html, "html.parser").find_all(attrs={"vrhm": True}):
+        meta, media = _json_attr(card, "vrhm"), _json_attr(card, "mmeta")
+        url = meta.get("pgurl") or meta.get("murl") or ""
+        title = " ".join(str(meta.get("vt") or "").split())[:_TITLE_MAX_CHARS]
+        canonical = canonical_url(url) if url.startswith("http") else None
+        if not canonical or canonical in results or len(title) < _MIN_TITLE_CHARS:
+            continue
+        results[canonical] = SearchResult(
+            url=url,
+            title=title,
+            source=source,
+            duration=_parse_duration_seconds(meta.get("du")),
+            thumbnail=media.get("turl") or meta.get("smturl") or "",
+        )
+    return list(results.values())

@@ -1,4 +1,5 @@
 import logging
+import random
 from urllib.parse import quote
 
 import httpx
@@ -44,10 +45,14 @@ def _get_store():
         from app.services.search.agent import SearchAgent
         from app.services.search.sources import default_sources
         from app.services.search.store import SearchStore
+        from app.services.search.verify import VideoPageCheck
+        from app.services.scraper.playback import USER_AGENTS
         from app.state import llm_manager
 
         open_sources = default_sources(get_settings())
-        _store = SearchStore(agent_factory=lambda: SearchAgent(llm_manager, open_sources, matcher=_matcher))
+        _store = SearchStore(agent_factory=lambda: SearchAgent(
+            llm_manager, open_sources, matcher=_matcher, verifier=VideoPageCheck(random.choice(USER_AGENTS)),
+        ))
     return _store
 
 

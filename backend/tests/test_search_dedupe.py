@@ -93,15 +93,17 @@ def test_dedupe_skips_results_already_seen_in_earlier_pages():
     assert [r.url for r in fresh] == ["https://example.com/v/new"]
 
 
-def test_dedupe_counts_how_often_each_video_was_found():
-    items = [
-        result("https://youtu.be/2pTGdH0A4Qs", source="ytsearch"),
-        result("https://www.youtube.com/watch?v=2pTGdH0A4Qs", source="engine"),
-        result("https://www.youtube.com/shorts/2pTGdH0A4Qs", source="engine"),
-        result("https://example.com/v/1", title="Other video"),
-    ]
+def test_dedupe_adds_up_the_votes_of_every_copy_of_a_video():
+    import dataclasses
 
-    assert [r.hits for r in dedupe(items)] == [3, 1]
+    items = [dataclasses.replace(item, votes=votes) for item, votes in (
+        (result("https://youtu.be/2pTGdH0A4Qs", source="ytsearch"), 0.5),
+        (result("https://www.youtube.com/watch?v=2pTGdH0A4Qs", source="engine"), 0.25),
+        (result("https://www.youtube.com/shorts/2pTGdH0A4Qs", source="engine"), 0.125),
+        (result("https://example.com/v/1", title="Other video"), 0.1),
+    )]
+
+    assert [r.votes for r in dedupe(items)] == [0.875, 0.1]
 
 
 def test_same_title_uploads_on_one_site_are_different_videos_not_mirrors():
@@ -139,3 +141,12 @@ def test_titles_sharing_few_words_or_lengths_apart_are_different_videos():
                           duration=700.0)
 
     assert len(dedupe([base, loose, other_length])) == 3
+
+
+def test_a_video_confirmed_by_any_source_stays_confirmed_after_merging():
+    import dataclasses
+
+    found_by_engine = result("https://www.youtube.com/watch?v=2pTGdH0A4Qs", source="engine")
+    found_by_ytdlp = dataclasses.replace(result("https://youtu.be/2pTGdH0A4Qs", source="ytsearch"), is_video=True)
+
+    assert [r.is_video for r in dedupe([found_by_engine, found_by_ytdlp])] == [True]
