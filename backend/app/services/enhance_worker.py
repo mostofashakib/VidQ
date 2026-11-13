@@ -40,9 +40,11 @@ _pool_state = WorkerPoolState()
 
 
 class EnhanceJob:
-    def __init__(self, job_id: str, input_path: str):
+    def __init__(self, job_id: str, input_path: str, title: Optional[str] = None, cleanup_input: bool = True):
         self.job_id = job_id
         self.input_path = input_path
+        self.title = title
+        self.cleanup_input = cleanup_input
         self.status = "queued"   # queued | processing | done | failed | cancelled
         self.phase = "queued"    # queued | splitting | enhancing N/M | assembling | done
         self.progress: int = 0
@@ -169,7 +171,7 @@ def _worker_loop() -> None:
                 jobs=_jobs,
                 lock=_lock,
                 logger=logger,
-                cleanup_cancelled=lambda job: cleanup_paths([job.input_path]) if job else None,
+                cleanup_cancelled=lambda job: cleanup_paths([job.input_path]) if (job and getattr(job, "cleanup_input", True)) else None,
                 picked_message=lambda job: f"[{job.job_id}] Worker picked up enhance job",
                 process=lambda job: _process_job(job.job_id),
                 acquire_global_slot=False,
@@ -211,10 +213,10 @@ def cancel_job(job_id: str) -> bool:
     return True
 
 
-def start_enhance_job(input_path: str) -> str:
+def start_enhance_job(input_path: str, title: Optional[str] = None, cleanup_input: bool = True) -> str:
     _ensure_pool()
     job_id = new_job_id()
-    job = EnhanceJob(job_id=job_id, input_path=input_path)
+    job = EnhanceJob(job_id=job_id, input_path=input_path, title=title, cleanup_input=cleanup_input)
     enqueue_registered_job(_jobs, _lock, _task_queue, job)
     logger.info(f"[{job_id}] Queued enhance job")
     return job_id
@@ -742,6 +744,22 @@ def _process_job(job_id: str) -> None:
             job.phase = "done"
         logger.info(f"[{job_id}] Done: {out_filename}")
 
+        if job.title:
+            try:
+                from app.db import SessionLocal, Video
+                with SessionLocal() as db:
+                    v = Video(
+                        url=result_url.strip().lower(),
+                        category="enhanced",
+                        title=f"{job.title} (Upscaled)",
+                        duration=duration,
+                        source="enhance",
+                    )
+                    db.add(v)
+                    db.commit()
+            except Exception as exc:
+                logger.warning(f"Could not save enhanced video to DB: {exc}")
+
     except _CancelledError:
         logger.info(f"[{job_id}] Cancelled")
         cleanup_paths([out_path])
@@ -755,4 +773,5 @@ def _process_job(job_id: str) -> None:
 
     finally:
         shutil.rmtree(tmp_base, ignore_errors=True)
-        cleanup_paths([job.input_path])
+        if getattr(job, "cleanup_input", True):
+            cleanup_paths([job.input_path])

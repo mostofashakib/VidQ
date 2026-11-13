@@ -75,6 +75,7 @@ interface UseJobPollingOptions<TData extends { status: string }, TJob extends Po
   pollRefs: MutableRefObject<Map<string, ReturnType<typeof setInterval>>>;
   getJob: (token: string, jobId: string) => Promise<TData>;
   intervalMs?: number;
+  onStatusChange?: (localId: string, data: TData) => void;
 }
 
 export function useJobPolling<TData extends { status: string }, TJob extends PollableJob<TData>>({
@@ -84,6 +85,7 @@ export function useJobPolling<TData extends { status: string }, TJob extends Pol
   pollRefs,
   getJob,
   intervalMs = 2000,
+  onStatusChange,
 }: UseJobPollingOptions<TData, TJob>) {
   const updateJob = useCallback(
     (localId: string, patch: Partial<TJob>) => {
@@ -117,17 +119,27 @@ export function useJobPolling<TData extends { status: string }, TJob extends Pol
         try {
           const data = await getJob(token, jobId);
           updateJob(localId, { data } as Partial<TJob>);
+          onStatusChange?.(localId, data);
           if (isTerminalStatus(data.status)) {
             stopPolling(localId);
             if (data.status === "cancelled") removeJob(localId);
           }
-        } catch {
-          // ignore transient poll errors
+        } catch (err: unknown) {
+          const status = (err as { response?: { status?: number } })?.response?.status;
+          if (status === 404) {
+            stopPolling(localId);
+            updateJob(localId, {
+              data: {
+                status: "failed",
+                error: "Job not found on server",
+              },
+            } as unknown as Partial<TJob>);
+          }
         }
       }, intervalMs);
       pollRefs.current.set(localId, intervalId);
     },
-    [getJob, intervalMs, pollRefs, removeJob, stopPolling, token, updateJob],
+    [getJob, intervalMs, onStatusChange, pollRefs, removeJob, stopPolling, token, updateJob],
   );
 
   const cancelLocalJob = useCallback(

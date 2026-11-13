@@ -4,7 +4,14 @@ import { useEffect, useState, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "./auth-context";
 import { useJobs, type DownloadJob } from "./jobs-context";
-import { downloadBlob, queuedDownloadRows, videoDownloadName } from "./job-utils";
+import {
+  downloadBlob,
+  queuedDownloadRows,
+  videoDownloadName,
+  createLocalId,
+  useJobPolling,
+  triggerFileDownload,
+} from "./job-utils";
 import {
   addVideo,
   listVideos,
@@ -14,6 +21,14 @@ import {
   getQueueStatus,
   cancelJob,
   downloadVideo,
+  startEnhanceForVideo,
+  startTranslateForVideo,
+  cancelEnhanceJob,
+  cancelTranslateJob,
+  getEnhanceJob,
+  getTranslateJob,
+  type EnhanceJobData,
+  type TranslateJobData,
 } from "./api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -32,7 +47,7 @@ import {
   CardFooter,
 } from "@/components/ui/card";
 import Image from "next/image";
-import { Trash, Download, Check, X, Loader2, Trash2 } from "lucide-react";
+import { Trash, Download, Check, X, Loader2, Trash2, Captions, Sparkles, Clock } from "lucide-react";
 import Navbar from "@/components/Navbar";
 
 interface Video {
@@ -52,6 +67,35 @@ function phaseMessage(phase?: string): string {
     case "heavy_pass_waiting": return "Loading video player…";
     case "heavy_pass_recording": return "Recording video stream…";
     default: return "Processing video…";
+  }
+}
+
+function translatePhaseMessage(data: TranslateJobData): string {
+  if (data.status === "queued") return "Waiting in queue…";
+  if (data.status === "done") return "Subtitled video ready!";
+  if (data.status === "failed") return data.error || "Subtitling failed";
+  switch (data.phase) {
+    case "extracting_audio": return "Extracting audio…";
+    case "transcribing": return "Transcribing with Whisper…";
+    case "translating": return data.total_chunks > 0 ? `Translating (${data.chunk_index}/${data.total_chunks})…` : "Translating…";
+    case "burning": return `Burning subtitles… ${data.overall_progress}%`;
+    default: return "Processing subtitles…";
+  }
+}
+
+function enhancePhaseMessage(data: EnhanceJobData): string {
+  if (data.status === "queued") return "Queued for upscale…";
+  if (data.status === "done") return "Upscaled video ready!";
+  if (data.status === "failed") return data.error || "Upscale failed";
+  switch (data.phase) {
+    case "splitting": return "Splitting video into chunks…";
+    case "assembling": return "Assembling final video…";
+    default:
+      if (data.phase.startsWith("enhancing")) {
+        const chunk = data.phase.split(" ")[1] ?? "1/1";
+        return `Upscaling chunk ${chunk} — ${data.progress}%`;
+      }
+      return `Upscaling video… ${data.progress}%`;
   }
 }
 
@@ -128,7 +172,9 @@ export default function HomePage() {
   const { token, loading } = useAuth();
   const router = useRouter();
   const [videos, setVideos] = useState<Video[]>([]);
+  const [videoMeta, setVideoMeta] = useState<Record<number, { width: number; height: number }>>({});
   const [url, setUrl] = useState("");
+  const [actionPendingId, setActionPendingId] = useState<number | null>(null);
   const [error, setError] = useState("");
   const [hasMore, setHasMore] = useState(true);
   const [deleteId, setDeleteId] = useState<number | null>(null);
@@ -137,7 +183,16 @@ export default function HomePage() {
   const [downloadingAll, setDownloadingAll] = useState(false);
   const loaderRef = useRef<HTMLDivElement | null>(null);
   const [fetching, setFetching] = useState(false);
-  const { downloads, setDownloads } = useJobs();
+  const {
+    downloads,
+    setDownloads,
+    enhanceJobs,
+    setEnhanceJobs,
+    enhancePollRefs,
+    translateJobs,
+    setTranslateJobs,
+    translatePollRefs,
+  } = useJobs();
   const downloadsRef = useRef<DownloadJob[]>([]);
 
   // Keep ref in sync so polling interval always sees latest state
@@ -165,6 +220,125 @@ export default function HomePage() {
       }
     },
     [token, videos.length]
+  );
+
+  const {
+    updateJob: updateEnhanceJob,
+    startPolling: startEnhancePolling,
+    cancelLocalJob: cancelLocalEnhanceJob,
+    removeJob: removeEnhanceJob,
+  } = useJobPolling({
+    token,
+    jobs: enhanceJobs,
+    setJobs: setEnhanceJobs,
+    pollRefs: enhancePollRefs,
+    getJob: getEnhanceJob,
+    intervalMs: 2500,
+    onStatusChange: (_id, data) => {
+      if (data.status === "done") {
+        fetchMoreVideos(true);
+      }
+    },
+  });
+
+  const {
+    updateJob: updateTranslateJob,
+    startPolling: startTranslatePolling,
+    cancelLocalJob: cancelLocalTranslateJob,
+    removeJob: removeTranslateJob,
+  } = useJobPolling({
+    token,
+    jobs: translateJobs,
+    setJobs: setTranslateJobs,
+    pollRefs: translatePollRefs,
+    getJob: getTranslateJob,
+    intervalMs: 2500,
+    onStatusChange: (_id, data) => {
+      if (data.status === "done") {
+        fetchMoreVideos(true);
+      }
+    },
+  });
+
+  const handleStartSubtitle = useCallback(
+    async (targetVideo: { id: number; title?: string }) => {
+      if (!token) return;
+      setActionPendingId(targetVideo.id);
+      const localId = createLocalId();
+      const initialData: TranslateJobData = {
+        job_id: "",
+        filename: targetVideo.title || `video_${targetVideo.id}`,
+        status: "queued",
+        phase: "queued",
+        overall_progress: 0,
+        chunk_index: 0,
+        total_chunks: 0,
+      };
+
+      setTranslateJobs((prev) => [
+        ...prev,
+        {
+          localId,
+          filename: initialData.filename,
+          uploadProgress: 100,
+          jobId: "",
+          data: initialData,
+        },
+      ]);
+
+      try {
+        const data = await startTranslateForVideo(token, targetVideo.id);
+        updateTranslateJob(localId, { jobId: data.job_id, data });
+        startTranslatePolling(localId, data.job_id);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Failed to start subtitle pipeline";
+        updateTranslateJob(localId, {
+          data: { ...initialData, status: "failed", error: msg },
+        });
+      } finally {
+        setActionPendingId(null);
+      }
+    },
+    [token, setTranslateJobs, updateTranslateJob, startTranslatePolling]
+  );
+
+  const handleStartUpscale = useCallback(
+    async (targetVideo: { id: number; title?: string }) => {
+      if (!token) return;
+      setActionPendingId(targetVideo.id);
+      const localId = createLocalId();
+      const initialData: EnhanceJobData = {
+        job_id: "",
+        status: "queued",
+        phase: "queued",
+        progress: 0,
+      };
+
+      setEnhanceJobs((prev) => [
+        ...prev,
+        {
+          localId,
+          filename: targetVideo.title || `video_${targetVideo.id}`,
+          uploadProgress: 100,
+          jobId: "",
+          data: initialData,
+        },
+      ]);
+
+      try {
+        const data = await startEnhanceForVideo(token, targetVideo.id);
+        updateEnhanceJob(localId, { jobId: data.job_id, data });
+        startEnhancePolling(localId, data.job_id);
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : "Failed to start upscale pipeline";
+        updateEnhanceJob(localId, {
+          data: { ...initialData, status: "failed", error: msg },
+        });
+      } finally {
+        setActionPendingId(null);
+      }
+    },
+    [token, setEnhanceJobs, updateEnhanceJob, startEnhancePolling]
   );
 
   useEffect(() => {
@@ -246,8 +420,27 @@ export default function HomePage() {
                 )
               );
             }
-          } catch (err) {
-            console.error("Polling error for job", job.jobId, err);
+          } catch (err: unknown) {
+            const status = (err as { response?: { status?: number } })?.response?.status;
+            if (status === 404) {
+              setDownloads((prev) =>
+                prev.map((d) =>
+                  d.localId === job.localId
+                    ? {
+                        ...d,
+                        status: "failed",
+                        message: "Job expired or not found",
+                        errorDetail: "The download job is no longer available on the server.",
+                      }
+                    : d
+                )
+              );
+              setTimeout(() => {
+                setDownloads((prev) => prev.filter((d) => d.localId !== job.localId));
+              }, 4000);
+            } else {
+              console.error("Polling error for job", job.jobId, err);
+            }
           }
         })
       );
@@ -257,7 +450,7 @@ export default function HomePage() {
     const interval = setInterval(pollActiveJobs, 1000);
 
     return () => clearInterval(interval);
-  }, [token, hasActiveQueueJobs, fetchMoreVideos, setDownloads]);
+  }, [token, hasActiveQueueJobs, fetchMoreVideos, setDownloads, handleStartSubtitle, handleStartUpscale]);
 
   useEffect(() => {
     if (!token) return;
@@ -297,7 +490,13 @@ export default function HomePage() {
 
     setDownloads((prev) => [
       ...prev,
-      { localId, url: submittedUrl, status: "extracting", message: "Extracting video metadata...", abortController: controller },
+      {
+        localId,
+        url: submittedUrl,
+        status: "extracting",
+        message: "Extracting video metadata...",
+        abortController: controller,
+      },
     ]);
 
     try {
@@ -319,7 +518,11 @@ export default function HomePage() {
 
         if (res.job_id) {
           setDownloads((prev) =>
-            prev.flatMap((d) => (d.localId === localId ? queuedDownloadRows(d, res) : [d]))
+            prev.flatMap((d) =>
+              d.localId === localId
+                ? queuedDownloadRows(d, res)
+                : [d]
+            )
           );
           return;
         }
@@ -431,9 +634,10 @@ export default function HomePage() {
     );
   }
 
-  const activeCount = downloads.filter(
-    (d) => d.status !== "done" && d.status !== "failed"
-  ).length;
+  const activeCount =
+    downloads.filter((d) => d.status !== "done" && d.status !== "failed" && d.status !== "cancelled").length +
+    translateJobs.filter((tj) => tj.data.status !== "done" && tj.data.status !== "failed").length +
+    enhanceJobs.filter((ej) => ej.data.status !== "done" && ej.data.status !== "failed").length;
 
   return (
     <div className="min-h-screen text-white pb-20">
@@ -442,31 +646,33 @@ export default function HomePage() {
       <div className="max-w-6xl mx-auto px-4 sm:px-6">
         {/* Add Video Form */}
         <div className="glass-panel p-6 md:p-8 rounded-4xl mb-8 shadow-2xl shadow-purple-500/5 transform transition-all hover:scale-[1.01] duration-500">
-          <form onSubmit={handleAddVideo} className="flex flex-col sm:flex-row gap-4">
-            <Input
-              placeholder="Video URL (YouTube, Vimeo, etc)"
-              value={url}
-              onChange={(e) => setUrl(e.target.value)}
-              onPaste={handlePaste}
-              className="flex-1 bg-white/5 border-white/10 focus-visible:ring-indigo-500 rounded-xl h-14 text-white placeholder:text-gray-400 px-5 text-base"
-            />
-            <Button
-              type="submit"
-              disabled={!url}
-              className="sm:w-auto w-full h-14 px-8 font-semibold rounded-xl bg-linear-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 transition-all border-none shadow-lg shadow-indigo-500/25 text-white disabled:opacity-50"
-            >
-              Add Video
-            </Button>
+          <form onSubmit={handleAddVideo} className="flex flex-col gap-4">
+            <div className="flex flex-col sm:flex-row gap-4">
+              <Input
+                placeholder="Video URL (YouTube, Vimeo, etc)"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                onPaste={handlePaste}
+                className="flex-1 bg-white/5 border-white/10 focus-visible:ring-indigo-500 rounded-xl h-14 text-white placeholder:text-gray-400 px-5 text-base"
+              />
+              <Button
+                type="submit"
+                disabled={!url}
+                className="sm:w-auto w-full h-14 px-8 font-semibold rounded-xl bg-linear-to-r from-indigo-500 to-purple-600 hover:from-indigo-400 hover:to-purple-500 transition-all border-none shadow-lg shadow-indigo-500/25 text-white disabled:opacity-50 cursor-pointer"
+              >
+                Add Video
+              </Button>
+            </div>
           </form>
         </div>
 
         {error && <div className="text-red-500 mb-4">{error}</div>}
 
-        {/* Downloads Dashboard */}
-        {downloads.length > 0 && (
+        {/* Downloads & Pipelines Dashboard */}
+        {(downloads.length > 0 || translateJobs.length > 0 || enhanceJobs.length > 0) && (
           <div className="mb-10">
             <div className="flex items-center gap-3 mb-4">
-              <h2 className="text-base font-semibold text-white">Downloads</h2>
+              <h2 className="text-base font-semibold text-white">Active Pipelines & Downloads</h2>
               {activeCount > 0 && (
                 <span className="flex items-center gap-1.5 text-xs text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-1 rounded-full">
                   <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" />
@@ -632,6 +838,196 @@ export default function HomePage() {
                   )}
                 </div>
               ))}
+
+              {/* Translate Jobs (Auto-subtitle pipeline) */}
+              {translateJobs.map((tj) => (
+                <div
+                  key={tj.localId}
+                  className={`glass-panel px-5 py-4 rounded-2xl border flex items-center gap-4 transition-all ${
+                    tj.data.status === "done"
+                      ? "border-green-500/25"
+                      : tj.data.status === "failed"
+                      ? "border-red-500/40 bg-red-500/5"
+                      : "border-purple-500/30 bg-purple-500/5"
+                  }`}
+                >
+                  <div className="shrink-0">
+                    {tj.data.status === "done" ? (
+                      <div className="w-8 h-8 rounded-full bg-green-500/15 flex items-center justify-center">
+                        <Check className="w-4 h-4 text-green-400" />
+                      </div>
+                    ) : tj.data.status === "failed" ? (
+                      <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
+                        <X className="w-4 h-4 text-red-400" />
+                      </div>
+                    ) : (
+                      <div className="w-8 h-8 rounded-full bg-purple-500/15 flex items-center justify-center">
+                        <Loader2 className="w-4 h-4 text-purple-400 animate-spin" />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30 flex items-center gap-1">
+                        <Captions className="w-3 h-3" /> Auto-Subtitle
+                      </span>
+                      <p className="text-sm font-medium text-white truncate">
+                        {tj.filename}
+                      </p>
+                    </div>
+                    <p
+                      className={`text-xs mt-1 ${
+                        tj.data.status === "done"
+                          ? "text-green-400"
+                          : tj.data.status === "failed"
+                          ? "text-red-400"
+                          : "text-purple-300"
+                      }`}
+                    >
+                      {translatePhaseMessage(tj.data)}
+                    </p>
+                    {tj.data.status !== "done" && tj.data.status !== "failed" && (
+                      <div className="w-full h-1 rounded-full overflow-hidden mt-2 bg-white/5">
+                        <div
+                          className="h-full bg-purple-500 rounded-full transition-all duration-500"
+                          style={{ width: `${Math.max(8, tj.data.overall_progress || 0)}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {tj.data.status === "done" && tj.data.result_url && (
+                    <button
+                      title="Download Subtitled Video"
+                      onClick={() =>
+                        triggerFileDownload(
+                          tj.data.result_url!,
+                          `${tj.filename.replace(/\.[^/.]+$/, "")}_subtitled.mp4`
+                        )
+                      }
+                      className="shrink-0 p-2 rounded-xl bg-green-500/10 text-green-400 hover:bg-green-500 hover:text-white transition-all border border-green-500/20 cursor-pointer"
+                    >
+                      <Download className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {tj.data.status !== "done" && tj.data.status !== "failed" && (
+                    <button
+                      title="Cancel"
+                      onClick={() => cancelLocalTranslateJob(tj.localId, cancelTranslateJob)}
+                      className="shrink-0 text-orange-400 hover:text-white transition-colors ml-1 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {(tj.data.status === "done" || tj.data.status === "failed") && (
+                    <button
+                      title="Dismiss"
+                      onClick={() => removeTranslateJob(tj.localId)}
+                      className="shrink-0 text-gray-500 hover:text-white transition-colors ml-1 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
+
+              {/* Enhance Jobs (Upscale pipeline) */}
+              {enhanceJobs.map((ej) => (
+                <div
+                  key={ej.localId}
+                  className={`glass-panel px-5 py-4 rounded-2xl border flex items-center gap-4 transition-all ${
+                    ej.data.status === "done"
+                      ? "border-green-500/25"
+                      : ej.data.status === "failed"
+                      ? "border-red-500/40 bg-red-500/5"
+                      : "border-indigo-500/30 bg-indigo-500/5"
+                  }`}
+                >
+                  <div className="shrink-0">
+                    {ej.data.status === "done" ? (
+                      <div className="w-8 h-8 rounded-full bg-green-500/15 flex items-center justify-center">
+                        <Check className="w-4 h-4 text-green-400" />
+                      </div>
+                    ) : ej.data.status === "failed" ? (
+                      <div className="w-8 h-8 rounded-full bg-red-500/15 flex items-center justify-center">
+                        <X className="w-4 h-4 text-red-400" />
+                      </div>
+                    ) : (
+                      <div className="w-8 h-8 rounded-full bg-indigo-500/15 flex items-center justify-center">
+                        <Loader2 className="w-4 h-4 text-indigo-400 animate-spin" />
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 flex items-center gap-1">
+                        <Sparkles className="w-3 h-3" /> Upscale
+                      </span>
+                      <p className="text-sm font-medium text-white truncate">
+                        {ej.filename}
+                      </p>
+                    </div>
+                    <p
+                      className={`text-xs mt-1 ${
+                        ej.data.status === "done"
+                          ? "text-green-400"
+                          : ej.data.status === "failed"
+                          ? "text-red-400"
+                          : "text-indigo-300"
+                      }`}
+                    >
+                      {enhancePhaseMessage(ej.data)}
+                    </p>
+                    {ej.data.status !== "done" && ej.data.status !== "failed" && (
+                      <div className="w-full h-1 rounded-full overflow-hidden mt-2 bg-white/5">
+                        <div
+                          className="h-full bg-indigo-500 rounded-full transition-all duration-500"
+                          style={{ width: `${Math.max(8, ej.data.progress || 0)}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+
+                  {ej.data.status === "done" && ej.data.result_url && (
+                    <button
+                      title="Download Upscaled Video"
+                      onClick={() =>
+                        triggerFileDownload(
+                          ej.data.result_url!,
+                          `${ej.filename.replace(/\.[^/.]+$/, "")}_upscaled.mp4`
+                        )
+                      }
+                      className="shrink-0 p-2 rounded-xl bg-green-500/10 text-green-400 hover:bg-green-500 hover:text-white transition-all border border-green-500/20 cursor-pointer"
+                    >
+                      <Download className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {ej.data.status !== "done" && ej.data.status !== "failed" && (
+                    <button
+                      title="Cancel"
+                      onClick={() => cancelLocalEnhanceJob(ej.localId, cancelEnhanceJob)}
+                      className="shrink-0 text-orange-400 hover:text-white transition-colors ml-1 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+
+                  {(ej.data.status === "done" || ej.data.status === "failed") && (
+                    <button
+                      title="Dismiss"
+                      onClick={() => removeEnhanceJob(ej.localId)}
+                      className="shrink-0 text-gray-500 hover:text-white transition-colors ml-1 cursor-pointer"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  )}
+                </div>
+              ))}
             </div>
           </div>
         )}
@@ -669,84 +1065,214 @@ export default function HomePage() {
           {videos.length === 0 && !loading && (
             <div className="text-gray-500 col-span-3">No videos found.</div>
           )}
-          {videos.map((video) => (
-            <Card
-              key={`${video.id}-${video.url}`}
-              className="glass-panel overflow-hidden flex flex-col min-h-90 min-w-[320px] rounded-3xl border border-white/10 hover:border-indigo-500/30 shadow-xl hover:shadow-indigo-500/20 transform transition-all hover:-translate-y-2 duration-500 group bg-transparent"
-            >
-              {canRenderThumbnail(video.thumbnail) && (
-                <div className="w-full aspect-video relative overflow-hidden bg-black/40">
-                  <Image
-                    src={video.thumbnail}
-                    alt={video.title || "Video thumbnail"}
-                    fill
-                    className="object-cover group-hover:scale-105 transition-transform duration-700 ease-out opacity-90 group-hover:opacity-100"
-                    sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
-                    priority={true}
-                  />
-                  <div className="absolute inset-0 bg-linear-to-t from-black/80 via-transparent to-transparent" />
-                </div>
-              )}
-              <CardHeader className="pb-3 pt-5 relative z-10">
-                <CardTitle
-                  className="text-lg font-bold wrap-break-word whitespace-pre-line leading-tight truncate text-white drop-shadow-md"
-                  title={video.title}
-                >
-                  {video.title || "Untitled Video"}
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="flex-1 flex flex-col justify-between z-10 px-6">
-                <div className="mb-5 text-xs flex gap-2">
-                  {video.duration !== undefined && video.duration !== null && (
-                    <span className="inline-block px-3 py-1.5 bg-black/30 rounded-full text-gray-300 font-mono text-[10px] border border-white/5">
-                      {formatDuration(video.duration)}
-                    </span>
-                  )}
-                </div>
-                <div className="flex justify-between items-center rounded-xl overflow-hidden shadow-inner bg-black/40 relative group-hover:shadow-indigo-500/20 transition-all aspect-video">
-                  <video
-                    className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity duration-300"
-                    controls
-                    preload="metadata"
+          {videos.map((video) => {
+            const meta = videoMeta[video.id];
+            const metaHeight = meta?.height;
+            const isLowRes = metaHeight ? metaHeight < 720 : false;
+            const isEnhanced = video.category === "enhanced" || video.title?.includes("(Upscaled)");
+            const isSubtitled = video.category === "translated" || video.title?.includes("(Subtitled)");
+            const isForeign = /[^\x00-\x7F]/.test(video.title || "");
+            const titleMatch = video.title || `video_${video.id}`;
+            const isEnhancing =
+              actionPendingId === video.id ||
+              enhanceJobs.some(
+                (j) =>
+                  (j.filename.includes(titleMatch) || j.filename.includes(`video_${video.id}`)) &&
+                  j.data.status !== "done" &&
+                  j.data.status !== "failed"
+              );
+            const isTranslating =
+              actionPendingId === video.id ||
+              translateJobs.some(
+                (j) =>
+                  (j.filename.includes(titleMatch) || j.filename.includes(`video_${video.id}`)) &&
+                  j.data.status !== "done" &&
+                  j.data.status !== "failed"
+              );
+
+            return (
+              <Card
+                key={`${video.id}-${video.url}`}
+                className="glass-panel overflow-hidden flex flex-col min-h-90 min-w-[320px] rounded-3xl border border-white/10 hover:border-indigo-500/30 shadow-xl hover:shadow-indigo-500/20 transform transition-all hover:-translate-y-2 duration-500 group bg-transparent"
+              >
+                {canRenderThumbnail(video.thumbnail) && (
+                  <div className="w-full aspect-video relative overflow-hidden bg-black/40">
+                    <Image
+                      src={video.thumbnail}
+                      alt={video.title || "Video thumbnail"}
+                      fill
+                      className="object-cover group-hover:scale-105 transition-transform duration-700 ease-out opacity-90 group-hover:opacity-100"
+                      sizes="(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 33vw"
+                      priority={true}
+                    />
+                    <div className="absolute inset-0 bg-linear-to-t from-black/80 via-transparent to-transparent" />
+                  </div>
+                )}
+                <CardHeader className="pb-2 pt-5 relative z-10">
+                  <CardTitle
+                    className="text-lg font-bold wrap-break-word whitespace-pre-line leading-tight truncate text-white drop-shadow-md"
+                    title={video.title}
                   >
-                    <source src={video.url} type="video/mp4" />
-                    <source src={video.url} type="video/webm" />
-                    Your browser does not support the video tag.
-                  </video>
-                </div>
-              </CardContent>
-              <CardFooter className="flex justify-end gap-2 pt-0 pb-5 pr-6 z-10">
-                <Button
-                  variant="outline"
-                  size="icon"
-                  title="Download Video"
-                  onClick={async (e) => {
-                    e.stopPropagation();
-                    try {
-                      const blob = await downloadVideo(token!, video.id);
-                      downloadBlob(blob, videoDownloadName(video, "video"));
-                    } catch {
-                      window.open(video.url, "_blank");
-                    }
-                  }}
-                  className="h-10 w-10 p-0 rounded-full bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500 hover:text-white border border-indigo-500/20 transition-all shadow hover:shadow-indigo-500/40"
-                >
-                  <Download className="w-4 h-4" />
-                </Button>
-                <Button
-                  variant="destructive"
-                  size="icon"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDelete(video.id);
-                  }}
-                  className="h-10 w-10 p-0 rounded-full bg-red-500/10 text-red-400 hover:bg-red-500 hover:text-white border border-red-500/20 transition-all shadow hover:shadow-red-500/40"
-                >
-                  <Trash className="w-4 h-4" />
-                </Button>
-              </CardFooter>
-            </Card>
-          ))}
+                    {video.title || "Untitled Video"}
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="flex-1 flex flex-col justify-between z-10 px-6">
+                  {/* Smart Badges Row */}
+                  <div className="mb-4 flex flex-wrap items-center gap-1.5">
+                    {/* 1. Resolution / Upscale Smart Badge */}
+                    {isEnhanced ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-semibold tracking-wide uppercase bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shadow-xs shadow-emerald-500/20">
+                        <Sparkles className="w-3 h-3 text-emerald-400" />
+                        Enhanced HD
+                      </span>
+                    ) : isEnhancing ? (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium bg-indigo-500/20 text-indigo-200 border border-indigo-500/40 animate-pulse">
+                        <Loader2 className="w-3 h-3 text-indigo-400 animate-spin" />
+                        Upscaling…
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        title={
+                          isLowRes
+                            ? `Low resolution (${metaHeight}p). Click to upscale to HD with Real-ESRGAN`
+                            : "Click to upscale video quality with Real-ESRGAN"
+                        }
+                        disabled={actionPendingId === video.id || isEnhancing}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleStartUpscale(video);
+                        }}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium transition-all cursor-pointer border ${
+                          isLowRes
+                            ? "bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 border-amber-500/40 hover:border-amber-400 shadow-sm shadow-amber-500/20 hover:scale-[1.03]"
+                            : "bg-white/5 hover:bg-white/10 text-gray-300 border-white/10 hover:border-indigo-400/50 hover:text-indigo-300"
+                        }`}
+                      >
+                        <Sparkles
+                          className={`w-3 h-3 ${isLowRes ? "text-amber-400 animate-pulse" : "text-gray-400"}`}
+                        />
+                        <span>
+                          {metaHeight ? `${metaHeight}p` : "Web"} · {isLowRes ? "Upscale to HD" : "Upscale"}
+                        </span>
+                      </button>
+                    )}
+
+                    {/* 2. Subtitles / Language Smart Badge */}
+                    {isSubtitled ? (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-semibold tracking-wide uppercase bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 shadow-xs shadow-emerald-500/20">
+                        <Check className="w-3 h-3 text-emerald-400" />
+                        Subtitled (EN)
+                      </span>
+                    ) : isTranslating ? (
+                      <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium bg-purple-500/20 text-purple-200 border border-purple-500/40 animate-pulse">
+                        <Loader2 className="w-3 h-3 text-purple-400 animate-spin" />
+                        Subtitling…
+                      </span>
+                    ) : (
+                      <button
+                        type="button"
+                        title={
+                          isForeign
+                            ? "Non-English audio detected. Click to auto-generate English subtitles with Whisper"
+                            : "Auto-transcribe & burn English subtitles with Whisper"
+                        }
+                        disabled={actionPendingId === video.id || isTranslating}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          handleStartSubtitle(video);
+                        }}
+                        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[10px] font-medium transition-all cursor-pointer border ${
+                          isForeign
+                            ? "bg-purple-500/20 hover:bg-purple-500/30 text-purple-300 border-purple-500/40 hover:border-purple-400 shadow-sm shadow-purple-500/20 hover:scale-[1.03]"
+                            : "bg-white/5 hover:bg-white/10 text-gray-300 border-white/10 hover:border-purple-400/50 hover:text-purple-300"
+                        }`}
+                      >
+                        <Captions
+                          className={`w-3 h-3 ${isForeign ? "text-purple-400 animate-pulse" : "text-gray-400"}`}
+                        />
+                        <span>{isForeign ? "Foreign · Add Subtitles" : "Add Subtitles"}</span>
+                      </button>
+                    )}
+
+                    {/* 3. Duration Badge */}
+                    {video.duration !== undefined && video.duration !== null && (
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 bg-black/40 rounded-full text-gray-400 font-mono text-[10px] border border-white/5 ml-auto">
+                        <Clock className="w-2.5 h-2.5 text-gray-500" />
+                        {formatDuration(video.duration)}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex justify-between items-center rounded-xl overflow-hidden shadow-inner bg-black/40 relative group-hover:shadow-indigo-500/20 transition-all aspect-video">
+                    <video
+                      className="w-full h-full object-cover opacity-70 group-hover:opacity-100 transition-opacity duration-300"
+                      controls
+                      preload="metadata"
+                      onLoadedMetadata={(e) => {
+                        const el = e.currentTarget;
+                        if (el.videoHeight) {
+                          setVideoMeta((prev) =>
+                            prev[video.id]?.height === el.videoHeight
+                              ? prev
+                              : { ...prev, [video.id]: { width: el.videoWidth, height: el.videoHeight } }
+                          );
+                        }
+                      }}
+                    >
+                      <source src={video.url} type="video/mp4" />
+                      <source src={video.url} type="video/webm" />
+                      Your browser does not support the video tag.
+                    </video>
+                  </div>
+                </CardContent>
+                <CardFooter className="flex justify-between items-center gap-2 pt-0 pb-5 px-6 z-10">
+                  <div className="text-[11px] text-gray-400">
+                    {isEnhanced && isSubtitled ? (
+                      <span className="text-emerald-400/90 font-medium">Fully Polished</span>
+                    ) : isEnhanced ? (
+                      <span className="text-indigo-300/80">Upscaled Video</span>
+                    ) : isSubtitled ? (
+                      <span className="text-purple-300/80">Subtitled Video</span>
+                    ) : (
+                      <span className="text-gray-500">Original Web Download</span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    <Button
+                      variant="outline"
+                      size="icon"
+                      title="Download Video File"
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          const blob = await downloadVideo(token!, video.id);
+                          downloadBlob(blob, videoDownloadName(video, "video"));
+                        } catch {
+                          window.open(video.url, "_blank");
+                        }
+                      }}
+                      className="h-9 w-9 p-0 rounded-full bg-white/5 text-gray-300 hover:bg-white/15 hover:text-white border border-white/10 transition-all shadow hover:shadow-indigo-500/20 cursor-pointer"
+                    >
+                      <Download className="w-4 h-4" />
+                    </Button>
+                    <Button
+                      variant="destructive"
+                      size="icon"
+                      title="Delete Video"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleDelete(video.id);
+                      }}
+                      className="h-9 w-9 p-0 rounded-full bg-red-500/10 text-red-400 hover:bg-red-500 hover:text-white border border-red-500/20 transition-all shadow hover:shadow-red-500/40 cursor-pointer"
+                    >
+                      <Trash className="w-4 h-4" />
+                    </Button>
+                  </div>
+                </CardFooter>
+              </Card>
+            );
+          })}
         </div>
         <div ref={loaderRef} className="h-8" />
 

@@ -2,8 +2,6 @@
 
 VidQ finds and downloads any video with AI agents, then lets you edit it locally. It searches, downloads, converts, combines, translates, trims and enhances videos from one self-hosted web app.
 
-It's for people who want a private video workstation they clone, run and use without digging through dependency docs.
-
 ## Install
 
 You need:

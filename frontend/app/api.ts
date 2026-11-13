@@ -297,6 +297,16 @@ export async function cancelTranslateJob(token: string, jobId: string): Promise<
   });
 }
 
+export async function startTranslateForVideo(
+  token: string,
+  videoId: number,
+): Promise<TranslateJobData> {
+  const res = await axios.post(`${API_URL}/videos/${videoId}/translate`, {}, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
+}
+
 // ── Trim ───────────────────────────────────────────────────────────────────
 
 export interface TrimJobData {
@@ -382,4 +392,14 @@ export async function cancelEnhanceJob(token: string, jobId: string): Promise<vo
   await axios.delete(`${API_URL}/enhance-jobs/${jobId}`, {
     headers: { Authorization: `Bearer ${token}` },
   });
+}
+
+export async function startEnhanceForVideo(
+  token: string,
+  videoId: number,
+): Promise<EnhanceJobData> {
+  const res = await axios.post(`${API_URL}/videos/${videoId}/enhance`, {}, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return res.data;
 }

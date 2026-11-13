@@ -157,6 +157,39 @@ def test_enhance_job_not_found(client):
     assert r.status_code == 404
 
 
+def test_enhance_video_by_id_not_found(client):
+    r = client.post("/videos/99999/enhance", headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_enhance_video_by_id_success(client, db_session):
+    from unittest.mock import patch
+    from app.config import get_settings
+    from app.db import Video
+    settings = get_settings()
+    test_file = os.path.join(settings.temp_storage_dir, "test_enhance_video.mp4")
+    with open(test_file, "wb") as f:
+        f.write(_fake_mp4())
+
+    v = Video(
+        url=f"{settings.base_url}/temp_storage/test_enhance_video.mp4",
+        title="Sample Video",
+        category="download",
+    )
+    db_session.add(v)
+    db_session.commit()
+    db_session.refresh(v)
+
+    with patch("app.routers.enhance.start_enhance_job", return_value="mock-job-id") as mock_start:
+        r = client.post(f"/videos/{v.id}/enhance", headers=AUTH)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "queued"
+        assert data["job_id"] == "mock-job-id"
+        mock_start.assert_called_once_with(test_file, title="Sample Video", cleanup_input=False)
+
+
+
 def test_cancel_enhance_job_not_found(client):
     r = client.delete("/enhance-jobs/nonexistent-id", headers=AUTH)
     assert r.status_code == 404

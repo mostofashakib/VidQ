@@ -41,9 +41,11 @@ _NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)\s*\|\s?(.*)$")
 
 
 class TranslateJob:
-    def __init__(self, job_id: str, filename: str):
+    def __init__(self, job_id: str, filename: str, save_to_db: bool = False, cleanup_input: bool = True):
         self.job_id = job_id
         self.filename = filename
+        self.save_to_db = save_to_db
+        self.cleanup_input = cleanup_input
         self.status = "queued"  # queued | processing | done | failed | cancelled
         self.error: Optional[str] = None
         self.phase = "queued"  # queued | extracting_audio | transcribing | translating | burning
@@ -74,7 +76,7 @@ def _worker_loop() -> None:
                 jobs=_jobs,
                 lock=_lock,
                 logger=logger,
-                cleanup_cancelled=lambda job: cleanup_paths([file_path]),
+                cleanup_cancelled=lambda job: cleanup_paths([file_path]) if (job and getattr(job, "cleanup_input", True)) else None,
                 picked_message=lambda job: f"[{job.job_id}] Worker picked up {original_name}",
                 process=lambda job: _process_job(job.job_id, file_path, original_name),
             )
@@ -92,10 +94,10 @@ def cancel_job(job_id: str) -> bool:
     return cancel_registered_job(_jobs, _lock, job_id)
 
 
-def start_translate_job(file_path: str, original_name: str) -> str:
+def start_translate_job(file_path: str, original_name: str, save_to_db: bool = False, cleanup_input: bool = True) -> str:
     _ensure_pool()
     job_id = new_job_id()
-    job = TranslateJob(job_id=job_id, filename=original_name)
+    job = TranslateJob(job_id=job_id, filename=original_name, save_to_db=save_to_db, cleanup_input=cleanup_input)
     enqueue_registered_job(_jobs, _lock, _task_queue, job, (job_id, file_path, original_name))
     logger.info(f"[{job_id}] Queued: {original_name}")
     return job_id
@@ -368,6 +370,22 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
             job.result_url = result_url
         logger.info(f"[{job_id}] Done: {out_filename}")
 
+        if getattr(job, "save_to_db", False):
+            try:
+                from app.db import SessionLocal, Video
+                with SessionLocal() as db:
+                    v = Video(
+                        url=result_url.strip().lower(),
+                        category="translated",
+                        title=f"{job.filename} (Subtitled)",
+                        duration=video_duration,
+                        source="translate",
+                    )
+                    db.add(v)
+                    db.commit()
+            except Exception as exc:
+                logger.warning(f"Could not save translated video to DB: {exc}")
+
     except Exception as e:
         logger.error(f"[{job_id}] Process error: {e}", exc_info=True)
         with _lock:
@@ -375,4 +393,6 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
                 job.status = "failed"
                 job.error = str(e)
     finally:
-        cleanup_paths([audio_path, srt_path, file_path])
+        cleanup_paths([audio_path, srt_path])
+        if getattr(job, "cleanup_input", True):
+            cleanup_paths([file_path])

@@ -1,5 +1,6 @@
 """End-to-end tests for translate video endpoints and worker."""
 import io
+import os
 import time
 import pytest
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -85,6 +86,39 @@ def test_translate_job_not_found(client):
 def test_cancel_translate_job_not_found(client):
     r = client.delete("/translate-jobs/nonexistent-job-id", headers=AUTH)
     assert r.status_code == 404
+
+
+def test_translate_video_by_id_not_found(client):
+    r = client.post("/videos/99999/translate", headers=AUTH)
+    assert r.status_code == 404
+
+
+def test_translate_video_by_id_success(client, db_session):
+    from unittest.mock import patch
+    from app.config import get_settings
+    from app.db import Video
+    settings = get_settings()
+    test_file = os.path.join(settings.temp_storage_dir, "test_translate_video.mp4")
+    with open(test_file, "wb") as f:
+        f.write(_fake_mp4())
+
+    v = Video(
+        url=f"{settings.base_url}/temp_storage/test_translate_video.mp4",
+        title="Sample Video",
+        category="download",
+    )
+    db_session.add(v)
+    db_session.commit()
+    db_session.refresh(v)
+
+    with patch("app.routers.translate.start_translate_job", return_value="mock-job-id") as mock_start:
+        r = client.post(f"/videos/{v.id}/translate", headers=AUTH)
+        assert r.status_code == 200
+        data = r.json()
+        assert data["status"] == "queued"
+        assert data["job_id"] == "mock-job-id"
+        mock_start.assert_called_once_with(test_file, "Sample Video.mp4", save_to_db=True, cleanup_input=False)
+
 
 
 # ── Full pipeline tests ────────────────────────────────────────────────────

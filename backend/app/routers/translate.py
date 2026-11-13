@@ -3,9 +3,11 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
+from app.db import Video, get_db
 from app.routers.auth import verify_token
-from app.routers.upload_utils import save_upload_file
+from app.routers.upload_utils import resolve_video_file_path, save_upload_file
 from app.services.translate_worker import cancel_job, get_job, start_translate_job
 
 logger = logging.getLogger("TranslateRouter")
@@ -33,6 +35,21 @@ async def translate_video(
     file_path, original_name = save_upload_file(file, prefix="translate_in_")
     job_id = start_translate_job(file_path, original_name)
     logger.info(f"Translate queued: job_id={job_id} file={original_name}")
+    return TranslateJobOut(job_id=job_id, filename=original_name, status="queued")
+
+
+@router.post("/videos/{video_id}/translate", response_model=TranslateJobOut)
+def translate_video_by_id(
+    video_id: int,
+    db: Session = Depends(get_db),
+    token: str = Depends(verify_token),
+):
+    video = db.query(Video).filter(Video.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+    file_path, original_name = resolve_video_file_path(video)
+    job_id = start_translate_job(file_path, original_name, save_to_db=True, cleanup_input=False)
+    logger.info(f"Translate pipeline queued for video {video_id}: job_id={job_id} file={original_name}")
     return TranslateJobOut(job_id=job_id, filename=original_name, status="queued")
 
 
