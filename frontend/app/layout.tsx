@@ -3,6 +3,7 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import { AuthProvider } from "./auth-context";
 import { JobsProvider } from "./jobs-context";
+import { SearchProvider } from "./search-context";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -20,7 +21,9 @@ export default function RootLayout({
     <html lang="en">
       <body className={inter.className}>
         <AuthProvider>
-          <JobsProvider>{children}</JobsProvider>
+          <JobsProvider>
+            <SearchProvider>{children}</SearchProvider>
+          </JobsProvider>
         </AuthProvider>
       </body>
     </html>

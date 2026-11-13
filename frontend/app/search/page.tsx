@@ -1,29 +1,20 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import Image from "next/image";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../auth-context";
 import { useJobs } from "../jobs-context";
+import { errorMessage, useSearch } from "../search-context";
 import { createLocalId, queuedDownloadRows } from "../job-utils";
-import {
-  extractVideo,
-  getSearch,
-  moreSearchResults,
-  playSearchResult,
-  startSearch,
-  type PlayData,
-  type SearchData,
-  type SearchResultItem,
-} from "../api";
+import { extractVideo, playSearchResult, type PlayData, type SearchResultItem } from "../api";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Check, Download, ExternalLink, Loader2, Play, Search } from "lucide-react";
 import Navbar from "@/components/Navbar";
 import SearchPlayer from "@/components/SearchPlayer";
 
-const POLL_MS = 2000;
 const MAX_DESCRIPTION_CHARS = 500;
 
 const PHASE_LABELS: Record<string, string> = {
@@ -53,13 +44,6 @@ function siteName(url: string): string {
   }
 }
 
-function errorMessage(err: unknown, fallback: string): string {
-  const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
-  return detail || fallback;
-}
-
-type QueueState = "queuing" | "queued" | "failed";
-
 type Playing = {
   result: SearchResultItem;
   play: PlayData | null;
@@ -71,57 +55,20 @@ export default function SearchPage() {
   const router = useRouter();
   const { setDownloads } = useJobs();
 
-  const [description, setDescription] = useState("");
-  const [search, setSearch] = useState<SearchData | null>(null);
-  const [error, setError] = useState("");
-  const [queueStates, setQueueStates] = useState<Record<string, QueueState>>({});
+  // The search itself lives in SearchProvider, so leaving this tab never drops it.
+  const { description, setDescription, search, error, queueStates, setQueueStates, start, loadMore } = useSearch();
   const [playing, setPlaying] = useState<Playing | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (!loading && !token) router.replace("/login");
   }, [token, loading, router]);
 
-  const searchId = search?.search_id;
   const running = search?.status === "running";
-
-  // Poll while the backend works on the current step (first page or "more").
-  useEffect(() => {
-    if (!token || !searchId || !running) return;
-    pollRef.current = setInterval(async () => {
-      try {
-        setSearch(await getSearch(token, searchId));
-      } catch (err) {
-        setError(errorMessage(err, "Lost track of this search. Start a new one."));
-        setSearch((prev) => (prev ? { ...prev, status: "failed" } : prev));
-      }
-    }, POLL_MS);
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
-    };
-  }, [token, searchId, running]);
 
   async function handleSearch(e: { preventDefault(): void }) {
     e.preventDefault();
     const text = description.trim();
-    if (!text || !token) return;
-    setError("");
-    setQueueStates({});
-    try {
-      setSearch(await startSearch(token, text));
-    } catch (err) {
-      setError(errorMessage(err, "Search failed to start."));
-    }
-  }
-
-  async function handleMore() {
-    if (!token || !searchId) return;
-    setError("");
-    try {
-      setSearch(await moreSearchResults(token, searchId));
-    } catch (err) {
-      setError(errorMessage(err, "Could not load more results."));
-    }
+    if (text) await start(text);
   }
 
   // Ask the backend how to play a result, then show it in the player dialog.
@@ -289,7 +236,7 @@ export default function SearchPage() {
 
         {search && search.status !== "running" && search.has_more && results.length > 0 && (
           <div className="flex justify-center mt-8">
-            <Button onClick={handleMore} className="bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl px-8">
+            <Button onClick={loadMore} className="bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl px-8">
               More results
             </Button>
           </div>
