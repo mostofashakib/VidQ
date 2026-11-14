@@ -119,7 +119,7 @@ def _make_fake_popen(progress_lines=None):
 
     class FakePopen:
         def __init__(self, cmd, stdout=None, stderr=None, text=None,
-                     encoding=None, errors=None, bufsize=None):
+                     encoding=None, errors=None, bufsize=None, **kwargs):
             # Write fake output so size > 1000 check passes
             with open(cmd[-1], "wb") as f:
                 f.write(b"fake-mp4-data" * 200)
@@ -425,7 +425,7 @@ def test_combine_job_ffmpeg_failure_marks_failed(client):
 
     class FailingPopen:
         def __init__(self, cmd, stdout=None, stderr=None, text=None,
-                     encoding=None, errors=None, bufsize=None):
+                     encoding=None, errors=None, bufsize=None, **kwargs):
             self.stdout = iter([])
             self.stderr = iter(["ffmpeg: error\n"])
             self.returncode = 1

@@ -24,10 +24,11 @@ from urllib.parse import urlencode
 from playwright.async_api import async_playwright
 
 from app.services.scraper.browser_adapter import launch_browser
+from app.services.scraper.candidates import _parse_duration_seconds
 from app.services.scraper.pipeline import _open_context
 from app.services.scraper.playback import HEADLESS_OPTIONS, USER_AGENTS
 from app.services.search.models import SearchResult
-from app.services.search.page_reader import bing_results, harvest_results
+from app.services.search.page_reader import bing_results, harvest_results, yandex_results
 
 logger = logging.getLogger("VideoSearch")
 
@@ -133,6 +134,69 @@ def bing_videos_url(query: str, safe_search: str, page: int) -> str:
     return f"https://www.bing.com/videos/search?{urlencode({'q': query, 'adlt': safe_search})}"
 
 
+def yandex_videos_url(query: str, safe_search: str, page: int) -> str:
+    """Yandex loads later pages on scroll, so the URL ignores page."""
+    return f"https://yandex.com/video/search?{urlencode({'text': query})}"
+
+
+class SearXNGSource:
+    """SearXNG metasearch engine JSON API for aggregated video queries."""
+
+    def __init__(self, base_url: str, name: str = "searxng", timeout_s: float = 15.0) -> None:
+        self.name = name
+        self._base_url = base_url.rstrip("/")
+        self._timeout_s = timeout_s
+
+    async def search(self, query: str, page: int) -> list[SearchResult]:
+        import httpx
+
+        url = f"{self._base_url}/search"
+        params = {
+            "q": query,
+            "categories": "videos",
+            "format": "json",
+            "pageno": page,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout_s) as client:
+                resp = await client.get(url, params=params)
+                if resp.status_code != 200:
+                    raise SourceError(f"SearXNG returned HTTP {resp.status_code}")
+                data = resp.json()
+        except SourceError:
+            raise
+        except Exception as exc:
+            raise SourceError(f"SearXNG query failed: {exc}") from exc
+
+        results: list[SearchResult] = []
+        for item in data.get("results", []):
+            item_url = item.get("url") or ""
+            title = (item.get("title") or "").strip()
+            if not item_url.startswith("http") or not title:
+                continue
+            duration = item.get("length") or item.get("duration")
+            duration_s = None
+            if isinstance(duration, (int, float)):
+                duration_s = float(duration)
+            elif isinstance(duration, str):
+                duration_s = _parse_duration_seconds(duration)
+
+            thumb = item.get("thumbnail") or item.get("img_src") or ""
+            snippet = (item.get("content") or "").strip()
+            results.append(
+                SearchResult(
+                    url=item_url,
+                    title=title,
+                    source=self.name,
+                    duration=duration_s,
+                    thumbnail=thumb,
+                    snippet=snippet[:160],
+                    is_video=True,
+                )
+            )
+        return results
+
+
 class BrowserEngineSource:
     """
     A search engine's video tab, loaded in the browser. Only results that show
@@ -212,25 +276,29 @@ class BrowserPageFetcher:
 def default_sources(settings) -> Callable[[], AsyncIterator[list[SearchSource]]]:
     """
     Opener for the standard sources: yt-dlp search for YouTube and Bilibili,
-    plus DuckDuckGo, Brave and Bing video search in one shared browser. When the
-    browser fails to start, the search runs on the yt-dlp sources alone.
+    plus DuckDuckGo, Brave, Bing, and Yandex video search in one shared browser.
+    If SearXNG is configured, it is included as an additional clear-web source.
+    When the browser fails to start, the search runs on non-browser sources alone.
     """
 
     @asynccontextmanager
     async def open_sources():
         ytdlp = [YtDlpSource("youtube", "ytsearch"), YtDlpSource("bilibili", "bilisearch")]
+        searxng = [SearXNGSource(settings.searxng_url)] if getattr(settings, "searxng_url", "") else []
+        non_browser = ytdlp + searxng
         async with AsyncExitStack() as stack:
             try:
                 fetcher = await stack.enter_async_context(BrowserPageFetcher(settings))
             except Exception as exc:
-                logger.warning(f"Browser unavailable for search engines; using yt-dlp only: {exc}")
-                yield ytdlp
+                logger.warning(f"Browser unavailable for search engines; using non-browser sources only: {exc}")
+                yield non_browser
                 return
             safe = settings.search_safe_search
-            yield ytdlp + [
+            yield non_browser + [
                 BrowserEngineSource("duckduckgo", duckduckgo_videos_url, safe, fetcher, scroll_paging=True),
                 BrowserEngineSource("brave", brave_videos_url, safe, fetcher),
                 BrowserEngineSource("bing", bing_videos_url, safe, fetcher, scroll_paging=True, parser=bing_results),
+                BrowserEngineSource("yandex", yandex_videos_url, safe, fetcher, scroll_paging=True, parser=yandex_results),
             ]
 
     return open_sources

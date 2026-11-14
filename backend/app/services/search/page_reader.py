@@ -196,3 +196,69 @@ def bing_results(html: str, page_url: str, source: str) -> list[SearchResult]:
             thumbnail=media.get("turl") or meta.get("smturl") or "",
         )
     return list(results.values())
+
+
+def yandex_results(html: str, page_url: str, source: str) -> list[SearchResult]:
+    """
+    One SearchResult per Yandex video card (.VideoSnippet), in page order.
+    Extracts the destination video link, title, duration, and thumbnail.
+    """
+    results: dict[str, SearchResult] = {}
+    soup = BeautifulSoup(html, "html.parser")
+    for snippet in soup.select(".VideoSnippet"):
+        title_el = snippet.select_one(".VideoSnippet-Title")
+        title = " ".join(title_el.get_text(" ").split())[:_TITLE_MAX_CHARS] if title_el else ""
+        if len(title) < _MIN_TITLE_CHARS:
+            continue
+
+        target_url = None
+        host_link = snippet.select_one("a.VideoHostExtended-Host, a[class*='Host']")
+        if host_link and host_link.get("href"):
+            href = host_link["href"]
+            if href.startswith("http") and not _is_on(href, "yandex.com") and not _is_on(href, "yandex.ru"):
+                target_url = href
+
+        if not target_url:
+            for a in snippet.find_all("a", href=True):
+                href = a["href"]
+                if href.startswith("http") and not _is_on(href, "yandex.com") and not _is_on(href, "yandex.ru"):
+                    target_url = href
+                    break
+
+        if not target_url:
+            continue
+
+        canonical = canonical_url(target_url)
+        if not canonical or canonical in results:
+            continue
+
+        duration = None
+        duration_el = snippet.select_one(".VideoThumb3-Duration, [class*='Duration'], .VideoSnippet-Duration")
+        if duration_el:
+            duration = _parse_duration_seconds(duration_el.get_text(strip=True))
+        if not duration:
+            m = _DURATION_RE.search(snippet.get_text())
+            if m:
+                duration = _parse_duration_seconds(m.group(0))
+
+        thumb = ""
+        thumb_el = snippet.select_one("video[poster], img[src]")
+        if thumb_el:
+            thumb = thumb_el.get("poster") or thumb_el.get("src") or ""
+            if thumb.startswith("//"):
+                thumb = "https:" + thumb
+
+        text = _clean_text(snippet)
+        snippet_text = text.replace(title, "", 1).strip()[:_SNIPPET_CHARS]
+
+        results[canonical] = SearchResult(
+            url=target_url,
+            title=title,
+            source=source,
+            duration=duration,
+            thumbnail=thumb,
+            snippet=snippet_text,
+            is_video=True,
+        )
+    return list(results.values())
+

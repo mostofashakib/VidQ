@@ -127,7 +127,7 @@ async def test_default_sources_add_every_engine_with_the_safe_search_setting(mon
     settings = type("S", (), {"search_safe_search": "off"})()
 
     async with sources_module.default_sources(settings)() as sources:
-        assert [s.name for s in sources] == ["youtube", "bilibili", "duckduckgo", "brave", "bing"]
+        assert [s.name for s in sources] == ["youtube", "bilibili", "duckduckgo", "brave", "bing", "yandex"]
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────

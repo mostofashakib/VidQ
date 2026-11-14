@@ -110,6 +110,9 @@ class Settings:
             "SEARCH_SAFE_SEARCH", ("off", "moderate", "strict"), default="off"
         )
 
+        # Optional SearXNG instance URL for aggregated privacy/alternative web search
+        self.searxng_url: str = os.getenv("SEARXNG_URL", "").strip().rstrip("/")
+
         if not self.database_url:
             raise ValueError("Missing required environment variable: DATABASE_URL")
 settings = Settings()

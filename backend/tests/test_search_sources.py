@@ -8,11 +8,14 @@ from app.config import Settings
 from app.services.search.models import SearchResult
 from app.services.search.sources import (
     BrowserEngineSource,
-    bing_videos_url,
+    SearXNGSource,
     SourceError,
     YtDlpSource,
+    bing_videos_url,
     brave_videos_url,
+    default_sources,
     duckduckgo_videos_url,
+    yandex_videos_url,
 )
 
 
@@ -147,3 +150,127 @@ async def test_browser_sources_read_pages_with_their_own_parser():
     source = BrowserEngineSource("bing", bing_videos_url, safe_search="off", fetcher=FakeFetcher(), parser=parser)
 
     assert [r.url for r in await source.search("q", page=1)] == ["https://v.example/1"]
+
+
+def test_yandex_videos_url():
+    assert yandex_videos_url("deep sea", "off", 1) == "https://yandex.com/video/search?text=deep+sea"
+    assert yandex_videos_url("deep sea", "strict", 3) == "https://yandex.com/video/search?text=deep+sea"
+
+
+@pytest.mark.asyncio
+async def test_searxng_source_parses_json_results(monkeypatch):
+    class FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "results": [
+                    {
+                        "url": "https://peertube.example/videos/watch/123",
+                        "title": "Decentralized Video",
+                        "length": 340,
+                        "thumbnail": "https://peertube.example/thumb.jpg",
+                        "content": "A cool open video",
+                    },
+                    {
+                        "url": "https://vimeo.example/456",
+                        "title": "String duration video",
+                        "duration": "12:30",
+                    },
+                    {
+                        "url": "not-http",
+                        "title": "Bad url",
+                    },
+                ]
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, params):
+            assert url == "https://searx.example/search"
+            assert params["q"] == "open source"
+            assert params["categories"] == "videos"
+            assert params["pageno"] == 2
+            return FakeResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", FakeAsyncClient)
+
+    source = SearXNGSource("https://searx.example/")
+    results = await source.search("open source", page=2)
+
+    assert len(results) == 2
+    assert results[0].url == "https://peertube.example/videos/watch/123"
+    assert results[0].title == "Decentralized Video"
+    assert results[0].duration == 340.0
+    assert results[0].source == "searxng"
+    assert results[1].duration == 750.0
+
+
+@pytest.mark.asyncio
+async def test_searxng_source_handles_errors(monkeypatch):
+    class FailingClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def get(self, url, params):
+            class ErrResponse:
+                status_code = 502
+            return ErrResponse()
+
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", FailingClient)
+
+    source = SearXNGSource("https://searx.example")
+    with pytest.raises(SourceError) as exc_info:
+        await source.search("query", page=1)
+    assert "HTTP 502" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_default_sources_includes_yandex_and_searxng(monkeypatch):
+    from unittest.mock import AsyncMock, patch
+
+    class FakeSettings:
+        search_safe_search = "off"
+        searxng_url = "https://searx.example"
+
+    # When browser launch fails, non-browser sources are yielded
+    with patch("app.services.search.sources.BrowserPageFetcher") as mock_fetcher:
+        mock_fetcher.side_effect = Exception("No browser")
+        opener = default_sources(FakeSettings())
+        async with opener() as sources:
+            names = [s.name for s in sources]
+            assert "youtube" in names
+            assert "bilibili" in names
+            assert "searxng" in names
+            assert "yandex" not in names  # browser-dependent
+
+    # When browser launch succeeds
+    class FakeBrowserFetcher:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    with patch("app.services.search.sources.BrowserPageFetcher", return_value=FakeBrowserFetcher()):
+        opener = default_sources(FakeSettings())
+        async with opener() as sources:
+            names = [s.name for s in sources]
+            assert names == ["youtube", "bilibili", "searxng", "duckduckgo", "brave", "bing", "yandex"]
+

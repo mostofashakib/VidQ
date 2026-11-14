@@ -117,7 +117,7 @@ def test_titles_prefer_title_attributes_and_headings_over_card_text():
 
 # ── Engines that keep results in JSON attributes ──────────────────────────────
 
-from app.services.search.page_reader import bing_results  # noqa: E402
+from app.services.search.page_reader import bing_results, yandex_results  # noqa: E402
 
 BING = "https://www.bing.com/videos/search?q=ocean"
 BING_PAGE = """<body>
@@ -140,3 +140,50 @@ def test_bing_results_read_each_cards_json_once():
         ("https://www.youtube.com/watch?v=2pTGdH0A4Qs", "The Coral Triangle", 4366.0,
          "https://th.bing.com/th/id/OMB.2", "bing"),
     ]
+
+
+YANDEX_PAGE = """<body>
+  <div class="VideoSnippet">
+    <div class="VideoSnippet-Title">Python tutorial for beginners</div>
+    <div class="VideoSnippet-Duration">5:22</div>
+    <a class="VideoHostExtended-Host" href="http://rutube.ru/video/12345/">Rutube</a>
+    <video poster="//avatars.mds.yandex.net/get-vthumb/123/thumb.jpg"></video>
+  </div>
+  <div class="VideoSnippet">
+    <div class="VideoSnippet-Title">Intermediate Python Programming Course</div>
+    <span class="dur">1:30:00</span>
+    <a href="http://www.youtube.com/watch?v=abcdef">YouTube</a>
+    <img src="https://i.ytimg.com/vi/abcdef/hqdefault.jpg" />
+  </div>
+  <div class="VideoSnippet">
+    <div class="VideoSnippet-Title">Internal yandex promo</div>
+    <a href="https://yandex.com/legal">Terms</a>
+  </div>
+  <div class="VideoSnippet">
+    <div class="VideoSnippet-Title">No links here</div>
+  </div>
+  <div class="VideoSnippet">
+    <div class="VideoSnippet-Title">Repeat of first</div>
+    <div class="VideoSnippet-Duration">5:22</div>
+    <a class="VideoHostExtended-Host" href="http://rutube.ru/video/12345/">Rutube</a>
+  </div>
+</body>"""
+
+
+def test_yandex_results_extracts_video_metadata():
+    results = yandex_results(YANDEX_PAGE, "https://yandex.com/video/search?text=python", "yandex")
+
+    assert len(results) == 2
+    first, second = results
+    assert first.url == "http://rutube.ru/video/12345/"
+    assert first.title == "Python tutorial for beginners"
+    assert first.duration == 322.0
+    assert first.thumbnail == "https://avatars.mds.yandex.net/get-vthumb/123/thumb.jpg"
+    assert first.source == "yandex"
+    assert first.is_video is True
+
+    assert second.url == "http://www.youtube.com/watch?v=abcdef"
+    assert second.title == "Intermediate Python Programming Course"
+    assert second.duration == 5400.0
+    assert second.thumbnail == "https://i.ytimg.com/vi/abcdef/hqdefault.jpg"
+
