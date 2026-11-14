@@ -25,10 +25,15 @@ app.mount("/temp_storage", StaticFiles(directory=settings.temp_storage_dir), nam
 if not settings.cors_origins:
     raise ValueError("Missing required environment variable: CORS_ORIGINS")
 
+allowed_origins = {origin.strip() for origin in settings.cors_origins.split(",") if origin.strip()}
+# Ensure both localhost and 127.0.0.1 variants are allowed for local development
+allowed_origins.update(["http://localhost:3000", "http://127.0.0.1:3000"])
+
 # Allow local frontend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins.split(","),
+    allow_origins=list(allowed_origins),
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

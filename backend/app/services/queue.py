@@ -81,7 +81,7 @@ def _video_payload(video) -> dict:
 
 def _save_video_to_db(job: "RecordingJob", result: dict, temp_video_url: Optional[str]) -> dict:
     """Persist the downloaded video to the database and return the enriched result dict."""
-    from app.db import SessionLocal, Video
+    from app.db import SessionLocal, Video, create_video_record
 
     video_url = result.get("video_url") or job.url
     title = result.get("title")
@@ -95,16 +95,14 @@ def _save_video_to_db(job: "RecordingJob", result: dict, temp_video_url: Optiona
             existing = db.query(Video).filter(Video.title == title.strip()).first()
 
         if not existing:
-            v = Video(
-                url=video_url.strip().lower(),
+            v = create_video_record(
+                db,
+                video_url,
                 category=job.category,
                 title=title,
                 duration=duration,
                 thumbnail=thumbnail,
             )
-            db.add(v)
-            db.commit()
-            db.refresh(v)
             result["db_id"] = v.id
             result["video"] = _video_payload(v)
             logger.info(f"Job {job.job_id} saved video id={v.id}")

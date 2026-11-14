@@ -12,6 +12,7 @@ import {
   type SetStateAction,
 } from "react";
 import type { CombineJobData, EnhanceJobData, TranslateJobData, TrimJobData } from "./api";
+export type { CombineJobData, EnhanceJobData, TranslateJobData, TrimJobData };
 
 // ── Shared job types ───────────────────────────────────────────────────────────
 

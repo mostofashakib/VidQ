@@ -372,17 +372,16 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
 
         if getattr(job, "save_to_db", False):
             try:
-                from app.db import SessionLocal, Video
+                from app.db import SessionLocal, create_video_record
                 with SessionLocal() as db:
-                    v = Video(
-                        url=result_url.strip().lower(),
+                    create_video_record(
+                        db,
+                        result_url,
                         category="translated",
                         title=f"{job.filename} (Subtitled)",
                         duration=video_duration,
                         source="translate",
                     )
-                    db.add(v)
-                    db.commit()
             except Exception as exc:
                 logger.warning(f"Could not save translated video to DB: {exc}")
 

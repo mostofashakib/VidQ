@@ -31,3 +31,30 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def create_video_record(
+    db,
+    url: str,
+    *,
+    title: str | None = None,
+    category: str = DEFAULT_CATEGORY,
+    duration: float | None = None,
+    thumbnail: str | None = None,
+    source: str = "url",
+) -> Video:
+    """Create, persist, and return a standardized Video database record."""
+    norm_url = url.strip().lower() if url else ""
+    video = Video(
+        url=norm_url,
+        title=title,
+        category=category or DEFAULT_CATEGORY,
+        duration=duration,
+        thumbnail=thumbnail,
+        source=source,
+    )
+    db.add(video)
+    db.commit()
+    db.refresh(video)
+    return video
+

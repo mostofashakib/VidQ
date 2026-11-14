@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
-from app.db import get_db, Video
+from app.db import get_db, Video, create_video_record
 from app.models import VideoCreate, VideoOut, DEFAULT_CATEGORY, FORBIDDEN_URL_MSG
 from app.routers.auth import verify_token
 from app.services.url_safety import is_safe_url, filename_from_url
@@ -99,11 +99,14 @@ def add_video(video: VideoCreate, db: Session = Depends(get_db), token: str = De
             title = scraped_title
         if duration is None:
             duration = scraped_duration
-    db_video = Video(url=norm_url, category=video.category or DEFAULT_CATEGORY, title=title, duration=duration)
-    db.add(db_video)
-    db.commit()
-    db.refresh(db_video)
-    return db_video
+    return create_video_record(
+        db,
+        norm_url,
+        category=video.category or DEFAULT_CATEGORY,
+        title=title,
+        duration=duration,
+        source="url",
+    )
 
 @router.get("/videos", response_model=List[VideoOut])
 def list_videos(category: Optional[str] = None, skip: int = 0, limit: int = 20, db: Session = Depends(get_db), token: str = Depends(verify_token)):

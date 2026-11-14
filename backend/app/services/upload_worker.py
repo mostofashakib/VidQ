@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 
 from app.config import get_settings
-from app.db import SessionLocal, Video
+from app.db import SessionLocal, create_video_record
 from app.services.ffmpeg_utils import (
     build_normalize_command,
     output_file_is_valid,
@@ -175,16 +175,14 @@ def _process_job(job_id: str, file_path: str, original_name: str) -> None:
 
         db = SessionLocal()
         try:
-            db_video = Video(
-                url=video_url.strip().lower(),
+            db_video = create_video_record(
+                db,
+                video_url,
                 category="uploads",
                 title=title,
                 duration=duration,
                 source="upload",
             )
-            db.add(db_video)
-            db.commit()
-            db.refresh(db_video)
             with _lock:
                 if job.status == "processing":
                     job.status = "done"

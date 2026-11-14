@@ -746,17 +746,16 @@ def _process_job(job_id: str) -> None:
 
         if job.title:
             try:
-                from app.db import SessionLocal, Video
+                from app.db import SessionLocal, create_video_record
                 with SessionLocal() as db:
-                    v = Video(
-                        url=result_url.strip().lower(),
+                    create_video_record(
+                        db,
+                        result_url,
                         category="enhanced",
                         title=f"{job.title} (Upscaled)",
                         duration=duration,
                         source="enhance",
                     )
-                    db.add(v)
-                    db.commit()
             except Exception as exc:
                 logger.warning(f"Could not save enhanced video to DB: {exc}")
 
